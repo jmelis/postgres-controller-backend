@@ -39,10 +39,22 @@ func setupLease(t *testing.T, bucketID int, holder string, ttl time.Duration) in
 	t.Helper()
 	conn := freshConn(t)
 	defer conn.Close(context.Background())
-	mgr := lease.NewManager(conn, holder)
+	mgr := lease.NewSpecManager(conn, holder)
 	epoch, err := mgr.Acquire(context.Background(), bucketID, ttl)
 	if err != nil {
 		t.Fatalf("setup lease: %v", err)
+	}
+	return epoch
+}
+
+func setupStatusLease(t *testing.T, bucketID int, holder string, ttl time.Duration) int64 {
+	t.Helper()
+	conn := freshConn(t)
+	defer conn.Close(context.Background())
+	mgr := lease.NewStatusManager(conn, holder)
+	epoch, err := mgr.Acquire(context.Background(), bucketID, ttl)
+	if err != nil {
+		t.Fatalf("setup status lease: %v", err)
 	}
 	return epoch
 }

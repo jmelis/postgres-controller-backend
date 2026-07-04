@@ -12,13 +12,17 @@ import (
 var migrationsFS embed.FS
 
 func Migrate(ctx context.Context, conn *pgx.Conn) error {
-	sql, err := migrationsFS.ReadFile("migrations/001_initial.sql")
-	if err != nil {
-		return fmt.Errorf("read migration: %w", err)
+	files := []string{
+		"migrations/001_initial.sql",
 	}
-	_, err = conn.Exec(ctx, string(sql))
-	if err != nil {
-		return fmt.Errorf("apply migration: %w", err)
+	for _, f := range files {
+		sql, err := migrationsFS.ReadFile(f)
+		if err != nil {
+			return fmt.Errorf("read migration %s: %w", f, err)
+		}
+		if _, err := conn.Exec(ctx, string(sql)); err != nil {
+			return fmt.Errorf("apply migration %s: %w", f, err)
+		}
 	}
 	return nil
 }

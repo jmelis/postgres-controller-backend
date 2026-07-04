@@ -18,7 +18,9 @@
       "Bash(make build *)",
       "Bash(make test-unit *)",
       "Bash(make test-race *)",
-      "Bash(make test-integration *)"
+      "Bash(make test-integration *)",
+      "Bash(podman search *)",
+      "Bash(podman pull *)"
     ]
   }
 }

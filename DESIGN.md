@@ -3,7 +3,7 @@
 **Status:** Proposed · **Platform:** AWS RDS PostgreSQL 16+ Multi-AZ (single region) · **Supersedes:** v3
 **Prime directive:** correctness first. Every mechanism in this document is justified by a named invariant, every invariant has a named attack (race/failure), and every attack has a named test. Performance targets are retained but subordinate.
 
-**Change from v3:** the design (§3) is carried forward essentially unchanged — poll-primary watch, doorbell as latency-only optimization, per-(GVK, bucket) gapless counters, lease fencing, timeline epochs, tombstone compaction. v4 adds: a formal invariant catalog (§2), one write-path hardening (lease share-lock closes the fence-expiry race, §3.4), a race-condition catalog with deterministic tests (§5), a continuous production invariant verifier (§6), and an expanded certification plan (§7). Sizing defaults to the 5,000-cluster tier with an in-place scale-up path to 50,000 (§4).
+**Change from v3:** the design (§3) is carried forward essentially unchanged — poll-primary watch, doorbell as latency-only optimization, per-(GVK, bucket) gapless counters, lease fencing, timeline epochs, tombstone compaction. v4 adds: a formal invariant catalog (§2), one write-path hardening (lease share-lock closes the fence-expiry race, §3.4), a spec/status split with independent fencing domains (§3.3b), a race-condition catalog with deterministic tests (§5, including R11/R12 for the split), a continuous production invariant verifier (§6), and an expanded certification plan (§7). Sizing defaults to the 5,000-cluster tier with an in-place scale-up path to 50,000 (§4).
 
 ---
 
@@ -62,11 +62,20 @@ CREATE TABLE gvk_bucket_counters (
     PRIMARY KEY (bucket_id, gvk)
 ) WITH (fillfactor = 50);          -- hottest rows in the system: keep updates HOT
 
--- 2. Lease fencing: authoritative writer epoch per bucket
-CREATE TABLE bucket_leases (
+-- 2a. Lease fencing: authoritative spec writer epoch per bucket
+CREATE TABLE bucket_spec_leases (
     bucket_id  INT    PRIMARY KEY,
     holder     TEXT   NOT NULL,
     epoch      BIGINT NOT NULL,     -- strictly increases on EVERY acquisition
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+-- 2b. Lease fencing: authoritative status writer epoch per bucket
+--     Independent from bucket_spec_leases — spec and status can have different holders.
+CREATE TABLE bucket_status_leases (
+    bucket_id  INT    PRIMARY KEY,
+    holder     TEXT   NOT NULL,
+    epoch      BIGINT NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL
 );
 
@@ -119,7 +128,7 @@ CREATE TABLE compaction_horizon (
 BEGIN;
 
 -- (a) FENCE — upholds I4. FOR SHARE, held to COMMIT (see §3.4 for why).
-SELECT 1 FROM bucket_leases
+SELECT 1 FROM bucket_spec_leases
  WHERE bucket_id = $bucket AND holder = $replica_id
    AND epoch = $lease_epoch AND expires_at > now()
  FOR SHARE;                          -- zero rows => abort: fencing violation
@@ -158,6 +167,47 @@ COMMIT;
 
 Client rules: a 409 from (c) must ROLLBACK (never retry inside the same txn — the counter increment must abort with it, preserving I1). Any ambiguous commit outcome (connection dropped mid-COMMIT) is resolved by reading back the row and `current_seq` before retrying — the write is idempotent to verify because `object_version` and seq identify it.
 
+### 3.3b Atomic Status Write Path (Spec/Status Split)
+
+In Kubernetes, spec (desired state) and status (observed state) are written by different controllers — e.g., the API server writes spec while a controller writes status. The system supports this with a `WriteStatus` path that mirrors §3.3 except:
+
+1. **Fence against `bucket_status_leases`** (not `bucket_spec_leases`). This gives status writers their own fencing domain — a status writer holds a status lease, a spec writer holds a spec lease, and neither interferes with the other.
+2. **UPDATE only touches `status`** — `spec`, `metadata`, and `deletion_timestamp` are unchanged. There is no create path; the object must already exist (`ExpectedVersion > 0`).
+3. **Same shared counter and `object_version`.** Both `Write()` and `WriteStatus()` increment the same `gvk_bucket_counters` row and bump the same `object_version` column on `kubernetes_resources`. This ensures watchers see a single gapless, ordered event stream covering both spec and status changes.
+
+```sql
+BEGIN;
+-- (a) FENCE — against bucket_status_leases (independent from spec lease)
+SELECT 1 FROM bucket_status_leases
+ WHERE bucket_id = $bucket AND holder = $replica_id
+   AND epoch = $lease_epoch AND expires_at > now()
+ FOR SHARE;
+
+-- (b) SEQUENCE — same shared counter as Write()
+INSERT INTO gvk_bucket_counters (bucket_id, gvk, current_seq)
+VALUES ($bucket, $gvk, 1)
+ON CONFLICT (bucket_id, gvk)
+DO UPDATE SET current_seq = gvk_bucket_counters.current_seq + 1
+RETURNING current_seq;               -- => $next_seq
+
+-- (c) UPDATE status only — spec, metadata, deletion_timestamp unchanged
+UPDATE kubernetes_resources
+SET gvk_bucket_seq = $next_seq,
+    object_version = object_version + 1,
+    status = $status,
+    updated_at = now()
+WHERE gvk = $gvk AND namespace = $ns AND name = $name
+  AND object_version = $expected_version;  -- zero rows => 409 Conflict
+
+-- (d) DOORBELL — same channel as spec writes
+SELECT pg_notify('resource_changes_b' || $bucket, ...);
+COMMIT;
+```
+
+The fencing guarantees (I4) apply independently per domain: `FOR SHARE` on `bucket_status_leases` blocks a status lease grant while a status write is in-flight (R11), just as `FOR SHARE` on `bucket_spec_leases` blocks a spec lease grant (R1). A spec writer and a status writer can operate concurrently on the same bucket — the counter's exclusive row lock serializes sequence issuance (I1/I2), but the fence locks are on different tables and do not conflict (R12).
+
+Most controllers own both spec and status for their resources. `BothManager` provides `AcquireBoth`/`RenewBoth`/`ReleaseBoth` — each executes both lease operations in a single transaction (atomic both-or-neither). For the minority of controllers that split ownership (e.g., API server writes spec, a separate controller writes status), `NewSpecManager` and `NewStatusManager` operate independently.
+
 ### 3.4 Lease Fencing — closing the expiry race (hardening added in v4)
 
 The v3 fence checked the lease at transaction start, leaving a window: lease expires (or is reassigned) *after* the check but *before* COMMIT — a paused writer could commit under an epoch that is no longer authoritative.
@@ -165,7 +215,9 @@ The v3 fence checked the lease at transaction start, leaving a window: lease exp
 v4 closes it with lock discipline, not timestamps:
 
 * The writer's fence takes **`FOR SHARE`** on the lease row and holds it to COMMIT.
-* The coordinator's **grant/steal is an `UPDATE bucket_leases SET holder=$new, epoch=epoch+1 ...`** — a row `UPDATE` requires the exclusive lock, which **conflicts with `FOR SHARE`**.
+* The coordinator's **grant/steal is an `UPDATE bucket_spec_leases SET holder=$new, epoch=epoch+1 ...`** — a row `UPDATE` requires the exclusive lock, which **conflicts with `FOR SHARE`**.
+
+The same mechanism applies to `bucket_status_leases` for the status write path (§3.3b). The two lease tables are fully independent: a status lease grant does not block a spec writer, and vice versa.
 
 Consequence: a new epoch cannot be granted for a bucket while any in-flight fenced write on that bucket is between fence-check and COMMIT. Either the old writer's transaction commits first (it was still the legitimate holder for that write — I4 holds), or the coordinator's grant commits first and the late writer's fence finds the new epoch and aborts. There is no interleaving in which a stale-epoch write commits after a new epoch exists. Lease *renewal* by the current holder updates only `expires_at` and also serializes behind in-flight shares; renewals are cheap and infrequent (10 s cadence) so the contention is negligible.
 
@@ -229,6 +281,8 @@ Every entry names the invariant at stake, the interleaving, the defense, and the
 * **R8 — Failover mid-transaction (I1–I3).** Failover strikes between counter increment and COMMIT. *Defense:* the whole txn aborts atomically; sync standby has all acknowledged commits. *Test:* Phase 6 drill with writes in flight; assert no gap (aborted increment leaves none) and no regression.
 * **R9 — RV backwards exposure (I6).** Client presents an RV from a previous timeline epoch after failover. *Defense:* epoch comparison → `410 Gone`, relist. *Test:* replay a pre-failover RV post-failover; assert rejection, never a partial stream.
 * **R10 — 409 handling corrupting the stream (I1).** Buggy client retries the upsert inside the same txn after a version conflict. *Defense:* client library makes it structurally impossible (txn helper owns BEGIN/COMMIT); assert in code review + a library test that a conflict always rolls back the counter increment.
+* **R11 — Status fence-expiry race (I4).** Mirrors R1 for the status write path: `FOR SHARE` on `bucket_status_leases` must block a coordinator's grant while a status writer is mid-transaction. *Defense:* same §3.4 share-lock mechanism on `bucket_status_leases`. *Test:* session A does `WriteStatus()` with hook pausing at BeforeCommit, session B attempts Grant on the status lease — must block; unblock A, verify B completes; A's next `WriteStatus()` with the old epoch returns fence violation.
+* **R12 — Concurrent spec/status writes (I1/I2).** holder-A writes spec, holder-B writes status to the same resource. The shared counter must produce a gapless sequence; the watcher must see the correct stream; cross-domain fencing must be enforced (holder-B cannot Write, holder-A cannot WriteStatus). *Defense:* shared `gvk_bucket_counters`, independent lease tables. *Test:* interleaved spec and status writes produce consecutive seqs {1,2,3,4}; watcher starting from hwm sees correct state; holder-B's Write attempt is fenced; holder-A's WriteStatus attempt is fenced.
 
 ## 6. Continuous Invariant Verification (production, not just tests)
 

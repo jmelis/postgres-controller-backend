@@ -39,7 +39,7 @@ func TestListReturnsLiveResources(t *testing.T) {
 	ctx := context.Background()
 
 	leaseConn := db.Connect(t)
-	mgr := lease.NewManager(leaseConn, "replica-1")
+	mgr := lease.NewSpecManager(leaseConn, "replica-1")
 	epoch, err := mgr.Acquire(ctx, 1, 30*time.Second)
 	require.NoError(t, err)
 
@@ -77,7 +77,7 @@ func TestListExcludesTombstones(t *testing.T) {
 	ctx := context.Background()
 
 	leaseConn := db.Connect(t)
-	mgr := lease.NewManager(leaseConn, "replica-1")
+	mgr := lease.NewSpecManager(leaseConn, "replica-1")
 	epoch, err := mgr.Acquire(ctx, 1, 30*time.Second)
 	require.NoError(t, err)
 
@@ -119,7 +119,7 @@ func TestListMultipleBuckets(t *testing.T) {
 	ctx := context.Background()
 
 	leaseConn := db.Connect(t)
-	mgr := lease.NewManager(leaseConn, "replica-1")
+	mgr := lease.NewSpecManager(leaseConn, "replica-1")
 	epoch1, err := mgr.Acquire(ctx, 1, 30*time.Second)
 	require.NoError(t, err)
 	epoch2, err := mgr.Acquire(ctx, 2, 30*time.Second)

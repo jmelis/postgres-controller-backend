@@ -46,7 +46,7 @@ func TestWatchReceivesWrittenEvents(t *testing.T) {
 	defer cancel()
 
 	leaseConn := db.Connect(t)
-	mgr := lease.NewManager(leaseConn, "replica-1")
+	mgr := lease.NewSpecManager(leaseConn, "replica-1")
 	epoch, err := mgr.Acquire(ctx, 1, 60*time.Second)
 	require.NoError(t, err)
 
@@ -111,7 +111,7 @@ func TestWatchDetectsDeletion(t *testing.T) {
 	defer cancel()
 
 	leaseConn := db.Connect(t)
-	mgr := lease.NewManager(leaseConn, "replica-1")
+	mgr := lease.NewSpecManager(leaseConn, "replica-1")
 	epoch, err := mgr.Acquire(ctx, 1, 60*time.Second)
 	require.NoError(t, err)
 
@@ -180,7 +180,7 @@ func TestWatchBaselinePollDelivers(t *testing.T) {
 	defer cancel()
 
 	leaseConn := db.Connect(t)
-	mgr := lease.NewManager(leaseConn, "replica-1")
+	mgr := lease.NewSpecManager(leaseConn, "replica-1")
 	epoch, err := mgr.Acquire(ctx, 1, 60*time.Second)
 	require.NoError(t, err)
 

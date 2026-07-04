@@ -29,7 +29,7 @@ func (w *Writer) Write(ctx context.Context, req model.WriteRequest) (model.Write
 	// (a) FENCE — FOR SHARE held to COMMIT (I4)
 	var fenceOK int
 	err = tx.QueryRow(ctx, `
-		SELECT 1 FROM bucket_leases
+		SELECT 1 FROM bucket_spec_leases
 		WHERE bucket_id = $1 AND holder = $2
 		  AND epoch = $3 AND expires_at > now()
 		FOR SHARE`,
@@ -110,6 +110,105 @@ func (w *Writer) Write(ctx context.Context, req model.WriteRequest) (model.Write
 	}
 
 	// (d) DOORBELL — latency optimization only, correctness from poll (I5)
+	_, err = tx.Exec(ctx, `SELECT pg_notify($1, $2)`,
+		fmt.Sprintf("resource_changes_b%d", req.BucketID),
+		fmt.Sprintf(`{"bucket_id":%d,"gvk":"%s","seq":%d}`, req.BucketID, req.GVK, seq))
+	if err != nil {
+		return model.WriteResult{}, fmt.Errorf("doorbell: %w", err)
+	}
+
+	if w.hooks != nil {
+		if err := w.hooks.BeforeCommit(ctx, tx); err != nil {
+			return model.WriteResult{}, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return model.WriteResult{}, &AmbiguousCommitError{Cause: err, Req: req, Seq: seq}
+	}
+
+	return model.WriteResult{Seq: seq, ObjectVersion: resultVersion, UID: resultUID}, nil
+}
+
+// WriteStatus updates only the status sub-resource, fencing against
+// bucket_status_leases instead of bucket_spec_leases. The object must already exist
+// (ExpectedVersion > 0). Spec, metadata, and deletion_timestamp are not touched.
+// The shared gvk_bucket_seq counter and object_version are bumped so watchers
+// see status changes in the same ordered stream as spec changes.
+func (w *Writer) WriteStatus(ctx context.Context, req model.WriteRequest) (model.WriteResult, error) {
+	if req.ExpectedVersion == 0 {
+		return model.WriteResult{}, fmt.Errorf("WriteStatus requires ExpectedVersion > 0: object must exist")
+	}
+
+	tx, err := w.conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return model.WriteResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// (a) FENCE against bucket_status_leases (independent from spec lease)
+	var fenceOK int
+	err = tx.QueryRow(ctx, `
+		SELECT 1 FROM bucket_status_leases
+		WHERE bucket_id = $1 AND holder = $2
+		  AND epoch = $3 AND expires_at > now()
+		FOR SHARE`,
+		req.BucketID, req.LeaseHolder, req.LeaseEpoch).Scan(&fenceOK)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return model.WriteResult{}, ErrFenceViolation
+		}
+		return model.WriteResult{}, fmt.Errorf("fence: %w", err)
+	}
+
+	if w.hooks != nil {
+		if err := w.hooks.AfterFence(ctx, tx); err != nil {
+			return model.WriteResult{}, err
+		}
+	}
+
+	// (b) SEQUENCE — same shared counter as Write()
+	var seq int64
+	err = tx.QueryRow(ctx, `
+		INSERT INTO gvk_bucket_counters (bucket_id, gvk, current_seq)
+		VALUES ($1, $2, 1)
+		ON CONFLICT (bucket_id, gvk)
+		DO UPDATE SET current_seq = gvk_bucket_counters.current_seq + 1
+		RETURNING current_seq`,
+		req.BucketID, req.GVK).Scan(&seq)
+	if err != nil {
+		return model.WriteResult{}, fmt.Errorf("counter: %w", err)
+	}
+
+	if w.hooks != nil {
+		if err := w.hooks.AfterCounter(ctx, tx, seq); err != nil {
+			return model.WriteResult{}, err
+		}
+	}
+
+	// (c) UPDATE status only — spec, metadata, deletion_timestamp unchanged
+	var resultUID uuid.UUID
+	var resultVersion int64
+	err = tx.QueryRow(ctx, `
+		UPDATE kubernetes_resources
+		SET gvk_bucket_seq = $1,
+		    object_version = object_version + 1,
+		    status = $2,
+		    updated_at = now()
+		WHERE gvk = $3 AND namespace = $4 AND name = $5
+		  AND object_version = $6
+		RETURNING uid, object_version`,
+		seq, req.Status,
+		req.GVK, req.Namespace, req.Name, req.ExpectedVersion,
+	).Scan(&resultUID, &resultVersion)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return model.WriteResult{}, ErrConflict
+		}
+		return model.WriteResult{}, fmt.Errorf("update status: %w", err)
+	}
+
+	// (d) DOORBELL
 	_, err = tx.Exec(ctx, `SELECT pg_notify($1, $2)`,
 		fmt.Sprintf("resource_changes_b%d", req.BucketID),
 		fmt.Sprintf(`{"bucket_id":%d,"gvk":"%s","seq":%d}`, req.BucketID, req.GVK, seq))

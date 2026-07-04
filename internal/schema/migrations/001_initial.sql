@@ -6,8 +6,16 @@ CREATE TABLE IF NOT EXISTS gvk_bucket_counters (
     PRIMARY KEY (bucket_id, gvk)
 ) WITH (fillfactor = 50);
 
--- Lease fencing: authoritative writer epoch per bucket
-CREATE TABLE IF NOT EXISTS bucket_leases (
+-- Lease fencing: authoritative spec writer epoch per bucket
+CREATE TABLE IF NOT EXISTS bucket_spec_leases (
+    bucket_id  INT    PRIMARY KEY,
+    holder     TEXT   NOT NULL,
+    epoch      BIGINT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+-- Lease fencing: authoritative status writer epoch per bucket
+CREATE TABLE IF NOT EXISTS bucket_status_leases (
     bucket_id  INT    PRIMARY KEY,
     holder     TEXT   NOT NULL,
     epoch      BIGINT NOT NULL,

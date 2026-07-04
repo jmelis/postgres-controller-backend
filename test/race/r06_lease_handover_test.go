@@ -38,7 +38,7 @@ func TestR6_LeaseHandoverOverlap(t *testing.T) {
 
 	// Phase 2: coordinator grants bucket to holder-b (epoch bump)
 	grantConn := freshConn(t)
-	coordinator := lease.NewManager(grantConn, "coordinator")
+	coordinator := lease.NewSpecManager(grantConn, "coordinator")
 	epochB, err := coordinator.Grant(ctx, 1, "holder-b", 60*time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, epochA+1, epochB)

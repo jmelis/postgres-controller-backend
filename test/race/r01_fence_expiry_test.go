@@ -14,7 +14,7 @@ import (
 
 // R1 — Fence-expiry race (I4).
 // Writer A passes fence, pauses before COMMIT. Coordinator attempts epoch bump
-// (UPDATE bucket_leases SET epoch=epoch+1). The UPDATE must block because A
+// (UPDATE bucket_spec_leases SET epoch=epoch+1). The UPDATE must block because A
 // holds FOR SHARE on the lease row.
 //
 // Sequence:
@@ -36,7 +36,7 @@ func TestR1_FenceExpiryRace(t *testing.T) {
 
 	// Session B: coordinator connection for Grant
 	grantConn := freshConn(t)
-	coordinator := lease.NewManager(grantConn, "coordinator")
+	coordinator := lease.NewSpecManager(grantConn, "coordinator")
 
 	// Start writer A in a goroutine — it will pause at BeforeCommit
 	type writeResult struct {
@@ -108,7 +108,7 @@ func TestR1_FenceExpiryRace_ReverseOrder(t *testing.T) {
 	writerA := newWriter(t, hook)
 
 	grantConn := freshConn(t)
-	coordinator := lease.NewManager(grantConn, "coordinator")
+	coordinator := lease.NewSpecManager(grantConn, "coordinator")
 
 	type res struct {
 		val interface{}
