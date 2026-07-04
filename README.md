@@ -24,6 +24,7 @@ The system uses PostgreSQL 16 as the authoritative store for Kubernetes resource
 
 - **Per-(GVK, bucket) gapless sequence counters** for commit-ordered event streams
 - **Independent spec/status fencing** — single `bucket_leases` table with `domain` column (`'spec'`/`'status'`), each row fenced independently with `FOR SHARE` lock for single-writer semantics per sub-resource
+- **No-op write suppression** — content-equal writes consume no sequence number, emit no doorbell, bump no `object_version`. Default on; `ForceWrite` opt-out. Matches Kubernetes API-server semantics where an update that changes nothing does not advance resourceVersion
 - **Single-goroutine poll-primary watch** with LISTEN/NOTIFY doorbell as a latency-only optimization; all polling in one goroutine with snapshot-isolated (REPEATABLE READ) poll cycles
 - **Tombstone compaction** via single CTE (atomic delete + horizon advancement)
 - **Timeline epochs** for failover detection
@@ -50,6 +51,13 @@ Every invariant has a corresponding race/failure scenario and a deterministic te
 | R13 | I5 | Single-goroutine scheduler: no concurrent polls under rapid doorbell + baseline overlap |
 | R14 | I6/I7 | Epoch mismatch on doorbell-triggered poll terminates watcher with 410 Gone (not swallowed) |
 | R15 | I7 | Mid-poll compaction: snapshot isolation makes compaction invisible within a poll cycle |
+| RB4a | I1/I5 | Identical write suppressed: no seq consumed, no version bump, counter unchanged |
+| RB4b | I1/I2 | Real change after no-op correctly sequenced (gets next seq) |
+| RB4c | I5 | Watcher sees no event for suppressed write |
+| RB4d | I1 | Replayed create with identical content suppressed |
+| RB4e | I1/I5 | WriteStatus suppression |
+| RB4f | — | ForceWrite bypasses suppression |
+| RB4g | I4 | Suppression holds FOR SHARE — grant blocks until suppressed txn commits |
 
 Additionally, R3 and R5 have Toxiproxy-enhanced variants that inject network-level faults (TCP RST) via a proxy container.
 
@@ -68,7 +76,7 @@ An optional canary writer measures write-to-delivery latency with p99 tracking v
 
 ## Spec/Status Split
 
-Both write paths (`Write` for spec, `WriteStatus` for status) share the same `gvk_bucket_counters` sequence and `object_version`, so watchers see a single ordered event stream covering both spec and status changes.
+Both write paths (`Write` for spec, `WriteStatus` for status) share the same `gvk_bucket_counters` sequence and `object_version`, so watchers see a single ordered event stream covering both spec and status changes. Both paths support no-op write suppression — `Write` compares all four content fields (spec, status, metadata, deletion_timestamp), `WriteStatus` compares only the status field. `WriteResult.Changed` indicates whether the write produced a new state; callers can use this to skip downstream side-effects on no-ops.
 
 Lease management matches the ownership pattern (see Assumption 4):
 
@@ -79,9 +87,9 @@ Lease management matches the ownership pattern (see Assumption 4):
 
 Phase 1 load test results on a local podman Postgres 16 container (macOS ARM64, 8 CPU, 3.8 GB RAM):
 
-**Per-bucket ceiling** (50 workers, 1 bucket): **1,045 writes/s**, p50=33ms, p99=231ms
+**Per-bucket ceiling** (50 workers, 1 bucket): **1,167 writes/s**, p50=28ms, p99=211ms
 
-**16-bucket scaling** (48 workers total): **2,548 writes/s**, p50=18ms, p99=45ms
+**16-bucket scaling** (48 workers total): **2,874 writes/s**, p50=18ms, p99=45ms
 
 All runs: zero serialization failures, zero fencing false-positives, zero invariant violations.
 
@@ -122,12 +130,15 @@ The [`examples/`](examples/) directory contains the same controller implemented 
 
 ```
 internal/
-  schema/       Schema migrations (5 tables: bucket_leases, ...)
+  schema/       Schema migrations (7 tables: bucket_leases, gvk_bucket_counters,
+                kubernetes_resources, cluster_epoch, compaction_horizon,
+                stream_checkpoints, mc_registry)
   model/        Core types (Resource, WriteRequest, StatusWriteRequest, WriteResult)
   lease/        Lease acquire/renew/release/grant + BothManager for atomic spec+status
-  writer/       Atomic write path (Write + WriteStatus) with TxHooks for test injection
+  writer/       Atomic write path (Write + WriteStatus) with no-op suppression, TxHooks
   reader/       List + single-goroutine poll-primary Watcher with snapshot polls
   compaction/   Tombstone compaction (single CTE: delete + horizon atomically)
+  checkpoint/   Fenced DynamoDB stream checkpoint (Save/Load/Delete)
   resourceversion/  Composite RV parse/serialize
   verifier/     Continuous invariant verifier (§6) — O(buckets) state, bounded ring buffer
 
@@ -136,7 +147,7 @@ pkg/
 
 test/
   testinfra/    Postgres + Toxiproxy container helpers (podman)
-  race/         Race catalog tests R1–R15
+  race/         Race catalog tests R1–R15, RB4a–g (no-op suppression)
   toxirace/     Toxiproxy-enhanced R3/R5
   loadtest/     Phase 1 counter ceiling + bucket scaling
 ```
@@ -147,8 +158,8 @@ Requires: Go 1.22+, podman with a running machine (`podman machine start`).
 
 ```bash
 make test-unit          # Pure unit tests (resourceversion)
-make test-integration   # All DB-backed tests (schema, lease, writer, reader, compaction, verifier)
-make test-race          # Race catalog R1–R15 under -race
+make test-integration   # All DB-backed tests (schema, lease, writer, reader, compaction, verifier, checkpoint)
+make test-race          # Race catalog R1–R15, RB4a–g under -race
 make test-toxirace      # Toxiproxy-enhanced R3/R5 (starts extra containers)
 make test-load          # Phase 1 load test (10s sustained, 50 workers)
 make test               # Unit + integration + race

@@ -124,8 +124,9 @@ type commitCutHook struct {
 	cutSignal *atomic.Bool
 }
 
-func (h *commitCutHook) AfterFence(_ context.Context, _ pgx.Tx) error   { return nil }
-func (h *commitCutHook) AfterCounter(_ context.Context, _ pgx.Tx, _ int64) error { return nil }
+func (h *commitCutHook) AfterFence(_ context.Context, _ pgx.Tx) error                    { return nil }
+func (h *commitCutHook) AfterSuppressionCheck(_ context.Context, _ pgx.Tx, _ bool) error { return nil }
+func (h *commitCutHook) AfterCounter(_ context.Context, _ pgx.Tx, _ int64) error         { return nil }
 
 func (h *commitCutHook) BeforeCommit(_ context.Context, _ pgx.Tx) error {
 	// Cut reads immediately — the COMMIT will be sent by pgx but the

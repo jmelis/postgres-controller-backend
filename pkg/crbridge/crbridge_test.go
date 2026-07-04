@@ -127,7 +127,13 @@ func TestClient_CreateConflict(t *testing.T) {
 	_, err := c.Create(context.Background(), ns, name, spec, json.RawMessage(`{}`), json.RawMessage(`{}`))
 	require.NoError(t, err)
 
-	_, err = c.Create(context.Background(), ns, name, spec, json.RawMessage(`{}`), json.RawMessage(`{}`))
+	// Replayed create with identical content is suppressed (no-op), not an error.
+	obj2, err := c.Create(context.Background(), ns, name, spec, json.RawMessage(`{}`), json.RawMessage(`{}`))
+	require.NoError(t, err, "replayed create with identical content succeeds as no-op")
+	assert.NotNil(t, obj2)
+
+	// Create with DIFFERENT content returns ErrAlreadyExists.
+	_, err = c.Create(context.Background(), ns, name, json.RawMessage(`{"replicas":99}`), json.RawMessage(`{}`), json.RawMessage(`{}`))
 	assert.True(t, errors.Is(err, crbridge.ErrAlreadyExists))
 }
 

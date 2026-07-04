@@ -35,6 +35,7 @@ type WriteRequest struct {
 	ExpectedVersion   int64 // 0 for create, >0 for update
 	LeaseHolder       string
 	LeaseEpoch        int64
+	ForceWrite        bool // skip no-op suppression; default false = suppress content-equal writes
 }
 
 type StatusWriteRequest struct {
@@ -46,10 +47,12 @@ type StatusWriteRequest struct {
 	ExpectedVersion int64
 	LeaseHolder     string
 	LeaseEpoch      int64
+	ForceWrite      bool // skip no-op suppression; default false = suppress content-equal writes
 }
 
 type WriteResult struct {
 	Seq           int64
 	ObjectVersion int64
 	UID           uuid.UUID
+	Changed       bool // false when suppressed (content-equal write)
 }

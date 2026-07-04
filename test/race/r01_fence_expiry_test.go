@@ -161,6 +161,9 @@ func (h *afterFenceBlockingHook) AfterFence(ctx context.Context, _ pgx.Tx) error
 	}
 }
 
+func (h *afterFenceBlockingHook) AfterSuppressionCheck(_ context.Context, _ pgx.Tx, _ bool) error {
+	return nil
+}
 func (h *afterFenceBlockingHook) AfterCounter(_ context.Context, _ pgx.Tx, _ int64) error {
 	return nil
 }

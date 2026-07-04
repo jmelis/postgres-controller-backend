@@ -89,8 +89,9 @@ type toxiCommitCutHook struct {
 	t *testing.T
 }
 
-func (h *toxiCommitCutHook) AfterFence(_ context.Context, _ pgx.Tx) error            { return nil }
-func (h *toxiCommitCutHook) AfterCounter(_ context.Context, _ pgx.Tx, _ int64) error { return nil }
+func (h *toxiCommitCutHook) AfterFence(_ context.Context, _ pgx.Tx) error                    { return nil }
+func (h *toxiCommitCutHook) AfterSuppressionCheck(_ context.Context, _ pgx.Tx, _ bool) error { return nil }
+func (h *toxiCommitCutHook) AfterCounter(_ context.Context, _ pgx.Tx, _ int64) error         { return nil }
 
 func (h *toxiCommitCutHook) BeforeCommit(_ context.Context, _ pgx.Tx) error {
 	// Add reset_peer toxic — kills existing connections by sending a RST

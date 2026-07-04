@@ -91,8 +91,9 @@ func newBlockingHook() *blockingHook {
 	}
 }
 
-func (h *blockingHook) AfterFence(_ context.Context, _ pgx.Tx) error   { return nil }
-func (h *blockingHook) AfterCounter(_ context.Context, _ pgx.Tx, _ int64) error { return nil }
+func (h *blockingHook) AfterFence(_ context.Context, _ pgx.Tx) error                    { return nil }
+func (h *blockingHook) AfterSuppressionCheck(_ context.Context, _ pgx.Tx, _ bool) error { return nil }
+func (h *blockingHook) AfterCounter(_ context.Context, _ pgx.Tx, _ int64) error         { return nil }
 
 func (h *blockingHook) BeforeCommit(ctx context.Context, _ pgx.Tx) error {
 	close(h.ready)

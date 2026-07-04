@@ -14,18 +14,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// B6 — Create collision returns raw Postgres error instead of typed sentinel.
-//
-// When Write is called with ExpectedVersion=0 and the resource already exists,
-// the INSERT hits a duplicate-key constraint (23505). The error surfaces as a
-// wrapped *pgconn.PgError instead of a typed ErrAlreadyExists. This breaks
-// caller retry/read-back logic that checks errors.Is.
-//
-// The counter increment rolls back correctly (I1 holds), so the next successful
-// write gets the expected seq.
-//
-// Expected current failure: errors.Is(err, ErrAlreadyExists) returns false;
-// the error is a raw "create resource: ERROR: duplicate key value..." message.
+// B6 — Replayed create with identical content is suppressed (no-op).
+// Replayed create with different content returns ErrAlreadyExists.
 func TestCreateConflict_ReturnsAlreadyExists(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires postgres")
@@ -50,15 +40,22 @@ func TestCreateConflict_ReturnsAlreadyExists(t *testing.T) {
 	}
 
 	// First create succeeds
-	_, err = w.Write(ctx, req)
+	r1, err := w.Write(ctx, req)
 	require.NoError(t, err)
+	assert.True(t, r1.Changed)
 
-	// Second create with ExpectedVersion=0 hits duplicate key
+	// Second create with identical content — suppressed (no-op)
+	r2, err := w.Write(ctx, req)
+	require.NoError(t, err, "replayed create with identical content must succeed as no-op")
+	assert.False(t, r2.Changed, "replayed create with identical content must be suppressed")
+	assert.Equal(t, r1.ObjectVersion, r2.ObjectVersion)
+
+	// Create with DIFFERENT content — ErrAlreadyExists
+	req.Spec = json.RawMessage(`{"replicas":99}`)
 	_, err = w.Write(ctx, req)
 	require.Error(t, err)
-
 	assert.ErrorIs(t, err, writer.ErrAlreadyExists,
-		"B6: duplicate create must return ErrAlreadyExists, got: %v", err)
+		"B6: duplicate create with different content must return ErrAlreadyExists, got: %v", err)
 
 	// Counter must have rolled back — next write gets seq=2 (not 3)
 	req2 := model.WriteRequest{

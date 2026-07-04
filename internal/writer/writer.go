@@ -2,8 +2,10 @@ package writer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -28,9 +30,17 @@ func (w *Writer) Write(ctx context.Context, req model.WriteRequest) (model.Write
 		domain: "spec",
 		gvk: req.GVK, namespace: req.Namespace, name: req.Name,
 		bucketID: req.BucketID, holder: req.LeaseHolder, epoch: req.LeaseEpoch,
+		forceWrite: req.ForceWrite,
 	}
 
-	return w.execWrite(ctx, p, func(ctx context.Context, tx pgx.Tx, seq int64) (uuid.UUID, int64, error) {
+	checker := func(existing *existingRow) bool {
+		return jsonEqual(existing.spec, req.Spec) &&
+			jsonEqual(existing.status, req.Status) &&
+			jsonEqual(existing.metadata, req.Metadata) &&
+			timeEqual(existing.deletionTimestamp, req.DeletionTimestamp)
+	}
+
+	return w.execWrite(ctx, p, checker, func(ctx context.Context, tx pgx.Tx, seq int64) (uuid.UUID, int64, error) {
 		var uid uuid.UUID
 		var version int64
 
@@ -90,9 +100,14 @@ func (w *Writer) WriteStatus(ctx context.Context, req model.StatusWriteRequest) 
 		domain: "status",
 		gvk: req.GVK, namespace: req.Namespace, name: req.Name,
 		bucketID: req.BucketID, holder: req.LeaseHolder, epoch: req.LeaseEpoch,
+		forceWrite: req.ForceWrite,
 	}
 
-	return w.execWrite(ctx, p, func(ctx context.Context, tx pgx.Tx, seq int64) (uuid.UUID, int64, error) {
+	checker := func(existing *existingRow) bool {
+		return jsonEqual(existing.status, req.Status)
+	}
+
+	return w.execWrite(ctx, p, checker, func(ctx context.Context, tx pgx.Tx, seq int64) (uuid.UUID, int64, error) {
 		var uid uuid.UUID
 		var version int64
 
@@ -144,17 +159,32 @@ func (w *Writer) ReadBack(ctx context.Context, gvk, namespace, name string, seq 
 
 type upsertFunc func(ctx context.Context, tx pgx.Tx, seq int64) (uuid.UUID, int64, error)
 
+// contentChecker returns true if the existing row's content matches the request
+// (i.e., the write is a no-op). Only called when suppression is active and the
+// row exists.
+type contentChecker func(existing *existingRow) bool
+
+type existingRow struct {
+	uid               uuid.UUID
+	objectVersion     int64
+	spec              json.RawMessage
+	status            json.RawMessage
+	metadata          json.RawMessage
+	deletionTimestamp *time.Time
+}
+
 type writeParams struct {
-	domain    string
-	gvk       string
+	domain     string
+	gvk        string
 	namespace  string
 	name       string
 	bucketID   int
 	holder     string
 	epoch      int64
+	forceWrite bool
 }
 
-func (w *Writer) execWrite(ctx context.Context, p writeParams, upsert upsertFunc) (model.WriteResult, error) {
+func (w *Writer) execWrite(ctx context.Context, p writeParams, isContentEqual contentChecker, upsert upsertFunc) (model.WriteResult, error) {
 	tx, err := w.conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return model.WriteResult{}, fmt.Errorf("begin: %w", err)
@@ -177,6 +207,37 @@ func (w *Writer) execWrite(ctx context.Context, p writeParams, upsert upsertFunc
 
 	if err := w.hooks.AfterFence(ctx, tx); err != nil {
 		return model.WriteResult{}, err
+	}
+
+	// No-op suppression: check if the row already holds the requested content.
+	// Runs after the fence (so the FOR SHARE lock is held) and before the counter
+	// (so a suppressed write consumes no sequence number).
+	if !p.forceWrite {
+		existing, err := readExisting(ctx, tx, p.gvk, p.namespace, p.name)
+		if err != nil {
+			return model.WriteResult{}, err
+		}
+
+		suppressed := existing != nil && isContentEqual(existing)
+
+		if err := w.hooks.AfterSuppressionCheck(ctx, tx, suppressed); err != nil {
+			return model.WriteResult{}, err
+		}
+
+		if suppressed {
+			if err := tx.Commit(ctx); err != nil {
+				return model.WriteResult{}, fmt.Errorf("commit (suppressed): %w", err)
+			}
+			return model.WriteResult{
+				ObjectVersion: existing.objectVersion,
+				UID:           existing.uid,
+				Changed:       false,
+			}, nil
+		}
+	} else {
+		if err := w.hooks.AfterSuppressionCheck(ctx, tx, false); err != nil {
+			return model.WriteResult{}, err
+		}
 	}
 
 	var seq int64
@@ -220,5 +281,51 @@ func (w *Writer) execWrite(ctx context.Context, p writeParams, upsert upsertFunc
 		}
 	}
 
-	return model.WriteResult{Seq: seq, ObjectVersion: version, UID: uid}, nil
+	return model.WriteResult{Seq: seq, ObjectVersion: version, UID: uid, Changed: true}, nil
+}
+
+func readExisting(ctx context.Context, tx pgx.Tx, gvk, namespace, name string) (*existingRow, error) {
+	row := &existingRow{}
+	err := tx.QueryRow(ctx, `
+		SELECT uid, object_version, spec, status, metadata, deletion_timestamp
+		FROM kubernetes_resources
+		WHERE gvk = $1 AND namespace = $2 AND name = $3`,
+		gvk, namespace, name,
+	).Scan(&row.uid, &row.objectVersion, &row.spec, &row.status, &row.metadata, &row.deletionTimestamp)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read existing: %w", err)
+	}
+	return row, nil
+}
+
+func jsonEqual(a, b json.RawMessage) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	var va, vb any
+	if err := json.Unmarshal(a, &va); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(b, &vb); err != nil {
+		return false
+	}
+	ra, _ := json.Marshal(va)
+	rb, _ := json.Marshal(vb)
+	return string(ra) == string(rb)
+}
+
+func timeEqual(a, b *time.Time) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return a.Equal(*b)
 }

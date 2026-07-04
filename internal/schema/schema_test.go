@@ -39,6 +39,8 @@ func TestMigrateCreatesAllTables(t *testing.T) {
 		"compaction_horizon",
 		"gvk_bucket_counters",
 		"kubernetes_resources",
+		"mc_registry",
+		"stream_checkpoints",
 	}
 	assert.Equal(t, expected, tables)
 

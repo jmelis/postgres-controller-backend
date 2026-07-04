@@ -40,7 +40,7 @@ These are the properties the system promises. Everything else exists to uphold t
       v                                         |
 +---------------------------------------------------------------+
 |                     Custom Client Layer                       |
-|   WRITE: fence(share-lock) -> counter lock -> upsert -> bell  |
+|   WRITE: fence(share-lock) -> suppress? -> counter -> upsert -> bell  |
 |   WATCH: 5s timer ┐                                           |
 |         doorbell ─┼─► debounce(100ms, lead+trail) ─► poll     |
 |         (LISTEN) ─┘        dirty-flag coalesce      seq>hwm   |
@@ -111,6 +111,26 @@ CREATE TABLE compaction_horizon (
     gvk           TEXT   NOT NULL,
     compacted_seq BIGINT NOT NULL,
     PRIMARY KEY (bucket_id, gvk)
+);
+
+-- 6. DynamoDB stream checkpoint (fenced via bucket_leases FOR SHARE)
+CREATE TABLE stream_checkpoints (
+    stream_arn   TEXT        NOT NULL,
+    shard_id     TEXT        NOT NULL,
+    last_seq_num TEXT        NOT NULL,
+    holder_id    TEXT        NOT NULL,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (stream_arn, shard_id)
+);
+
+-- 7. MC registry: authoritative map from MC to bucket and DynamoDB table ARN
+CREATE TABLE mc_registry (
+    mc_id           TEXT PRIMARY KEY,
+    mc_index        INT  NOT NULL UNIQUE,
+    read_table_arn  TEXT NOT NULL,
+    read_stream_arn TEXT,
+    state           TEXT NOT NULL CHECK (state IN ('active', 'draining', 'retired')),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
 
@@ -205,6 +225,39 @@ COMMIT;
 The fencing guarantees (I4) apply independently per domain: `FOR SHARE` on the `(bucket_id, 'status')` row blocks a status lease grant while a status write is in-flight (R11), just as `FOR SHARE` on the `(bucket_id, 'spec')` row blocks a spec lease grant (R1). A spec writer and a status writer can operate concurrently on the same bucket — the counter's exclusive row lock serializes sequence issuance (I1/I2), but the fence locks are on different rows and do not conflict (R12).
 
 Most controllers own both spec and status for their resources. `BothManager` provides `AcquireBoth`/`RenewBoth`/`ReleaseBoth` — each is a single multi-row statement against `bucket_leases` (atomic without an explicit transaction). For the minority of controllers that split ownership (e.g., API server writes spec, a separate controller writes status), `NewSpecManager` and `NewStatusManager` operate independently.
+
+### 3.3c No-Op Write Suppression
+
+Content-equal writes consume no sequence number, emit no doorbell, and bump no `object_version`. This matches Kubernetes API-server semantics where an update that changes nothing does not advance resourceVersion. The feature is default-on; callers set `ForceWrite: true` to bypass it.
+
+**Mechanism:** after the fence check (step a) and before the counter increment (step b), the writer reads the existing row by primary key within the same transaction:
+
+```sql
+SELECT spec, status, metadata, deletion_timestamp, object_version, uid
+FROM kubernetes_resources
+WHERE gvk = $gvk AND namespace = $ns AND name = $name;
+```
+
+If the row exists and all compared fields are equal to the incoming values, the transaction commits immediately (releasing the `FOR SHARE` lock) with no counter increment, no upsert, and no doorbell. The result is `WriteResult{Changed: false, ObjectVersion: existing, UID: existing, Seq: 0}`.
+
+**Field comparison rules:**
+- `Write()` compares all four content fields: `spec`, `status`, `metadata`, `deletion_timestamp`. JSONB equality (`=`) is key-order-insensitive; timestamp comparison uses `time.Equal()` to handle timezone normalization.
+- `WriteStatus()` compares only `status`.
+
+**Create-path behavior (ExpectedVersion == 0):** if the row already exists and content matches, the write is treated as a replayed create — returns `Changed: false` with the existing row's version and UID. If content differs, returns `ErrAlreadyExists` as before.
+
+**`WriteResult.Changed`** indicates whether the write produced a new state. Callers can use this to skip downstream side-effects (e.g., the DynamoDB bridge skips doorbell emission on `Changed: false`).
+
+**Invariants preserved:**
+- **I1 (gapless):** suppressed writes don't touch the counter — no gap possible.
+- **I2 (commit order):** no counter change, no ordering concern.
+- **I4 (single writer):** the `FOR SHARE` lock is still held for the duration of the transaction, even on suppression. A lease grant blocks until the suppressed transaction commits (RB4g).
+- **I5 (exactly-once delivery):** no event emitted for no state change — correct Kubernetes semantics.
+- **I8 (optimistic concurrency):** content-equal ⇒ intent satisfied regardless of version.
+
+**Performance:** one additional PK read per write. Under load tests with unique content per write (suppression finds "no match" and proceeds normally), no measurable regression — 1,167 writes/s single-bucket ceiling vs. 1,045 baseline.
+
+**Test hook:** `AfterSuppressionCheck(ctx, tx, suppressed bool)` in the `TxHooks` interface enables deterministic interleaving tests (RB4g).
 
 ### 3.4 Lease Fencing — closing the expiry race (hardening added in v4)
 
@@ -305,6 +358,14 @@ Every entry names the invariant at stake, the interleaving, the defense, and the
 * **R13 — Single-goroutine poll serialization (I5).** Rapid doorbell bursts overlapping with the baseline timer must not produce concurrent poll cycles — the `hwm` map is not safe for concurrent access and concurrent polls could deliver events out of order. *Defense:* single-goroutine scheduler (§3.6) — only one goroutine reads `hwm`, the listen goroutine only forwards into a buffered channel. *Test:* fire 10 rapid doorbells while baseline timer is due; assert exactly one poll executes at a time and events arrive in seq order.
 * **R14 — Epoch mismatch on doorbell-triggered poll (I6/I7).** A doorbell triggers a poll after the cluster epoch has been bumped. The watcher must terminate with 410 Gone, not silently swallow the error. *Defense:* every poll error (including epoch mismatch) causes `Run()` to return, closing the events channel — the watch adapter sees the channel close and propagates (§3.6). The listen goroutine uses a child context that is cancelled when `Run()` exits, ensuring prompt shutdown. *Test:* start watcher, bump `cluster_epoch`, trigger a doorbell to force a poll; assert the watcher terminates and the events channel closes within 5 s.
 * **R15 — Mid-poll compaction (I7).** Compaction runs and advances the horizon while a watcher is mid-poll. The watcher must not see an inconsistent state (some rows deleted, horizon advanced, within a single poll cycle). *Defense:* REPEATABLE READ snapshot isolation — the poll transaction sees the database as of its snapshot instant; the compaction's DELETE and horizon UPDATE are invisible within the poll cycle. *Test:* start a watcher poll (paused via hook), run compaction in a separate session, resume the poll; assert the watcher sees all pre-compaction rows and no unexplained gaps.
+* **RB4 — No-op write suppression (I1/I4/I5).** Content-equal writes must be suppressed without violating any invariant. Seven sub-cases:
+  - **RB4a** — Identical write suppressed: no seq consumed, no version bump, counter unchanged.
+  - **RB4b** — Real change after no-op correctly sequenced (gets next seq, watcher sees exactly one event).
+  - **RB4c** — Watcher sees no event for suppressed write (I5).
+  - **RB4d** — Replayed create with identical content suppressed (counter unchanged).
+  - **RB4e** — WriteStatus suppression (only status field compared).
+  - **RB4f** — ForceWrite bypasses suppression.
+  - **RB4g** — Suppression under fence interleaving (I4): `AfterSuppressionCheck` hook pauses a suppressed write; grant attempt must block because `FOR SHARE` is held. *Defense:* same §3.4 share-lock — the suppressed transaction holds the share lock for its entire lifetime, even though it performs no counter increment or upsert. *Test:* session A writes identical content (suppressed), paused after suppression check; session B attempts Grant — must block; unblock A, verify A completes as no-op, B completes after A.
 
 ## 6. Continuous Invariant Verification (production, not just tests)
 

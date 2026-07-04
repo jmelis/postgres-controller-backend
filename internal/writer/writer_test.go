@@ -94,6 +94,9 @@ func TestConflictReturns409(t *testing.T) {
 	_, err := w.Write(ctx, req)
 	require.NoError(t, err)
 
+	// Different content + stale version → 409 (suppression does not apply
+	// because content differs).
+	req.Spec = json.RawMessage(`{"replicas":99}`)
 	req.ExpectedVersion = 999
 	_, err = w.Write(ctx, req)
 	assert.ErrorIs(t, err, writer.ErrConflict)
