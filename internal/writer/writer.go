@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jmelisba/postgres-controller-backend/internal/model"
 )
 
@@ -24,7 +25,7 @@ func New(conn *pgx.Conn, hooks TxHooks) *Writer {
 
 func (w *Writer) Write(ctx context.Context, req model.WriteRequest) (model.WriteResult, error) {
 	p := writeParams{
-		fenceTable: "bucket_spec_leases",
+		domain: "spec",
 		gvk: req.GVK, namespace: req.Namespace, name: req.Name,
 		bucketID: req.BucketID, holder: req.LeaseHolder, epoch: req.LeaseEpoch,
 	}
@@ -44,6 +45,10 @@ func (w *Writer) Write(ctx context.Context, req model.WriteRequest) (model.Write
 				req.Spec, req.Status, req.Metadata, req.DeletionTimestamp,
 			).Scan(&uid, &version)
 			if err != nil {
+				var pgErr *pgconn.PgError
+				if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+					return uuid.Nil, 0, ErrAlreadyExists
+				}
 				return uuid.Nil, 0, fmt.Errorf("create resource: %w", err)
 			}
 		} else {
@@ -71,8 +76,8 @@ func (w *Writer) Write(ctx context.Context, req model.WriteRequest) (model.Write
 	})
 }
 
-// WriteStatus updates only the status sub-resource, fencing against
-// bucket_status_leases instead of bucket_spec_leases. The object must already
+// WriteStatus updates only the status sub-resource, fencing against the
+// status row of bucket_leases instead of the spec row. The object must already
 // exist (ExpectedVersion > 0). Spec, metadata, and deletion_timestamp are not
 // touched. The shared gvk_bucket_seq counter and object_version are bumped so
 // watchers see status changes in the same ordered stream as spec changes.
@@ -82,7 +87,7 @@ func (w *Writer) WriteStatus(ctx context.Context, req model.StatusWriteRequest) 
 	}
 
 	p := writeParams{
-		fenceTable: "bucket_status_leases",
+		domain: "status",
 		gvk: req.GVK, namespace: req.Namespace, name: req.Name,
 		bucketID: req.BucketID, holder: req.LeaseHolder, epoch: req.LeaseEpoch,
 	}
@@ -140,8 +145,8 @@ func (w *Writer) ReadBack(ctx context.Context, gvk, namespace, name string, seq 
 type upsertFunc func(ctx context.Context, tx pgx.Tx, seq int64) (uuid.UUID, int64, error)
 
 type writeParams struct {
-	fenceTable string
-	gvk        string
+	domain    string
+	gvk       string
 	namespace  string
 	name       string
 	bucketID   int
@@ -157,12 +162,12 @@ func (w *Writer) execWrite(ctx context.Context, p writeParams, upsert upsertFunc
 	defer tx.Rollback(ctx)
 
 	var fenceOK int
-	err = tx.QueryRow(ctx, fmt.Sprintf(`
-		SELECT 1 FROM %s
-		WHERE bucket_id = $1 AND holder = $2
-		  AND epoch = $3 AND expires_at > now()
-		FOR SHARE`, p.fenceTable),
-		p.bucketID, p.holder, p.epoch).Scan(&fenceOK)
+	err = tx.QueryRow(ctx, `
+		SELECT 1 FROM bucket_leases
+		WHERE bucket_id = $1 AND domain = $2 AND holder = $3
+		  AND epoch = $4 AND expires_at > now()
+		FOR SHARE`,
+		p.bucketID, p.domain, p.holder, p.epoch).Scan(&fenceOK)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return model.WriteResult{}, ErrFenceViolation
@@ -195,9 +200,8 @@ func (w *Writer) execWrite(ctx context.Context, p writeParams, upsert upsertFunc
 		return model.WriteResult{}, err
 	}
 
-	_, err = tx.Exec(ctx, `SELECT pg_notify($1, $2)`,
-		fmt.Sprintf("resource_changes_b%d", p.bucketID),
-		fmt.Sprintf(`{"bucket_id":%d,"gvk":"%s","seq":%d}`, p.bucketID, p.gvk, seq))
+	_, err = tx.Exec(ctx, `SELECT pg_notify($1, '')`,
+		fmt.Sprintf("resource_changes_b%d", p.bucketID))
 	if err != nil {
 		return model.WriteResult{}, fmt.Errorf("doorbell: %w", err)
 	}

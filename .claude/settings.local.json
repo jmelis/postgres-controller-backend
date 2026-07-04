@@ -20,7 +20,9 @@
       "Bash(make test-race *)",
       "Bash(make test-integration *)",
       "Bash(podman search *)",
-      "Bash(podman pull *)"
+      "Bash(podman pull *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }

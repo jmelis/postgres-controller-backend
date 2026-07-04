@@ -14,9 +14,9 @@ import (
 )
 
 // R11 — Status fence-expiry race (I4 for status sub-resource).
-// Mirrors R1 but for the status write path: FOR SHARE on bucket_status_leases
-// must block a coordinator's Grant (epoch bump UPDATE) while a status writer
-// is mid-transaction.
+// Mirrors R1 but for the status write path: FOR SHARE on the status row of
+// bucket_leases must block a coordinator's Grant (epoch bump UPDATE) while a
+// status writer is mid-transaction.
 func TestR11_StatusFenceExpiryRace(t *testing.T) {
 	truncateAll(t)
 	ctx := context.Background()
@@ -54,7 +54,7 @@ func TestR11_StatusFenceExpiryRace(t *testing.T) {
 		aCh <- writeResult{r, err}
 	}()
 
-	// Wait for A to reach BeforeCommit (holds FOR SHARE on bucket_status_leases)
+	// Wait for A to reach BeforeCommit (holds FOR SHARE on the status row)
 	select {
 	case <-hook.ready:
 	case <-time.After(10 * time.Second):

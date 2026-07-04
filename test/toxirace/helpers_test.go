@@ -49,8 +49,7 @@ func truncateAll(t *testing.T) {
 	tables := []string{
 		"kubernetes_resources",
 		"gvk_bucket_counters",
-		"bucket_spec_leases",
-		"bucket_status_leases",
+		"bucket_leases",
 		"compaction_horizon",
 	}
 	ctx := context.Background()

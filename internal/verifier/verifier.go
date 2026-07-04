@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -16,7 +17,7 @@ import (
 
 // Violation represents a detected invariant violation.
 type Violation struct {
-	Invariant string // I1, I3, I4, I5, I6, I7
+	Invariant string // I3, I5, I6, I7
 	Bucket    int
 	GVK       string
 	Detail    string
@@ -51,14 +52,19 @@ type Result struct {
 	CanaryP99     time.Duration
 }
 
-// Verifier is the continuous invariant verification consumer from §6.
+const canaryRingSize = 1000
+
+// Verifier is the continuous invariant verification consumer.
 // It subscribes via the ordinary poll path and checks:
-//   - I1: per-(GVK, bucket) seq contiguity
-//   - I3/I6: monotonic hwm
-//   - I5: no duplicate (object, seq) deliveries
-//   - I7: all gaps explained by compaction horizon
+//   - I3/I6: monotonic hwm (seq must be strictly greater than previous hwm)
+//   - I5: no duplicate delivery (duplicate ⇒ seq <= hwm, caught by I3 check)
+//   - I7: hwm-below-horizon implies 410 was received
 //
-// Optionally writes a synthetic canary object to measure write→delivery latency.
+// Stream-side seq contiguity (I1 gap checking) is deliberately omitted:
+// coalescing (I5 permits it) means two rapid writes to the same object leave
+// only the latest seq in the table. The resulting gap is legitimate, not data
+// loss. If gap auditing is needed later, it must cross-check the table to
+// verify the gap seq was superseded by a later object_version of some object.
 type Verifier struct {
 	cfg        Config
 	pollConn   *pgx.Conn
@@ -66,11 +72,12 @@ type Verifier struct {
 
 	mu          sync.Mutex
 	violations  []Violation
-	seenKeys    map[string]bool // "bucket:seq" → seen
 	hwm         map[int]int64
 	eventsCount int64
 	canaryCount int64
-	canaryTimes []time.Duration
+	canaryTimes [canaryRingSize]time.Duration
+	canaryIdx   int
+	canaryFull  bool
 }
 
 // New creates a verifier. canaryConn may be nil to disable canary writes.
@@ -91,13 +98,11 @@ func New(pollConn, canaryConn *pgx.Conn, cfg Config) *Verifier {
 		cfg:        cfg,
 		pollConn:   pollConn,
 		canaryConn: canaryConn,
-		seenKeys:   make(map[string]bool),
 		hwm:        hwm,
 	}
 }
 
 // Run starts the verifier. Blocks until ctx is cancelled.
-// Returns nil on clean shutdown (context cancelled), or the first fatal error.
 func (v *Verifier) Run(ctx context.Context) error {
 	watcher := reader.NewWatcher(v.pollConn, nil, reader.WatcherConfig{
 		GVK:              v.cfg.GVK,
@@ -150,10 +155,18 @@ func (v *Verifier) Result() Result {
 	defer v.mu.Unlock()
 
 	var p99 time.Duration
-	if len(v.canaryTimes) > 0 {
-		sorted := make([]time.Duration, len(v.canaryTimes))
-		copy(sorted, v.canaryTimes)
-		sortDurations(sorted)
+	n := v.canaryIdx
+	if v.canaryFull {
+		n = canaryRingSize
+	}
+	if n > 0 {
+		sorted := make([]time.Duration, n)
+		if v.canaryFull {
+			copy(sorted, v.canaryTimes[:])
+		} else {
+			copy(sorted, v.canaryTimes[:n])
+		}
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 		idx := int(float64(len(sorted)) * 0.99)
 		if idx >= len(sorted) {
 			idx = len(sorted) - 1
@@ -177,42 +190,10 @@ func (v *Verifier) checkEvent(ev reader.Event) {
 	bucket := ev.Resource.BucketID
 	seq := ev.Resource.GVKBucketSeq
 
-	// I5: no duplicate (object, seq)
-	key := fmt.Sprintf("%d:%d", bucket, seq)
-	if v.seenKeys[key] {
-		v.addViolation(Violation{
-			Invariant: "I5",
-			Bucket:    bucket,
-			GVK:       v.cfg.GVK,
-			Detail:    fmt.Sprintf("duplicate delivery: seq=%d", seq),
-			Time:      time.Now(),
-		})
-		return
-	}
-	v.seenKeys[key] = true
-
-	// I1: seq contiguity — seq must be exactly hwm+1 or explainable by compaction
 	prevHWM := v.hwm[bucket]
-	if seq != prevHWM+1 && seq > prevHWM+1 {
-		// Gap detected — check if compaction explains it
-		var compactedSeq *int64
-		err := v.pollConn.QueryRow(context.Background(),
-			`SELECT compacted_seq FROM compaction_horizon WHERE bucket_id = $1 AND gvk = $2`,
-			bucket, v.cfg.GVK).Scan(&compactedSeq)
-		if err == nil && compactedSeq != nil && *compactedSeq >= prevHWM+1 {
-			// I7: gap explained by compaction — OK
-		} else {
-			v.addViolation(Violation{
-				Invariant: "I1",
-				Bucket:    bucket,
-				GVK:       v.cfg.GVK,
-				Detail:    fmt.Sprintf("seq gap: expected %d, got %d (compaction does not explain)", prevHWM+1, seq),
-				Time:      time.Now(),
-			})
-		}
-	}
 
-	// I3/I6: monotonic hwm — seq must be > previous hwm
+	// I3/I5/I6: monotonic hwm — seq must be strictly greater than previous hwm.
+	// A duplicate delivery has seq <= hwm (caught here as I3).
 	if seq <= prevHWM {
 		v.addViolation(Violation{
 			Invariant: "I3",
@@ -262,18 +243,15 @@ func (v *Verifier) writeCanary(ctx context.Context) {
 
 	v.mu.Lock()
 	v.canaryCount++
-	v.canaryTimes = append(v.canaryTimes, latency)
+	v.canaryTimes[v.canaryIdx] = latency
+	v.canaryIdx++
+	if v.canaryIdx >= canaryRingSize {
+		v.canaryIdx = 0
+		v.canaryFull = true
+	}
 	v.mu.Unlock()
 }
 
 func (v *Verifier) addViolation(viol Violation) {
 	v.violations = append(v.violations, viol)
-}
-
-func sortDurations(d []time.Duration) {
-	for i := 1; i < len(d); i++ {
-		for j := i; j > 0 && d[j] < d[j-1]; j-- {
-			d[j], d[j-1] = d[j-1], d[j]
-		}
-	}
 }

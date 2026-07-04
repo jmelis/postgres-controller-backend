@@ -8,6 +8,7 @@ import (
 var (
 	ErrFenceViolation = errors.New("fence violation: lease not held or epoch mismatch")
 	ErrConflict       = errors.New("conflict: object version mismatch (409)")
+	ErrAlreadyExists  = errors.New("already exists: resource with this key already exists")
 )
 
 type AmbiguousCommitError struct {

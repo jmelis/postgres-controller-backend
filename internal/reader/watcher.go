@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -24,22 +23,26 @@ type WatcherConfig struct {
 }
 
 type Watcher struct {
-	cfg       WatcherConfig
-	pollConn  *pgx.Conn
+	cfg        WatcherConfig
+	pollConn   *pgx.Conn
 	listenConn *pgx.Conn
-	events    chan Event
-	hwm       map[int]int64 // per-bucket high-water mark
-	mu        sync.Mutex
-	dirty     atomic.Bool
-	lastPoll  time.Time
-	stopCh    chan struct{}
-	hooks     WatchHooks
+	events     chan Event
+	hwm        map[int]int64 // per-bucket high-water mark; only touched from the Run goroutine
+	stopCh     chan struct{}
+	hooks      WatchHooks
 }
 
 // WatchHooks allows tests to observe or inject behavior during poll cycles.
 type WatchHooks interface {
 	BeforePoll()
 	AfterPoll(events []Event)
+}
+
+// WatchHooksWithHorizon is an optional extension for testing compaction races.
+// If the hooks value implements this interface, AfterHorizonCheck is called
+// between the compaction horizon check and the row query in pollBucket.
+type WatchHooksWithHorizon interface {
+	AfterHorizonCheck(bucketID int)
 }
 
 func NewWatcher(pollConn, listenConn *pgx.Conn, cfg WatcherConfig, hooks WatchHooks) *Watcher {
@@ -58,13 +61,13 @@ func NewWatcher(pollConn, listenConn *pgx.Conn, cfg WatcherConfig, hooks WatchHo
 	}
 
 	return &Watcher{
-		cfg:      cfg,
-		pollConn: pollConn,
+		cfg:        cfg,
+		pollConn:   pollConn,
 		listenConn: listenConn,
-		events:   make(chan Event, 256),
-		hwm:      hwm,
-		stopCh:   make(chan struct{}),
-		hooks:    hooks,
+		events:     make(chan Event, 256),
+		hwm:        hwm,
+		stopCh:     make(chan struct{}),
+		hooks:      hooks,
 	}
 }
 
@@ -74,8 +77,13 @@ func (w *Watcher) Events() <-chan Event {
 }
 
 // Run starts the watch loop. Blocks until ctx is cancelled or Stop is called.
+//
+// Single-goroutine scheduler: one loop owns all polling and one timer. The
+// listen goroutine (if present) only forwards notifications into a 1-buffered
+// channel. hwm is never accessed concurrently.
 func (w *Watcher) Run(ctx context.Context) error {
-	// Set up LISTEN for all buckets
+	defer close(w.events)
+
 	if w.listenConn != nil {
 		for _, bid := range w.cfg.BucketIDs {
 			channel := fmt.Sprintf("resource_changes_b%d", bid)
@@ -90,17 +98,25 @@ func (w *Watcher) Run(ctx context.Context) error {
 		return err
 	}
 
-	baselineTicker := time.NewTicker(w.cfg.BaselineInterval)
-	defer baselineTicker.Stop()
+	lastPoll := time.Now()
+	doorbellPending := false
 
-	// Doorbell listener goroutine
+	timer := time.NewTimer(w.cfg.BaselineInterval)
+	defer timer.Stop()
+
+	// Doorbell listener goroutine — uses a child context so we can cancel it
+	// when the main loop exits (e.g. on poll error), without waiting for the
+	// caller's context to expire.
+	listenCtx, listenCancel := context.WithCancel(ctx)
+	defer listenCancel()
+
 	doorbellCh := make(chan struct{}, 1)
 	var listenWg sync.WaitGroup
 	if w.listenConn != nil {
 		listenWg.Add(1)
 		go func() {
 			defer listenWg.Done()
-			w.listenLoop(ctx, doorbellCh)
+			w.listenLoop(listenCtx, doorbellCh)
 		}()
 	}
 
@@ -112,19 +128,52 @@ func (w *Watcher) Run(ctx context.Context) error {
 			goto shutdown
 		case <-w.stopCh:
 			goto shutdown
-		case <-baselineTicker.C:
+
+		case <-doorbellCh:
+			sinceLastPoll := time.Since(lastPoll)
+			if sinceLastPoll >= w.cfg.DebounceFloor {
+				// Leading edge: poll immediately
+				if err := w.poll(ctx); err != nil {
+					retErr = err
+					goto shutdown
+				}
+				lastPoll = time.Now()
+				doorbellPending = false
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(w.cfg.BaselineInterval)
+			} else {
+				// Trailing edge: schedule poll at lastPoll + DebounceFloor
+				doorbellPending = true
+				remaining := w.cfg.DebounceFloor - sinceLastPoll
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(remaining)
+			}
+
+		case <-timer.C:
 			if err := w.poll(ctx); err != nil {
 				retErr = err
 				goto shutdown
 			}
-		case <-doorbellCh:
-			w.debouncedPoll(ctx)
+			lastPoll = time.Now()
+			doorbellPending = false
+			_ = doorbellPending // used on next iteration
+			timer.Reset(w.cfg.BaselineInterval)
 		}
 	}
 
 shutdown:
+	listenCancel()
 	listenWg.Wait()
-	close(w.events)
 	return retErr
 }
 
@@ -152,11 +201,9 @@ func (w *Watcher) listenLoop(ctx context.Context, notify chan<- struct{}) {
 			if ctx.Err() != nil {
 				return
 			}
-			// Doorbell loss — poll-primary handles it (R3 defense)
 			continue
 		}
 
-		// Non-blocking signal
 		select {
 		case notify <- struct{}{}:
 		default:
@@ -164,47 +211,26 @@ func (w *Watcher) listenLoop(ctx context.Context, notify chan<- struct{}) {
 	}
 }
 
-func (w *Watcher) debouncedPoll(ctx context.Context) {
-	w.mu.Lock()
-	sinceLastPoll := time.Since(w.lastPoll)
-	w.mu.Unlock()
-
-	if sinceLastPoll >= w.cfg.DebounceFloor {
-		// Leading edge: poll immediately
-		w.poll(ctx)
-	} else {
-		// Set dirty flag and schedule trailing poll
-		if !w.dirty.Swap(true) {
-			go func() {
-				remaining := w.cfg.DebounceFloor - sinceLastPoll
-				timer := time.NewTimer(remaining)
-				defer timer.Stop()
-				select {
-				case <-timer.C:
-					w.dirty.Store(false)
-					w.poll(ctx)
-					// Recheck dirty after poll (clear-before-snapshot defense for R2)
-					if w.dirty.Load() {
-						w.dirty.Store(false)
-						w.poll(ctx)
-					}
-				case <-ctx.Done():
-				case <-w.stopCh:
-				}
-			}()
-		}
-	}
-}
-
+// poll runs one poll cycle inside a REPEATABLE READ read-only transaction.
+// Epoch check, per-bucket horizon checks, and row queries all share the same
+// snapshot — mid-poll compaction is invisible (B3 fix).
 func (w *Watcher) poll(ctx context.Context) error {
 	if w.hooks != nil {
 		w.hooks.BeforePoll()
 	}
 
-	// Check timeline epoch (I6/R9 defense): if the DB epoch has changed
-	// since our StartRV, the client must relist.
+	tx, err := w.pollConn.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return fmt.Errorf("poll begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Epoch check (I6/R9 defense)
 	var currentEpoch int64
-	if err := w.pollConn.QueryRow(ctx, `SELECT timeline_id FROM cluster_epoch`).Scan(&currentEpoch); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT timeline_id FROM cluster_epoch`).Scan(&currentEpoch); err != nil {
 		return fmt.Errorf("poll epoch check: %w", err)
 	}
 	if w.cfg.StartRV.Epoch != 0 && currentEpoch != w.cfg.StartRV.Epoch {
@@ -212,22 +238,19 @@ func (w *Watcher) poll(ctx context.Context) error {
 			w.cfg.StartRV.Epoch, currentEpoch, ErrGone)
 	}
 
-	// Clear dirty flag BEFORE taking the snapshot (R2 defense: clear-before-snapshot)
-	w.dirty.Store(false)
-
 	var allEvents []Event
 
 	for _, bid := range w.cfg.BucketIDs {
-		events, err := w.pollBucket(ctx, bid)
+		events, err := w.pollBucket(ctx, tx, bid)
 		if err != nil {
 			return err
 		}
 		allEvents = append(allEvents, events...)
 	}
 
-	w.mu.Lock()
-	w.lastPoll = time.Now()
-	w.mu.Unlock()
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("poll commit: %w", err)
+	}
 
 	for _, ev := range allEvents {
 		select {
@@ -246,12 +269,11 @@ func (w *Watcher) poll(ctx context.Context) error {
 	return nil
 }
 
-func (w *Watcher) pollBucket(ctx context.Context, bucketID int) ([]Event, error) {
+func (w *Watcher) pollBucket(ctx context.Context, tx pgx.Tx, bucketID int) ([]Event, error) {
 	hwm := w.hwm[bucketID]
 
-	// Check compaction horizon — if our hwm is below it, 410 Gone (I7)
 	var compactedSeq *int64
-	err := w.pollConn.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		SELECT compacted_seq FROM compaction_horizon
 		WHERE bucket_id = $1 AND gvk = $2`,
 		bucketID, w.cfg.GVK).Scan(&compactedSeq)
@@ -263,7 +285,13 @@ func (w *Watcher) pollBucket(ctx context.Context, bucketID int) ([]Event, error)
 			bucketID, ErrGone, hwm, *compactedSeq)
 	}
 
-	rows, err := w.pollConn.Query(ctx, `
+	if w.hooks != nil {
+		if h, ok := w.hooks.(WatchHooksWithHorizon); ok {
+			h.AfterHorizonCheck(bucketID)
+		}
+	}
+
+	rows, err := tx.Query(ctx, `
 		SELECT gvk, namespace, name, uid, bucket_id, gvk_bucket_seq,
 		       object_version, spec, status, metadata,
 		       deletion_timestamp, created_at, updated_at

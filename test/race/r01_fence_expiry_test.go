@@ -14,8 +14,8 @@ import (
 
 // R1 — Fence-expiry race (I4).
 // Writer A passes fence, pauses before COMMIT. Coordinator attempts epoch bump
-// (UPDATE bucket_spec_leases SET epoch=epoch+1). The UPDATE must block because A
-// holds FOR SHARE on the lease row.
+// (UPDATE bucket_leases SET epoch=epoch+1 for the spec row). The UPDATE must
+// block because A holds FOR SHARE on the spec row.
 //
 // Sequence:
 // 1. Session A: BEGIN → fence FOR SHARE → counter → upsert → BeforeCommit hook blocks

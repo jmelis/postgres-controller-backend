@@ -77,8 +77,7 @@ func (db *TestDB) TruncateAll(t testing.TB, conn *pgx.Conn) {
 	tables := []string{
 		"kubernetes_resources",
 		"gvk_bucket_counters",
-		"bucket_spec_leases",
-		"bucket_status_leases",
+		"bucket_leases",
 		"compaction_horizon",
 	}
 	ctx := context.Background()
@@ -86,6 +85,9 @@ func (db *TestDB) TruncateAll(t testing.TB, conn *pgx.Conn) {
 		if _, err := conn.Exec(ctx, "TRUNCATE "+tbl+" CASCADE"); err != nil {
 			t.Fatalf("truncate %s: %v", tbl, err)
 		}
+	}
+	if _, err := conn.Exec(ctx, "UPDATE cluster_epoch SET timeline_id = 1"); err != nil {
+		t.Fatalf("reset cluster_epoch: %v", err)
 	}
 }
 
