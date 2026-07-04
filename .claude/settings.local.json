@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(podman version *)",
+      "Bash(podman machine *)",
+      "Bash(kind get *)",
+      "Bash(KIND_EXPERIMENTAL_PROVIDER=podman kind get clusters)",
+      "Bash(go version *)",
+      "Bash(go doc *)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:golang.testcontainers.org)",
+      "Bash(go mod *)",
+      "Bash(go get *)",
+      "Bash(go test *)",
+      "Bash(go vet *)",
+      "Bash(go build *)",
+      "Bash(make build *)",
+      "Bash(make test-unit *)",
+      "Bash(make test-race *)",
+      "Bash(make test-integration *)"
+    ]
+  }
+}
