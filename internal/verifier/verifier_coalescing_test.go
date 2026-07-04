@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jmelisba/postgres-controller-backend/internal/model"
-	"github.com/jmelisba/postgres-controller-backend/internal/verifier"
-	"github.com/jmelisba/postgres-controller-backend/internal/writer"
+	"github.com/jmelis/postgres-controller-backend/internal/model"
+	"github.com/jmelis/postgres-controller-backend/internal/verifier"
+	"github.com/jmelis/postgres-controller-backend/internal/writer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

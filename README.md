@@ -10,7 +10,7 @@ This design exploits constraints that a fleet controller satisfies but a general
 
 1. **The controller owns the write path.** Writes come from controller-runtime reconcilers, not from arbitrary API clients. The controller knows which resources it manages and can accept bucket-level lease assignment.
 
-2. **Closed GVK set.** The set of resource types (GVKs) is known at deployment time. This allows partitioning resources into a fixed number of buckets with per-(GVK, bucket) sequence counters, rather than a single global sequence.
+2. **Fixed bucket count.** The number of buckets is set at deployment time. Each (GVK, bucket) pair gets its own sequence counter created on first use, so there is no single global sequence bottleneck. Changing the bucket count is an epoch-bump migration (all watchers 410 + relist).
 
 3. **Single writer per bucket per sub-resource.** Each bucket has at most one spec writer and one status writer at any time, enforced by lease-based fencing. This replaces etcd's raft consensus with a cheaper mechanism — row-level `FOR SHARE` locks on lease tables.
 

@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jmelisba/postgres-controller-backend/internal/reader"
-	"github.com/jmelisba/postgres-controller-backend/internal/resourceversion"
+	"github.com/jmelis/postgres-controller-backend/internal/reader"
+	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
 	"github.com/stretchr/testify/assert"
 )
 

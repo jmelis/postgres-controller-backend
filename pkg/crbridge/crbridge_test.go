@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelisba/postgres-controller-backend/internal/lease"
-	"github.com/jmelisba/postgres-controller-backend/pkg/crbridge"
-	"github.com/jmelisba/postgres-controller-backend/test/testinfra"
+	"github.com/jmelis/postgres-controller-backend/internal/lease"
+	"github.com/jmelis/postgres-controller-backend/pkg/crbridge"
+	"github.com/jmelis/postgres-controller-backend/test/testinfra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

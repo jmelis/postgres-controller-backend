@@ -9,10 +9,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelisba/postgres-controller-backend/internal/model"
-	"github.com/jmelisba/postgres-controller-backend/internal/reader"
-	"github.com/jmelisba/postgres-controller-backend/internal/resourceversion"
-	"github.com/jmelisba/postgres-controller-backend/internal/writer"
+	"github.com/jmelis/postgres-controller-backend/internal/model"
+	"github.com/jmelis/postgres-controller-backend/internal/reader"
+	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
+	"github.com/jmelis/postgres-controller-backend/internal/writer"
 )
 
 // Violation represents a detected invariant violation.

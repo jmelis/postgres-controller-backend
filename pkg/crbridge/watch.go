@@ -1,7 +1,7 @@
 package crbridge
 
 import (
-	"github.com/jmelisba/postgres-controller-backend/internal/reader"
+	"github.com/jmelis/postgres-controller-backend/internal/reader"
 )
 
 // WatchInterface mirrors watch.Interface from k8s.io/apimachinery.

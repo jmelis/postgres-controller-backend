@@ -4,8 +4,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/jmelisba/postgres-controller-backend/internal/model"
-	"github.com/jmelisba/postgres-controller-backend/internal/reader"
+	"github.com/jmelis/postgres-controller-backend/internal/model"
+	"github.com/jmelis/postgres-controller-backend/internal/reader"
 )
 
 // B5 — Verifier state must be O(buckets), not O(events).

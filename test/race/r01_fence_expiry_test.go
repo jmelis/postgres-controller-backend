@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelisba/postgres-controller-backend/internal/lease"
-	"github.com/jmelisba/postgres-controller-backend/internal/writer"
+	"github.com/jmelis/postgres-controller-backend/internal/lease"
+	"github.com/jmelis/postgres-controller-backend/internal/writer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelisba/postgres-controller-backend/internal/model"
-	"github.com/jmelisba/postgres-controller-backend/internal/resourceversion"
+	"github.com/jmelis/postgres-controller-backend/internal/model"
+	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
 )
 
 var ErrGone = errors.New("410 Gone: resource version too old")

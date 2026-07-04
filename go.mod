@@ -1,4 +1,4 @@
-module github.com/jmelisba/postgres-controller-backend
+module github.com/jmelis/postgres-controller-backend
 
 go 1.26.4
 

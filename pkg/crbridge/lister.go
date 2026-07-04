@@ -4,8 +4,8 @@ import (
 	"context"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelisba/postgres-controller-backend/internal/reader"
-	"github.com/jmelisba/postgres-controller-backend/internal/resourceversion"
+	"github.com/jmelis/postgres-controller-backend/internal/reader"
+	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
 )
 
 // ListResult holds the result of a List operation.

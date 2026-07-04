@@ -16,7 +16,7 @@ import (
 	"strconv"
 
 	"github.com/google/uuid"
-	"github.com/jmelisba/postgres-controller-backend/internal/model"
+	"github.com/jmelis/postgres-controller-backend/internal/model"
 )
 
 // EventType mirrors watch.EventType.

@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jmelisba/postgres-controller-backend/internal/compaction"
-	"github.com/jmelisba/postgres-controller-backend/internal/reader"
-	"github.com/jmelisba/postgres-controller-backend/internal/resourceversion"
+	"github.com/jmelis/postgres-controller-backend/internal/compaction"
+	"github.com/jmelis/postgres-controller-backend/internal/reader"
+	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
 )
 
 // R15 — Compaction mid-poll (B3: I7 direct violation).

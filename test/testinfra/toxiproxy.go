@@ -9,7 +9,7 @@ import (
 
 	toxiproxy "github.com/Shopify/toxiproxy/client"
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelisba/postgres-controller-backend/internal/schema"
+	"github.com/jmelis/postgres-controller-backend/internal/schema"
 )
 
 type ProxiedDB struct {

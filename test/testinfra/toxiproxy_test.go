@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/jmelisba/postgres-controller-backend/test/testinfra"
+	"github.com/jmelis/postgres-controller-backend/test/testinfra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

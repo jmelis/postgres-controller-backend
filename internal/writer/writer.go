@@ -8,7 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jmelisba/postgres-controller-backend/internal/model"
+	"github.com/jmelis/postgres-controller-backend/internal/model"
 )
 
 type Writer struct {

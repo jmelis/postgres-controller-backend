@@ -1,6 +1,6 @@
 package reader
 
-import "github.com/jmelisba/postgres-controller-backend/internal/model"
+import "github.com/jmelis/postgres-controller-backend/internal/model"
 
 type EventType int
 
