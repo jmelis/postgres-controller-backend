@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: greeting-postgres-controller
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: greeting-postgres-controller
+  template:
+    metadata:
+      labels:
+        app: greeting-postgres-controller
+    spec:
+      containers:
+        - name: controller
+          image: localhost/greeting-postgres-controller:latest
+          imagePullPolicy: Never
+          env:
+            - name: POSTGRES_DSN
+              value: "postgres://greeting:greeting@postgres:5432/greetings?sslmode=disable"
+            - name: LISTEN_ADDR
+              value: ":8080"
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: greeting-postgres-controller
+  namespace: default
+spec:
+  selector:
+    app: greeting-postgres-controller
+  ports:
+    - port: 8080
+      targetPort: 8080
