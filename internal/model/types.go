@@ -37,6 +37,17 @@ type WriteRequest struct {
 	LeaseEpoch        int64
 }
 
+type StatusWriteRequest struct {
+	GVK             string
+	Namespace       string
+	Name            string
+	BucketID        int
+	Status          json.RawMessage
+	ExpectedVersion int64
+	LeaseHolder     string
+	LeaseEpoch      int64
+}
+
 type WriteResult struct {
 	Seq           int64
 	ObjectVersion int64

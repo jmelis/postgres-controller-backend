@@ -42,7 +42,7 @@ func TestR12_ConcurrentSpecStatus(t *testing.T) {
 
 	// Status update by holder-b (seq=2, object_version=2)
 	statusW := writer.New(freshConn(t), nil)
-	statusReq := model.WriteRequest{
+	statusReq := model.StatusWriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "mixed-writer",
 		BucketID: 1, Status: json.RawMessage(`{"ready":true,"conditions":["init"]}`),
 		LeaseHolder: "holder-b", LeaseEpoch: statusEpoch,
@@ -68,7 +68,7 @@ func TestR12_ConcurrentSpecStatus(t *testing.T) {
 	assert.Equal(t, int64(3), r3.ObjectVersion)
 
 	// Status update by holder-b (seq=4, object_version=4)
-	statusReq2 := model.WriteRequest{
+	statusReq2 := model.StatusWriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "mixed-writer",
 		BucketID: 1, Status: json.RawMessage(`{"ready":true,"conditions":["init","progressing"]}`),
 		LeaseHolder: "holder-b", LeaseEpoch: statusEpoch,
@@ -161,7 +161,7 @@ func TestR12_SpecStatusIndependentFencing(t *testing.T) {
 
 	// holder-a cannot do WriteStatus (status fence — wrong table)
 	specW2 := writer.New(freshConn(t), nil)
-	_, err = specW2.WriteStatus(ctx, model.WriteRequest{
+	_, err = specW2.WriteStatus(ctx, model.StatusWriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "independent-fence",
 		BucketID: 1, Status: json.RawMessage(`{"ready":true}`),
 		LeaseHolder: "holder-a", LeaseEpoch: specEpoch,
@@ -171,7 +171,7 @@ func TestR12_SpecStatusIndependentFencing(t *testing.T) {
 		"holder-a must be fenced on status write (no status lease)")
 
 	// holder-b can WriteStatus (has status lease)
-	statusResult, err := statusW.WriteStatus(ctx, model.WriteRequest{
+	statusResult, err := statusW.WriteStatus(ctx, model.StatusWriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "independent-fence",
 		BucketID: 1, Status: json.RawMessage(`{"ready":true}`),
 		LeaseHolder: "holder-b", LeaseEpoch: statusEpoch,

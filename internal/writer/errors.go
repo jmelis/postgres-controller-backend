@@ -3,8 +3,6 @@ package writer
 import (
 	"errors"
 	"fmt"
-
-	"github.com/jmelisba/postgres-controller-backend/internal/model"
 )
 
 var (
@@ -13,14 +11,16 @@ var (
 )
 
 type AmbiguousCommitError struct {
-	Cause error
-	Req   model.WriteRequest
-	Seq   int64
+	Cause     error
+	GVK       string
+	Namespace string
+	Name      string
+	Seq       int64
 }
 
 func (e *AmbiguousCommitError) Error() string {
 	return fmt.Sprintf("ambiguous commit for %s/%s/%s seq=%d: %v",
-		e.Req.GVK, e.Req.Namespace, e.Req.Name, e.Seq, e.Cause)
+		e.GVK, e.Namespace, e.Name, e.Seq, e.Cause)
 }
 
 func (e *AmbiguousCommitError) Unwrap() error {

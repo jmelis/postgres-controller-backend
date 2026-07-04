@@ -154,7 +154,7 @@ func TestWriteStatus_UpdatesOnlyStatus(t *testing.T) {
 	// Update status via WriteStatus
 	statusConn := db.Connect(t)
 	statusWriter := writer.New(statusConn, nil)
-	statusReq := model.WriteRequest{
+	statusReq := model.StatusWriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "status-test",
 		BucketID: 1, Status: json.RawMessage(`{"ready":true,"replicas":3}`),
 		LeaseHolder: "holder-b", LeaseEpoch: statusEpoch,
@@ -200,7 +200,7 @@ func TestWriteStatus_FenceViolation(t *testing.T) {
 	// No status lease acquired — WriteStatus must fail with fence violation
 	statusConn := db.Connect(t)
 	statusWriter := writer.New(statusConn, nil)
-	statusReq := model.WriteRequest{
+	statusReq := model.StatusWriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "nginx",
 		BucketID: 1, Status: json.RawMessage(`{"ready":true}`),
 		LeaseHolder: "holder-b", LeaseEpoch: 999,
@@ -237,7 +237,7 @@ func TestWriteStatus_Conflict(t *testing.T) {
 	// WriteStatus with stale version
 	statusConn := db.Connect(t)
 	statusWriter := writer.New(statusConn, nil)
-	statusReq := model.WriteRequest{
+	statusReq := model.StatusWriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "nginx",
 		BucketID: 1, Status: json.RawMessage(`{"ready":true}`),
 		LeaseHolder: "holder-b", LeaseEpoch: statusEpoch,
@@ -280,7 +280,7 @@ func TestWriteStatus_IndependentFromSpecLease(t *testing.T) {
 	// holder-b updates status via WriteStatus (different holder, different lease table)
 	statusConn := db.Connect(t)
 	statusWriter := writer.New(statusConn, nil)
-	statusResult, err := statusWriter.WriteStatus(ctx, model.WriteRequest{
+	statusResult, err := statusWriter.WriteStatus(ctx, model.StatusWriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "independent",
 		BucketID: 1, Status: json.RawMessage(`{"ready":true}`),
 		LeaseHolder: "holder-b", LeaseEpoch: statusEpoch,

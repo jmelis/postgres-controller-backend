@@ -44,7 +44,7 @@ func TestR11_StatusFenceExpiryRace(t *testing.T) {
 	}
 	aCh := make(chan writeResult, 1)
 	go func() {
-		req := model.WriteRequest{
+		req := model.StatusWriteRequest{
 			GVK: "apps/v1/Deployment", Namespace: "default", Name: "status-fence-test",
 			BucketID: 1, Status: json.RawMessage(`{"ready":true}`),
 			LeaseHolder: "status-holder-a", LeaseEpoch: statusEpoch,
@@ -91,7 +91,7 @@ func TestR11_StatusFenceExpiryRace(t *testing.T) {
 
 	// A's next WriteStatus with the OLD epoch must fail
 	statusWriterA2 := writer.New(freshConn(t), nil)
-	staleReq := model.WriteRequest{
+	staleReq := model.StatusWriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "status-fence-test",
 		BucketID: 1, Status: json.RawMessage(`{"ready":false}`),
 		LeaseHolder: "status-holder-a", LeaseEpoch: statusEpoch,

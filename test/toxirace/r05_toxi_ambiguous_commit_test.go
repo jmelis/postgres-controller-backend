@@ -40,7 +40,7 @@ func TestR5_Toxi_AmbiguousCommit_ResetPeer(t *testing.T) {
 		directReadConn := directConn(t)
 		cleanWriter := writer.New(directReadConn, nil)
 
-		resource, err := cleanWriter.ReadBack(ctx, req, 1)
+		resource, err := cleanWriter.ReadBack(ctx, req.GVK, req.Namespace, req.Name, 1)
 		require.NoError(t, err)
 
 		if resource != nil {

@@ -66,7 +66,7 @@ func TestR5_AmbiguousCommit(t *testing.T) {
 		cleanWriter := writer.New(cleanConn, nil)
 
 		// Read back: check if seq 1 landed
-		resource, err := cleanWriter.ReadBack(ctx, req, 1)
+		resource, err := cleanWriter.ReadBack(ctx, req.GVK, req.Namespace, req.Name, 1)
 		require.NoError(t, err)
 
 		if resource != nil {
