@@ -1,6 +1,22 @@
 # postgres-controller-backend
 
-A PostgreSQL-backed Kubernetes control plane storage backend, replacing etcd for fleet management at 5,000–50,000 managed clusters. See [DESIGN.md](DESIGN.md) for the full design, invariant catalog, and certification plan.
+A PostgreSQL-backed storage backend for Kubernetes controllers that manage fleet resources (5,000–50,000 managed clusters). Not a general-purpose etcd replacement — see Assumptions below.
+
+See [DESIGN.md](DESIGN.md) for the full design, invariant catalog, and certification plan.
+
+## Assumptions
+
+This design exploits constraints that a fleet controller satisfies but a general-purpose API server does not. If your use case doesn't match these, use [kine](https://github.com/k3s-io/kine).
+
+1. **The controller owns the write path.** Writes come from controller-runtime reconcilers, not from arbitrary API clients. The controller knows which resources it manages and can accept bucket-level lease assignment.
+
+2. **Closed GVK set.** The set of resource types (GVKs) is known at deployment time. This allows partitioning resources into a fixed number of buckets with per-(GVK, bucket) sequence counters, rather than a single global sequence.
+
+3. **Single writer per bucket per sub-resource.** Each bucket has at most one spec writer and one status writer at any time, enforced by lease-based fencing. This replaces etcd's raft consensus with a cheaper mechanism — row-level `FOR SHARE` locks on lease tables.
+
+4. **Spec/status ownership is decided at deployment time.** Most controllers own both spec and status for their resources — a single controller acquires both leases and calls `Write()` and `WriteStatus()`. Some controllers split ownership: an API server writes spec while a separate controller writes status, each holding its own lease on the same bucket independently. Both patterns are first-class; the lease tables (`bucket_spec_leases`, `bucket_status_leases`) are fully independent.
+
+5. **Regional, single-primary database.** AWS RDS PostgreSQL 16+ Multi-AZ with synchronous standby. No multi-region, no multi-writer. Synchronous replication guarantees that failover never loses an acknowledged commit.
 
 ## Architecture
 
@@ -47,14 +63,12 @@ An optional canary writer measures write-to-delivery latency with p99 tracking. 
 
 ## Spec/Status Split
 
-Kubernetes controllers write spec (desired state) and status (observed state) independently. This backend supports that with separate fencing domains:
+Both write paths (`Write` for spec, `WriteStatus` for status) share the same `gvk_bucket_counters` sequence and `object_version`, so watchers see a single ordered event stream covering both spec and status changes.
 
-- **`bucket_spec_leases`** — fences `Write()` (spec + metadata + deletion)
-- **`bucket_status_leases`** — fences `WriteStatus()` (status only)
+Lease management matches the ownership pattern (see Assumption 4):
 
-Both write paths share the same `gvk_bucket_counters` sequence and `object_version`, so watchers see a single ordered event stream covering both spec and status changes. A spec writer (e.g., API server) and a status writer (e.g., controller) can hold leases on the same bucket independently — neither blocks the other's fencing.
-
-Most controllers own both sub-resources. `BothManager` provides transactional `AcquireBoth`/`RenewBoth`/`ReleaseBoth` — a single BEGIN/COMMIT acquires or renews both lease rows atomically. For the minority of controllers that split ownership, `NewSpecManager` and `NewStatusManager` operate independently.
+- **Single owner:** `BothManager` provides transactional `AcquireBoth`/`RenewBoth`/`ReleaseBoth` — one transaction acquires both lease rows atomically.
+- **Split ownership:** `NewSpecManager` and `NewStatusManager` operate independently. A spec writer and a status writer hold leases on the same bucket without interfering — the fence locks are on different tables.
 
 ## Performance
 
