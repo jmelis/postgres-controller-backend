@@ -114,6 +114,10 @@ Bucket count caps the maximum controller replicas. The recommended default is **
 
 For conflict resolution and ambiguous-commit read-back, the direct `Get()` (or `ReadBack`) is always needed regardless of the read model — those paths require the live database value.
 
+## Examples
+
+The [`examples/`](examples/) directory contains the same controller implemented twice — once against etcd, once against PostgreSQL — showing exactly what changes when migrating from one to the other. See [`examples/README.md`](examples/README.md) for the full migration guide, a line-count breakdown, and a step-by-step checklist.
+
 ## Project Structure
 
 ```
