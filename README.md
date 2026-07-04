@@ -94,6 +94,26 @@ Against DESIGN.md §4 sizing tiers:
 
 Bucket count caps the maximum controller replicas. The recommended default is **16 buckets**, expandable via epoch-bump migration (same mechanism as failover — all watchers 410 + relist).
 
+## Read Model: Direct Reads vs. Cached Reads
+
+`Client.Get()` reads directly from PostgreSQL on every call — no in-memory cache. This differs from standard controller-runtime, where `Get()` inside a `Reconcile` reads from an informer cache populated by the List/Watch stream.
+
+**Why direct reads are the default:** A fleet controller has low read rates (reconcilers read a handful of objects per cycle, not thousands). Direct reads are simpler, always return committed state, and avoid a class of staleness bugs. The `ListerWatcher` already feeds the watch stream for event-driven reconciliation; `Get()` is a point-read for the current object, not a scan.
+
+**When to consider a cached model:** If reconcilers perform many `Get()` calls per cycle, or if multiple informers share the same `ListerWatcher`, wiring it into controller-runtime's standard cache reduces DB load and read latency. The `ListerWatcher` already implements the List/Watch contract, so the integration is mechanical — the hard part (gapless, ordered, exactly-once event stream) is already done.
+
+**Trade-offs:**
+
+| | Direct reads (current) | Cached reads |
+|---|---|---|
+| Read latency | ~1–5ms (Postgres round-trip) | ~0ms (memory) |
+| Freshness | Always committed state | Up to one poll interval stale (5s worst case, ~100ms typical) |
+| DB load | One query per `Get()` | Zero read queries from reconcilers |
+| Memory | None beyond the connection | Full working set in memory per controller |
+| Complexity | Simpler — no cache coherence concerns | Requires trusting the watch stream entirely |
+
+For conflict resolution and ambiguous-commit read-back, the direct `Get()` (or `ReadBack`) is always needed regardless of the read model — those paths require the live database value.
+
 ## Project Structure
 
 ```
