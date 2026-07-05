@@ -8,7 +8,6 @@ const (
 	EventAdded EventType = iota
 	EventModified
 	EventDeleted
-	EventBookmark
 )
 
 func (e EventType) String() string {
@@ -19,8 +18,6 @@ func (e EventType) String() string {
 		return "MODIFIED"
 	case EventDeleted:
 		return "DELETED"
-	case EventBookmark:
-		return "BOOKMARK"
 	default:
 		return "UNKNOWN"
 	}

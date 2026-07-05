@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jmelis/postgres-controller-backend/internal/metrics"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
 )
@@ -20,6 +22,22 @@ type WatcherConfig struct {
 	StartRV          resourceversion.RV
 	BaselineInterval time.Duration // default 5s
 	DebounceFloor    time.Duration // default 100ms
+
+	// ListenConnFactory, when set, lets the watcher replace a failed LISTEN
+	// connection. Called after backoff; the watcher re-LISTENs all bucket
+	// channels on the new connection and requests one immediate catch-up poll.
+	// When nil, a failed listen connection degrades to baseline-poll-only.
+	ListenConnFactory func(ctx context.Context) (*pgx.Conn, error)
+}
+
+// WatchStats holds doorbell health counters. Readable via Stats() from any
+// goroutine; incremented via sync/atomic.
+type WatchStats struct {
+	ListenErrors    int64 // WaitForNotification failures
+	Reconnects      int64 // successful ListenConnFactory reconnects
+	DoorbellPolls   int64 // polls triggered by a doorbell (leading or trailing)
+	BaselinePolls   int64 // polls triggered by the baseline timer
+	BaselineCatches int64 // baseline polls that delivered events while LISTEN was configured
 }
 
 type Watcher struct {
@@ -30,6 +48,8 @@ type Watcher struct {
 	hwm        map[int]int64 // per-bucket high-water mark; only touched from the Run goroutine
 	stopCh     chan struct{}
 	hooks      WatchHooks
+	stats      WatchStats
+	metrics    *metrics.WatcherMetrics
 }
 
 // WatchHooks allows tests to observe or inject behavior during poll cycles.
@@ -71,9 +91,26 @@ func NewWatcher(pollConn, listenConn *pgx.Conn, cfg WatcherConfig, hooks WatchHo
 	}
 }
 
+// WithMetrics attaches Prometheus metrics to the watcher.
+func (w *Watcher) WithMetrics(m *metrics.WatcherMetrics) *Watcher {
+	w.metrics = m
+	return w
+}
+
 // Events returns the channel on which watch events are delivered.
 func (w *Watcher) Events() <-chan Event {
 	return w.events
+}
+
+// Stats returns a snapshot of the doorbell health counters.
+func (w *Watcher) Stats() WatchStats {
+	return WatchStats{
+		ListenErrors:    atomic.LoadInt64(&w.stats.ListenErrors),
+		Reconnects:      atomic.LoadInt64(&w.stats.Reconnects),
+		DoorbellPolls:   atomic.LoadInt64(&w.stats.DoorbellPolls),
+		BaselinePolls:   atomic.LoadInt64(&w.stats.BaselinePolls),
+		BaselineCatches: atomic.LoadInt64(&w.stats.BaselineCatches),
+	}
 }
 
 // Run starts the watch loop. Blocks until ctx is cancelled or Stop is called.
@@ -84,22 +121,14 @@ func (w *Watcher) Events() <-chan Event {
 func (w *Watcher) Run(ctx context.Context) error {
 	defer close(w.events)
 
-	if w.listenConn != nil {
-		for _, bid := range w.cfg.BucketIDs {
-			channel := fmt.Sprintf("resource_changes_b%d", bid)
-			if _, err := w.listenConn.Exec(ctx, "LISTEN "+channel); err != nil {
-				return fmt.Errorf("listen %s: %w", channel, err)
-			}
-		}
-	}
-
 	// Initial poll
-	if err := w.poll(ctx); err != nil {
+	if _, err := w.poll(ctx); err != nil {
 		return err
 	}
 
 	lastPoll := time.Now()
 	doorbellPending := false
+	listenConfigured := w.listenConn != nil || w.cfg.ListenConnFactory != nil
 
 	timer := time.NewTimer(w.cfg.BaselineInterval)
 	defer timer.Stop()
@@ -112,7 +141,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 	doorbellCh := make(chan struct{}, 1)
 	var listenWg sync.WaitGroup
-	if w.listenConn != nil {
+	if listenConfigured {
 		listenWg.Add(1)
 		go func() {
 			defer listenWg.Done()
@@ -133,7 +162,17 @@ func (w *Watcher) Run(ctx context.Context) error {
 			sinceLastPoll := time.Since(lastPoll)
 			if sinceLastPoll >= w.cfg.DebounceFloor {
 				// Leading edge: poll immediately
-				if err := w.poll(ctx); err != nil {
+				atomic.AddInt64(&w.stats.DoorbellPolls, 1)
+				if w.metrics != nil {
+					w.metrics.DoorbellPollsTotal.Inc()
+				}
+				start := time.Now()
+				n, err := w.poll(ctx)
+				if w.metrics != nil {
+					w.metrics.PollDuration.WithLabelValues(w.cfg.GVK).Observe(time.Since(start).Seconds())
+					w.metrics.PollEventsDelivered.WithLabelValues(w.cfg.GVK).Observe(float64(n))
+				}
+				if err != nil {
 					retErr = err
 					goto shutdown
 				}
@@ -160,13 +199,36 @@ func (w *Watcher) Run(ctx context.Context) error {
 			}
 
 		case <-timer.C:
-			if err := w.poll(ctx); err != nil {
+			wasDoorbell := doorbellPending
+			start := time.Now()
+			n, err := w.poll(ctx)
+			if w.metrics != nil {
+				w.metrics.PollDuration.WithLabelValues(w.cfg.GVK).Observe(time.Since(start).Seconds())
+				w.metrics.PollEventsDelivered.WithLabelValues(w.cfg.GVK).Observe(float64(n))
+			}
+			if err != nil {
 				retErr = err
 				goto shutdown
 			}
+			if wasDoorbell {
+				atomic.AddInt64(&w.stats.DoorbellPolls, 1)
+				if w.metrics != nil {
+					w.metrics.DoorbellPollsTotal.Inc()
+				}
+			} else {
+				atomic.AddInt64(&w.stats.BaselinePolls, 1)
+				if w.metrics != nil {
+					w.metrics.BaselinePollsTotal.Inc()
+				}
+				if n > 0 && listenConfigured {
+					atomic.AddInt64(&w.stats.BaselineCatches, 1)
+					if w.metrics != nil {
+						w.metrics.BaselineCatchesTotal.Inc()
+					}
+				}
+			}
 			lastPoll = time.Now()
 			doorbellPending = false
-			_ = doorbellPending // used on next iteration
 			timer.Reset(w.cfg.BaselineInterval)
 		}
 	}
@@ -187,22 +249,97 @@ func (w *Watcher) Stop() {
 }
 
 func (w *Watcher) listenLoop(ctx context.Context, notify chan<- struct{}) {
+	conn := w.listenConn
+	backoff := 100 * time.Millisecond
+	const maxBackoff = 5 * time.Second
+
+	// If we start with a non-nil conn, LISTEN on it.
+	if conn != nil {
+		if err := w.listenAll(ctx, conn); err != nil {
+			conn.Close(context.Background())
+			conn = nil
+			atomic.AddInt64(&w.stats.ListenErrors, 1)
+			if w.metrics != nil {
+				w.metrics.ListenErrorsTotal.Inc()
+			}
+		}
+	}
+
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-w.stopCh:
-			return
-		default:
+		if conn == nil {
+			if w.cfg.ListenConnFactory == nil {
+				return
+			}
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return
+			case <-w.stopCh:
+				return
+			}
+
+			newConn, err := w.cfg.ListenConnFactory(ctx)
+			if err != nil {
+				atomic.AddInt64(&w.stats.ListenErrors, 1)
+				if w.metrics != nil {
+					w.metrics.ListenErrorsTotal.Inc()
+				}
+				if backoff < maxBackoff {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+				}
+				continue
+			}
+			if err := w.listenAll(ctx, newConn); err != nil {
+				newConn.Close(context.Background())
+				atomic.AddInt64(&w.stats.ListenErrors, 1)
+				if w.metrics != nil {
+					w.metrics.ListenErrorsTotal.Inc()
+				}
+				if backoff < maxBackoff {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+				}
+				continue
+			}
+			conn = newConn
+			atomic.AddInt64(&w.stats.Reconnects, 1)
+			if w.metrics != nil {
+				w.metrics.ReconnectsTotal.Inc()
+			}
+			backoff = 100 * time.Millisecond
+			// Nudge the main loop to catch up on missed notifications
+			select {
+			case notify <- struct{}{}:
+			default:
+			}
+			continue
 		}
 
-		_, err := w.listenConn.WaitForNotification(ctx)
+		_, err := conn.WaitForNotification(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
+			select {
+			case <-w.stopCh:
+				return
+			default:
+			}
+			atomic.AddInt64(&w.stats.ListenErrors, 1)
+			if w.metrics != nil {
+				w.metrics.ListenErrorsTotal.Inc()
+			}
+			conn.Close(context.Background())
+			conn = nil
 			continue
 		}
+
+		backoff = 100 * time.Millisecond
 
 		select {
 		case notify <- struct{}{}:
@@ -211,10 +348,22 @@ func (w *Watcher) listenLoop(ctx context.Context, notify chan<- struct{}) {
 	}
 }
 
+// listenAll issues LISTEN for all configured bucket channels on the given conn.
+func (w *Watcher) listenAll(ctx context.Context, conn *pgx.Conn) error {
+	for _, bid := range w.cfg.BucketIDs {
+		channel := fmt.Sprintf("resource_changes_b%d", bid)
+		if _, err := conn.Exec(ctx, "LISTEN "+channel); err != nil {
+			return fmt.Errorf("listen %s: %w", channel, err)
+		}
+	}
+	return nil
+}
+
 // poll runs one poll cycle inside a REPEATABLE READ read-only transaction.
 // Epoch check, per-bucket horizon checks, and row queries all share the same
 // snapshot — mid-poll compaction is invisible (B3 fix).
-func (w *Watcher) poll(ctx context.Context) error {
+// Returns the number of events delivered.
+func (w *Watcher) poll(ctx context.Context) (int, error) {
 	if w.hooks != nil {
 		w.hooks.BeforePoll()
 	}
@@ -224,17 +373,17 @@ func (w *Watcher) poll(ctx context.Context) error {
 		AccessMode: pgx.ReadOnly,
 	})
 	if err != nil {
-		return fmt.Errorf("poll begin tx: %w", err)
+		return 0, fmt.Errorf("poll begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
 	// Epoch check (I6/R9 defense)
 	var currentEpoch int64
 	if err := tx.QueryRow(ctx, `SELECT timeline_id FROM cluster_epoch`).Scan(&currentEpoch); err != nil {
-		return fmt.Errorf("poll epoch check: %w", err)
+		return 0, fmt.Errorf("poll epoch check: %w", err)
 	}
 	if w.cfg.StartRV.Epoch != 0 && currentEpoch != w.cfg.StartRV.Epoch {
-		return fmt.Errorf("epoch mismatch (have=%d, db=%d): %w",
+		return 0, fmt.Errorf("epoch mismatch (have=%d, db=%d): %w",
 			w.cfg.StartRV.Epoch, currentEpoch, ErrGone)
 	}
 
@@ -243,22 +392,22 @@ func (w *Watcher) poll(ctx context.Context) error {
 	for _, bid := range w.cfg.BucketIDs {
 		events, err := w.pollBucket(ctx, tx, bid)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		allEvents = append(allEvents, events...)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("poll commit: %w", err)
+		return 0, fmt.Errorf("poll commit: %w", err)
 	}
 
 	for _, ev := range allEvents {
 		select {
 		case w.events <- ev:
 		case <-ctx.Done():
-			return ctx.Err()
+			return 0, ctx.Err()
 		case <-w.stopCh:
-			return nil
+			return 0, nil
 		}
 	}
 
@@ -266,7 +415,7 @@ func (w *Watcher) poll(ctx context.Context) error {
 		w.hooks.AfterPoll(allEvents)
 	}
 
-	return nil
+	return len(allEvents), nil
 }
 
 func (w *Watcher) pollBucket(ctx context.Context, tx pgx.Tx, bucketID int) ([]Event, error) {

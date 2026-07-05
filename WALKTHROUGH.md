@@ -595,12 +595,16 @@ of the invariants doing real work: I5 *permits* coalescing, so the verifier must
 tolerate it.)
 
 The second probe is a **canary**: at a low rate, the verifier writes a synthetic
-object per sampled bucket through the real fenced write path and tracks latency
-in a bounded ring buffer (1,000 samples, p99). This measures the health of the
-write→delivery pipeline — in particular the doorbell, which correctness never
-depends on (Section 4e) and which would therefore fail *silently* if nobody
-measured latency: events would still arrive, just up to 5 s late. The canary is
-what turns "doorbell quietly broken" from an invisible degradation into a metric.
+object per sampled bucket through the real fenced write path and measures
+write-to-delivery latency — the wall-clock time from `Write` returning to the
+event appearing on the watcher channel. This times the full pipeline: commit
+visibility, `pg_notify` doorbell, poll scheduling, and channel delivery. Latency
+samples are kept in a bounded ring buffer (1,000 entries, p99) and also observed
+via the `pgctl_verifier_canary_delivery_seconds` Prometheus histogram. The
+doorbell is never required for correctness (Section 4e) and would fail
+*silently* if nobody measured latency — events would still arrive, just up to
+5 s late. The canary is what turns "doorbell quietly broken" from an invisible
+degradation into a metric.
 
 Operationally: any violation pages a human; a sequence regression additionally
 trips a **write-freeze** on the affected bucket (with synchronous replication it

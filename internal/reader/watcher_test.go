@@ -218,3 +218,137 @@ func TestWatchBaselinePollDelivers(t *testing.T) {
 		t.Fatal("baseline poll did not deliver event within 2s")
 	}
 }
+
+func TestListenLoop_NoHotSpinOnDeadConn(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres")
+	}
+	db := testinfra.StartPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Acquire lease on bucket 1
+	leaseConn := db.Connect(t)
+	mgr := lease.NewSpecManager(leaseConn, "replica-1")
+	epoch, err := mgr.Acquire(ctx, 1, 60*time.Second)
+	require.NoError(t, err)
+
+	pollConn := connectManual(t, db)
+	listenConn := connectManual(t, db)
+
+	// Close listenConn immediately to simulate a dead connection.
+	listenConn.Close(context.Background())
+
+	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
+		GVK:              "apps/v1/Deployment",
+		BucketIDs:        []int{1},
+		StartRV:          resourceversion.RV{Epoch: 1, Buckets: map[int]int64{1: 0}},
+		BaselineInterval: 300 * time.Millisecond,
+	}, nil)
+
+	watchCtx, watchCancel := context.WithCancel(ctx)
+	done := runWatcher(w, watchCtx)
+
+	// Let the watcher run for 500ms so the listen loop hits the dead conn.
+	time.Sleep(500 * time.Millisecond)
+
+	stats := w.Stats()
+	assert.Greater(t, stats.ListenErrors, int64(0), "should detect listen errors on dead conn")
+	assert.LessOrEqual(t, stats.ListenErrors, int64(10),
+		"backoff should prevent hot spin (got %d errors, without backoff would be thousands)", stats.ListenErrors)
+
+	// Write a resource and confirm it arrives via baseline poll, proving the
+	// watcher still works despite the dead listen connection.
+	writerConn := db.Connect(t)
+	wr := writer.New(writerConn, nil)
+	_, err = wr.Write(ctx, model.WriteRequest{
+		GVK: "apps/v1/Deployment", Namespace: "default", Name: "backoff-test",
+		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Metadata: json.RawMessage(`{}`), LeaseHolder: "replica-1", LeaseEpoch: epoch,
+	})
+	require.NoError(t, err)
+
+	select {
+	case ev := <-w.Events():
+		assert.Equal(t, reader.EventAdded, ev.Type)
+		assert.Equal(t, "backoff-test", ev.Resource.Name)
+	case <-time.After(3 * time.Second):
+		t.Fatal("baseline poll did not deliver event within 3s")
+	}
+
+	watchCancel()
+	<-done
+	pollConn.Close(context.Background())
+}
+
+func TestListenLoop_DegradedModeSignal(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres")
+	}
+	db := testinfra.StartPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Acquire lease on bucket 1
+	leaseConn := db.Connect(t)
+	mgr := lease.NewSpecManager(leaseConn, "replica-1")
+	epoch, err := mgr.Acquire(ctx, 1, 60*time.Second)
+	require.NoError(t, err)
+
+	pollConn := connectManual(t, db)
+	listenConn := connectManual(t, db)
+
+	// Close listenConn immediately — dead conn, no factory, so listen degrades.
+	listenConn.Close(context.Background())
+
+	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
+		GVK:              "apps/v1/Deployment",
+		BucketIDs:        []int{1},
+		StartRV:          resourceversion.RV{Epoch: 1, Buckets: map[int]int64{1: 0}},
+		BaselineInterval: 300 * time.Millisecond,
+		// No ListenConnFactory — watcher should fall back to baseline-only.
+	}, nil)
+
+	watchCtx, watchCancel := context.WithCancel(ctx)
+	done := runWatcher(w, watchCtx)
+	defer func() {
+		watchCancel()
+		<-done
+		pollConn.Close(context.Background())
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Write 3 resources
+	writerConn := db.Connect(t)
+	wr := writer.New(writerConn, nil)
+	for i := 0; i < 3; i++ {
+		_, err := wr.Write(ctx, model.WriteRequest{
+			GVK: "apps/v1/Deployment", Namespace: "default",
+			Name: fmt.Sprintf("degraded-%d", i), BucketID: 1,
+			Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+			Metadata: json.RawMessage(`{}`), LeaseHolder: "replica-1", LeaseEpoch: epoch,
+		})
+		require.NoError(t, err)
+	}
+
+	// Collect all 3 events
+	var events []reader.Event
+	deadline := time.After(5 * time.Second)
+	for len(events) < 3 {
+		select {
+		case ev := <-w.Events():
+			events = append(events, ev)
+		case <-deadline:
+			t.Fatalf("timeout waiting for events, got %d", len(events))
+		}
+	}
+
+	assert.Len(t, events, 3)
+
+	// Because LISTEN was configured (listenConn was non-nil at construction) but
+	// broken, baseline polls that delivered events should be counted as catches.
+	stats := w.Stats()
+	assert.GreaterOrEqual(t, stats.BaselineCatches, int64(1),
+		"baseline poll should signal degraded mode when doorbell is broken")
+}

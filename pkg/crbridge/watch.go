@@ -46,8 +46,6 @@ func (a *watchAdapter) translate() {
 			evType = EventModified
 		case reader.EventDeleted:
 			evType = EventDeleted
-		case reader.EventBookmark:
-			evType = EventBookmark
 		default:
 			continue
 		}

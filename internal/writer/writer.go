@@ -5,17 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jmelis/postgres-controller-backend/internal/metrics"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 )
 
 type Writer struct {
-	conn  *pgx.Conn
-	hooks TxHooks
+	conn    *pgx.Conn
+	hooks   TxHooks
+	metrics *metrics.WriterMetrics
 }
 
 func New(conn *pgx.Conn, hooks TxHooks) *Writer {
@@ -23,6 +26,12 @@ func New(conn *pgx.Conn, hooks TxHooks) *Writer {
 		hooks = noopHooks{}
 	}
 	return &Writer{conn: conn, hooks: hooks}
+}
+
+// WithMetrics attaches Prometheus metrics to the writer.
+func (w *Writer) WithMetrics(m *metrics.WriterMetrics) *Writer {
+	w.metrics = m
+	return w
 }
 
 func (w *Writer) Write(ctx context.Context, req model.WriteRequest) (model.WriteResult, error) {
@@ -185,6 +194,41 @@ type writeParams struct {
 }
 
 func (w *Writer) execWrite(ctx context.Context, p writeParams, isContentEqual contentChecker, upsert upsertFunc) (model.WriteResult, error) {
+	start := time.Now()
+	result, err := w.execWriteInner(ctx, p, isContentEqual, upsert)
+
+	if w.metrics != nil {
+		dur := time.Since(start)
+		bucketStr := strconv.Itoa(p.bucketID)
+		var resultLabel string
+		switch {
+		case err == nil && !result.Changed:
+			resultLabel = "noop"
+			w.metrics.NoopSuppressionsTotal.Inc()
+		case err == nil:
+			resultLabel = "success"
+		case errors.Is(err, ErrFenceViolation):
+			resultLabel = "fence_violation"
+		case errors.Is(err, ErrConflict):
+			resultLabel = "conflict"
+		case errors.Is(err, ErrAlreadyExists):
+			resultLabel = "already_exists"
+		default:
+			var ambErr *AmbiguousCommitError
+			if errors.As(err, &ambErr) {
+				resultLabel = "ambiguous_commit"
+			} else {
+				resultLabel = "error"
+			}
+		}
+		w.metrics.WriteDuration.WithLabelValues(p.gvk, bucketStr, resultLabel).Observe(dur.Seconds())
+		w.metrics.WritesTotal.WithLabelValues(p.gvk, bucketStr, resultLabel).Inc()
+	}
+
+	return result, err
+}
+
+func (w *Writer) execWriteInner(ctx context.Context, p writeParams, isContentEqual contentChecker, upsert upsertFunc) (model.WriteResult, error) {
 	tx, err := w.conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return model.WriteResult{}, fmt.Errorf("begin: %w", err)

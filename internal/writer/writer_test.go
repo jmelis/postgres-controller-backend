@@ -321,3 +321,35 @@ func TestSequentialWritesAreGapless(t *testing.T) {
 		assert.Equal(t, int64(i+1), result.Seq)
 	}
 }
+
+func TestExpiredUnStolenLeaseRejectsWrite(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres")
+	}
+
+	db := testinfra.StartPostgres(t)
+	ctx := context.Background()
+
+	// Acquire lease with a very short TTL (1 second)
+	leaseConn := db.Connect(t)
+	mgr := lease.NewSpecManager(leaseConn, "test-replica")
+	epoch, err := mgr.Acquire(ctx, 1, 1*time.Second)
+	require.NoError(t, err)
+
+	// Wait for lease to expire naturally (no one steals it)
+	time.Sleep(1500 * time.Millisecond)
+
+	// Try to write with the same holder and epoch — should fail because expires_at < now()
+	writerConn := db.Connect(t)
+	w := writer.New(writerConn, nil)
+	req := model.WriteRequest{
+		GVK: "apps/v1/Deployment", Namespace: "default", Name: "expired-test",
+		BucketID: 1,
+		Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Metadata: json.RawMessage(`{}`),
+		LeaseHolder: "test-replica", LeaseEpoch: epoch,
+	}
+	_, err = w.Write(ctx, req)
+	assert.ErrorIs(t, err, writer.ErrFenceViolation,
+		"write must fail with fence violation when lease is expired but not stolen")
+}

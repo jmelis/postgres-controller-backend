@@ -2,7 +2,7 @@
 
 A PostgreSQL-backed storage backend for Kubernetes controllers that manage fleet resources (5,000–50,000 managed clusters). Not a general-purpose etcd replacement — see Assumptions below.
 
-See [DESIGN.md](DESIGN.md) for the full design, invariant catalog, and certification plan.
+See [DESIGN.md](DESIGN.md) for the full design, [WALKTHROUGH.md](WALKTHROUGH.md) for the narrative explanation, and [METRICS.md](METRICS.md) for Prometheus instrumentation.
 
 ## Assumptions
 
@@ -25,9 +25,10 @@ The system uses PostgreSQL 16 as the authoritative store for Kubernetes resource
 - **Per-(GVK, bucket) gapless sequence counters** for commit-ordered event streams
 - **Independent spec/status fencing** — single `bucket_leases` table with `domain` column (`'spec'`/`'status'`), each row fenced independently with `FOR SHARE` lock for single-writer semantics per sub-resource
 - **No-op write suppression** — content-equal writes consume no sequence number, emit no doorbell, bump no `object_version`. Default on; `ForceWrite` opt-out. Matches Kubernetes API-server semantics where an update that changes nothing does not advance resourceVersion
-- **Single-goroutine poll-primary watch** with LISTEN/NOTIFY doorbell as a latency-only optimization; all polling in one goroutine with snapshot-isolated (REPEATABLE READ) poll cycles
+- **Single-goroutine poll-primary watch** with LISTEN/NOTIFY doorbell as a latency-only optimization; all polling in one goroutine with snapshot-isolated (REPEATABLE READ) poll cycles; automatic LISTEN reconnection via `ListenConnFactory` with exponential backoff
 - **Tombstone compaction** via single CTE (atomic delete + horizon advancement)
 - **Timeline epochs** for failover detection
+- **Prometheus instrumentation** across writer, watcher, verifier, and lease paths (see [METRICS.md](METRICS.md))
 
 All mechanisms are justified by 8 named correctness invariants (I1–I8) defined in DESIGN.md §2.
 
@@ -58,8 +59,11 @@ Every invariant has a corresponding race/failure scenario and a deterministic te
 | RB4e | I1/I5 | WriteStatus suppression |
 | RB4f | — | ForceWrite bypasses suppression |
 | RB4g | I4 | Suppression holds FOR SHARE — grant blocks until suppressed txn commits |
+| R16 | I5 | Debounce suppression: 30 rapid doorbells coalesce to ≤2 polls, trailing edge fires within floor window, no event loss |
+| R17 | I5/I7 | Multi-bucket: interleaved delivery with per-bucket ascending seqs, per-channel doorbell, partial 410 on single-bucket compaction |
+| R18 | I5 | Watcher resume: cancel + restart from HWM delivers exactly the missed events, union is complete, no duplicates |
 
-Additionally, R3 and R5 have Toxiproxy-enhanced variants that inject network-level faults (TCP RST) via a proxy container.
+Additionally, R3 and R5 have Toxiproxy-enhanced variants that inject network-level faults (TCP RST) via a proxy container, including a reconnect test that verifies `ListenConnFactory` restores the doorbell fast path after a connection kill.
 
 ## Continuous Invariant Verifier (§6)
 
@@ -72,7 +76,7 @@ Stream-side gap checking (I1) is deliberately omitted: under coalescing (two wri
 
 Duplicate detection uses monotonicity: `seq <= prevHWM` is reported as an I3 violation. No per-key map is maintained — verifier state is O(buckets), bounded.
 
-An optional canary writer measures write-to-delivery latency with p99 tracking via a bounded ring buffer (1,000 samples). The same code serves as the acceptance oracle for load tests and (later) production monitoring.
+An optional canary writer measures write-to-delivery latency — the wall-clock time from `Write` returning to the event appearing on the watcher channel — with p99 tracking via a bounded ring buffer (1,000 samples) and the `pgctl_verifier_canary_delivery_seconds` Prometheus histogram. The same code serves as the acceptance oracle for load tests and (later) production monitoring.
 
 ## Spec/Status Split
 
@@ -85,9 +89,11 @@ Lease management matches the ownership pattern (see Assumption 4):
 
 ## Performance
 
-Phase 1 load test results on a local podman Postgres 16 container (macOS ARM64, 8 CPU, 3.8 GB RAM):
+Load test results on a local podman Postgres 16 container (macOS ARM64, 8 CPU, 3.8 GB RAM).
 
-**Per-bucket ceiling** (50 workers, 1 bucket): **1,167 writes/s**, p50=28ms, p99=211ms
+### Write throughput (Phase 1)
+
+**Per-bucket ceiling** (50 workers, 1 bucket): **1,060 writes/s**, p50=27ms, p99=248ms
 
 **16-bucket scaling** (48 workers total): **2,874 writes/s**, p50=18ms, p99=45ms
 
@@ -101,6 +107,18 @@ Against DESIGN.md §4 sizing tiers:
 | 50,000 clusters | 1,870 | 3,740 | 4–8 |
 
 Bucket count caps the maximum controller replicas. The recommended default is **16 buckets**, expandable via epoch-bump migration (same mechanism as failover — all watchers 410 + relist).
+
+### Poll cost & delivery latency (Phase 5)
+
+4 buckets, 2,000 seeded resources, 10 watchers:
+
+| Metric | p50 | p99 |
+|--------|-----|-----|
+| Idle poll cycle | 4.1 ms | 9.5 ms |
+| Doorbell write-to-delivery | 25 ms | 62 ms |
+| Baseline-only (notify-loss drill) | 527 ms | 996 ms |
+
+All 1,000 events delivered under notify-loss (no doorbell), verifier silent. The baseline-only latency is bounded by the 1s polling interval used in the drill — in production the default 5s baseline is the worst case, but doorbells keep typical delivery under 100ms.
 
 ## Read Model: Direct Reads vs. Cached Reads
 
@@ -126,31 +144,11 @@ For conflict resolution and ambiguous-commit read-back, the direct `Get()` (or `
 
 The [`examples/`](examples/) directory contains the same controller implemented twice — once against etcd, once against PostgreSQL — showing exactly what changes when migrating from one to the other. See [`examples/README.md`](examples/README.md) for the full migration guide, a line-count breakdown, and a step-by-step checklist.
 
-## Project Structure
+## Documentation
 
-```
-internal/
-  schema/       Schema migrations (7 tables: bucket_leases, gvk_bucket_counters,
-                kubernetes_resources, cluster_epoch, compaction_horizon,
-                stream_checkpoints, mc_registry)
-  model/        Core types (Resource, WriteRequest, StatusWriteRequest, WriteResult)
-  lease/        Lease acquire/renew/release/grant + BothManager for atomic spec+status
-  writer/       Atomic write path (Write + WriteStatus) with no-op suppression, TxHooks
-  reader/       List + single-goroutine poll-primary Watcher with snapshot polls
-  compaction/   Tombstone compaction (single CTE: delete + horizon atomically)
-  checkpoint/   Fenced DynamoDB stream checkpoint (Save/Load/Delete)
-  resourceversion/  Composite RV parse/serialize
-  verifier/     Continuous invariant verifier (§6) — O(buckets) state, bounded ring buffer
-
-pkg/
-  crbridge/     controller-runtime-shaped adapter (Client, ListerWatcher, WatchInterface)
-
-test/
-  testinfra/    Postgres + Toxiproxy container helpers (podman)
-  race/         Race catalog tests R1–R15, RB4a–g (no-op suppression)
-  toxirace/     Toxiproxy-enhanced R3/R5
-  loadtest/     Phase 1 counter ceiling + bucket scaling
-```
+- [DESIGN.md](DESIGN.md) — full design, invariant catalog (I1–I8), race catalog (R1–R18), and certification plan
+- [WALKTHROUGH.md](WALKTHROUGH.md) — narrative explanation of why each mechanism exists and how the pieces fit together
+- [METRICS.md](METRICS.md) — Prometheus metrics reference (all `pgctl_*` metrics, labels, integration guide)
 
 ## Running Tests
 
@@ -158,10 +156,10 @@ Requires: Go 1.22+, podman with a running machine (`podman machine start`).
 
 ```bash
 make test-unit          # Pure unit tests (resourceversion)
-make test-integration   # All DB-backed tests (schema, lease, writer, reader, compaction, verifier, checkpoint)
-make test-race          # Race catalog R1–R15, RB4a–g under -race
-make test-toxirace      # Toxiproxy-enhanced R3/R5 (starts extra containers)
-make test-load          # Phase 1 load test (10s sustained, 50 workers)
+make test-integration   # All DB-backed tests (schema, lease, writer, reader, compaction, verifier)
+make test-race          # Race catalog R1–R18, RB4a–g under -race
+make test-toxirace      # Toxiproxy-enhanced R3/R5 + doorbell reconnect
+make test-load          # Phase 1 + Phase 5 load tests
 make test               # Unit + integration + race
 ```
 

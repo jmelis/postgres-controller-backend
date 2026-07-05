@@ -295,8 +295,6 @@ Polling is the correctness mechanism (**I5**); the doorbell only changes *when* 
 
 **Doorbell loss:** on any LISTEN drop (including failover) reconnect, re-LISTEN; the next baseline poll reconciles. No catch-up/stream ordering hazard exists — there is only the poll.
 
-**Bookmarks:** each cycle (even empty) may emit current per-bucket hwm as a progress event so informers advance RV without relist.
-
 ### 3.7 Tombstone Compaction
 
 A **single CTE** atomically deletes tombstones and advances the compaction horizon — the horizon must never lag the physical delete, or a watcher could see an unexplained gap (I7):

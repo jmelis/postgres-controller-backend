@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jmelis/postgres-controller-backend/internal/metrics"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/reader"
 	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
@@ -42,6 +43,13 @@ type Config struct {
 
 	// PollInterval for the verification watcher.
 	PollInterval time.Duration
+
+	// ListenConn, when set, gives the verifier's watcher a doorbell connection
+	// so canary delivery latency reflects the real fast path.
+	ListenConn *pgx.Conn
+
+	// ListenConnFactory for reconnect support on the verifier's watcher.
+	ListenConnFactory func(ctx context.Context) (*pgx.Conn, error)
 }
 
 // Result holds the current verification state.
@@ -49,7 +57,7 @@ type Result struct {
 	Violations    []Violation
 	EventsChecked int64
 	CanaryWrites  int64
-	CanaryP99     time.Duration
+	CanaryP99     time.Duration // write-to-delivery latency p99
 }
 
 const canaryRingSize = 1000
@@ -57,27 +65,29 @@ const canaryRingSize = 1000
 // Verifier is the continuous invariant verification consumer.
 // It subscribes via the ordinary poll path and checks:
 //   - I3/I6: monotonic hwm (seq must be strictly greater than previous hwm)
-//   - I5: no duplicate delivery (duplicate ⇒ seq <= hwm, caught by I3 check)
+//   - I5: no duplicate delivery (duplicate => seq <= hwm, caught by I3 check)
 //   - I7: hwm-below-horizon implies 410 was received
 //
-// Stream-side seq contiguity (I1 gap checking) is deliberately omitted:
-// coalescing (I5 permits it) means two rapid writes to the same object leave
-// only the latest seq in the table. The resulting gap is legitimate, not data
-// loss. If gap auditing is needed later, it must cross-check the table to
-// verify the gap seq was superseded by a later object_version of some object.
+// The canary probe writes synthetic objects and measures write-to-delivery
+// latency (the wall-clock time from Write returning to the event appearing
+// on the watcher channel). This times the full pipeline: commit visibility,
+// pg_notify doorbell, poll scheduling, and channel delivery.
 type Verifier struct {
 	cfg        Config
 	pollConn   *pgx.Conn
 	canaryConn *pgx.Conn
 
-	mu          sync.Mutex
-	violations  []Violation
-	hwm         map[int]int64
-	eventsCount int64
-	canaryCount int64
-	canaryTimes [canaryRingSize]time.Duration
-	canaryIdx   int
-	canaryFull  bool
+	mu              sync.Mutex
+	violations      []Violation
+	hwm             map[int]int64
+	eventsCount     int64
+	canaryCount     int64
+	canaryTimes     [canaryRingSize]time.Duration
+	canaryIdx       int
+	canaryFull      bool
+	pendingCanaries map[string]time.Time // name -> writeCompletedAt
+
+	metrics *metrics.VerifierMetrics
 }
 
 // New creates a verifier. canaryConn may be nil to disable canary writes.
@@ -95,20 +105,28 @@ func New(pollConn, canaryConn *pgx.Conn, cfg Config) *Verifier {
 	}
 
 	return &Verifier{
-		cfg:        cfg,
-		pollConn:   pollConn,
-		canaryConn: canaryConn,
-		hwm:        hwm,
+		cfg:             cfg,
+		pollConn:        pollConn,
+		canaryConn:      canaryConn,
+		hwm:             hwm,
+		pendingCanaries: make(map[string]time.Time),
 	}
+}
+
+// WithMetrics attaches Prometheus metrics to the verifier.
+func (v *Verifier) WithMetrics(m *metrics.VerifierMetrics) *Verifier {
+	v.metrics = m
+	return v
 }
 
 // Run starts the verifier. Blocks until ctx is cancelled.
 func (v *Verifier) Run(ctx context.Context) error {
-	watcher := reader.NewWatcher(v.pollConn, nil, reader.WatcherConfig{
-		GVK:              v.cfg.GVK,
-		BucketIDs:        v.cfg.BucketIDs,
-		StartRV:          resourceversion.RV{Epoch: 1, Buckets: v.hwm},
-		BaselineInterval: v.cfg.PollInterval,
+	watcher := reader.NewWatcher(v.pollConn, v.cfg.ListenConn, reader.WatcherConfig{
+		GVK:               v.cfg.GVK,
+		BucketIDs:         v.cfg.BucketIDs,
+		StartRV:           resourceversion.RV{Epoch: 1, Buckets: v.hwm},
+		BaselineInterval:  v.cfg.PollInterval,
+		ListenConnFactory: v.cfg.ListenConnFactory,
 	}, nil)
 
 	watchDone := make(chan error, 1)
@@ -187,13 +205,16 @@ func (v *Verifier) checkEvent(ev reader.Event) {
 	defer v.mu.Unlock()
 
 	v.eventsCount++
+	if v.metrics != nil {
+		v.metrics.EventsCheckedTotal.Inc()
+	}
+
 	bucket := ev.Resource.BucketID
 	seq := ev.Resource.GVKBucketSeq
 
 	prevHWM := v.hwm[bucket]
 
 	// I3/I5/I6: monotonic hwm — seq must be strictly greater than previous hwm.
-	// A duplicate delivery has seq <= hwm (caught here as I3).
 	if seq <= prevHWM {
 		v.addViolation(Violation{
 			Invariant: "I3",
@@ -202,6 +223,23 @@ func (v *Verifier) checkEvent(ev reader.Event) {
 			Detail:    fmt.Sprintf("non-monotonic: seq=%d <= hwm=%d", seq, prevHWM),
 			Time:      time.Now(),
 		})
+	}
+
+	// Canary delivery latency measurement
+	if ev.Resource.Namespace == "_verifier" {
+		if writeTime, ok := v.pendingCanaries[ev.Resource.Name]; ok {
+			deliveryLatency := time.Since(writeTime)
+			v.canaryTimes[v.canaryIdx] = deliveryLatency
+			v.canaryIdx++
+			if v.canaryIdx >= canaryRingSize {
+				v.canaryIdx = 0
+				v.canaryFull = true
+			}
+			delete(v.pendingCanaries, ev.Resource.Name)
+			if v.metrics != nil {
+				v.metrics.CanaryDelivery.Observe(deliveryLatency.Seconds())
+			}
+		}
 	}
 
 	if seq > v.hwm[bucket] {
@@ -233,25 +271,28 @@ func (v *Verifier) writeCanary(ctx context.Context) {
 		LeaseEpoch:  v.cfg.CanaryEpoch,
 	}
 
-	start := time.Now()
 	_, err := w.Write(ctx, req)
-	latency := time.Since(start)
-
 	if err != nil {
 		return
 	}
+	writeCompleted := time.Now()
 
 	v.mu.Lock()
 	v.canaryCount++
-	v.canaryTimes[v.canaryIdx] = latency
-	v.canaryIdx++
-	if v.canaryIdx >= canaryRingSize {
-		v.canaryIdx = 0
-		v.canaryFull = true
+	// Cap pending map to stay bounded
+	if len(v.pendingCanaries) >= canaryRingSize {
+		for k := range v.pendingCanaries {
+			delete(v.pendingCanaries, k)
+			break
+		}
 	}
+	v.pendingCanaries[name] = writeCompleted
 	v.mu.Unlock()
 }
 
 func (v *Verifier) addViolation(viol Violation) {
 	v.violations = append(v.violations, viol)
+	if v.metrics != nil {
+		v.metrics.ViolationsTotal.WithLabelValues(viol.Invariant).Inc()
+	}
 }

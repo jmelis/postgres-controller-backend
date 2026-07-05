@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jmelis/postgres-controller-backend/internal/metrics"
 )
 
 var (
@@ -31,6 +33,7 @@ type Manager struct {
 	conn     *pgx.Conn
 	holderID string
 	domain   string
+	metrics  *metrics.LeaseMetrics
 }
 
 func NewSpecManager(conn *pgx.Conn, holderID string) *Manager {
@@ -41,7 +44,14 @@ func NewStatusManager(conn *pgx.Conn, holderID string) *Manager {
 	return &Manager{conn: conn, holderID: holderID, domain: DomainStatus}
 }
 
+// WithMetrics attaches Prometheus metrics to the lease manager.
+func (m *Manager) WithMetrics(met *metrics.LeaseMetrics) *Manager {
+	m.metrics = met
+	return m
+}
+
 func (m *Manager) Acquire(ctx context.Context, bucketID int, ttl time.Duration) (int64, error) {
+	start := time.Now()
 	var epoch int64
 	err := m.conn.QueryRow(ctx, `
 		INSERT INTO bucket_leases (bucket_id, domain, holder, epoch, expires_at)
@@ -59,6 +69,11 @@ func (m *Manager) Acquire(ctx context.Context, bucketID int, ttl time.Duration) 
 			return 0, fmt.Errorf("lease acquire bucket %d: held by another replica", bucketID)
 		}
 		return 0, fmt.Errorf("lease acquire bucket %d: %w", bucketID, err)
+	}
+	if m.metrics != nil {
+		bucketStr := strconv.Itoa(bucketID)
+		m.metrics.AcquisitionDuration.WithLabelValues(m.domain, bucketStr).Observe(time.Since(start).Seconds())
+		m.metrics.AcquisitionsTotal.WithLabelValues(m.domain, bucketStr).Inc()
 	}
 	return epoch, nil
 }
