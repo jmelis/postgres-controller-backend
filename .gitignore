@@ -1,2 +1,13 @@
 # Compiled binaries
 examples/etcd-controller/etcd-controller
+examples/postgres-controller/postgres-controller
+
+# Claude Code
+.claude/settings.local.json
+
+# macOS
+.DS_Store
+
+# Talk build artifacts
+talk/build/
+talk/output.mp4
