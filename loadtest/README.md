@@ -113,20 +113,20 @@ Large JSONB payloads matter because they exercise:
 ## Architecture
 
 ```
-┌─────────────────────────────────────┐
-│            EKS Cluster              │
-│                                     │
-│  ┌──────────────┬────────────────┐  │
-│  │  loadtest    │  CloudWatch    │  │
-│  │  harness     │  Agent sidecar │  │
-│  │  /metrics ──>│  (scrapes &    │  │
-│  │              │   pushes)      │  │
-│  └──────┬───────┴───────┬────────┘  │
-│         │               │           │
-└─────────┼───────────────┼───────────┘
-          │               │
-          │ pgx           │ PutMetricData
-          ▼               ▼
+┌──────────────────────────────────────┐
+│          EC2 Instance (public)       │
+│                                      │
+│  ┌──────────────┬─────────────────┐  │
+│  │  loadtest    │  CloudWatch     │  │
+│  │  harness     │  Agent          │  │
+│  │  /metrics ──>│  (scrapes &     │  │
+│  │              │   pushes)       │  │
+│  └──────┬───────┴────────┬────────┘  │
+│         │                │           │
+└─────────┼────────────────┼───────────┘
+          │                │
+          │ pgx            │ PutMetricData
+          ▼                ▼
 ┌─────────────────┐   ┌──────────────┐
 │  RDS PostgreSQL │   │  CloudWatch  │
 │  16 Multi-AZ    │   │  (metrics +  │
@@ -136,7 +136,9 @@ Large JSONB payloads matter because they exercise:
 
 The harness is a standalone Go binary that imports the library packages directly — no RPC, no controllers, no Kubernetes API server. It connects to Postgres via `pgx`, runs the same code paths that controllers would, and exposes the same Prometheus metrics the library emits.
 
-**CloudWatch Agent sidecar** scrapes the harness's `/metrics` endpoint and pushes `pgctl_*` + `loadtest_*` metrics to CloudWatch. RDS metrics (CPU, IOPS, connections) are already there natively. One dashboard covers everything.
+**Terraform** provisions a VPC, an EC2 instance (public subnet), RDS (database subnet), and a CloudWatch dashboard. The binary is cross-compiled locally and uploaded to EC2 via `scp`.
+
+**CloudWatch Agent** runs on the EC2 instance, scraping the harness's `/metrics` endpoint and pushing `pgctl_*` + `loadtest_*` metrics to CloudWatch. RDS metrics (CPU, IOPS, connections) are already there natively. One dashboard covers everything.
 
 **Compaction** runs in a background goroutine (every 5 minutes, 1-hour retention) to keep table size bounded during long tests.
 
@@ -156,21 +158,25 @@ A single YAML file controls everything: bucket count, GVK payload sizes, which p
 ## Quick start
 
 ```bash
-# Prerequisites: AWS CLI, Terraform >= 1.5, kubectl, Podman, Go 1.22+
+# Prerequisites: AWS CLI, Terraform >= 1.5, Go 1.22+, SSH key pair in AWS
 
-# 1. Provision infrastructure and run the 5k baseline test
+# 1. Configure Terraform variables
+cp loadtest/terraform/terraform.tfvars.example loadtest/terraform/terraform.tfvars
+# Edit terraform.tfvars — set ec2_key_name to your AWS key pair name
+
+# 2. Provision infrastructure and run the 5k baseline test
 ./run.sh specs/5k-baseline.yaml all
 
-# 2. Check the CloudWatch dashboard (URL printed by setup)
+# 3. Check the CloudWatch dashboard (URL printed by setup)
 ./run.sh status
 
-# 3. For long-running tests, check progress anytime
+# 4. For long-running tests, check progress anytime
 ./run.sh check
 
-# 4. Fetch final results
+# 5. Fetch final results
 ./run.sh results
 
-# 5. Tear down when done
+# 6. Tear down when done
 ./run.sh teardown
 ```
 
@@ -179,12 +185,13 @@ A single YAML file controls everything: bucket count, GVK payload sizes, which p
 ```bash
 ./run.sh [SPEC_FILE] [COMMAND]
 
-setup       # Terraform apply + K8s manifests
-run         # Build image + start Job
+setup       # Terraform apply + deploy harness binary to EC2
+run         # Cross-compile, upload, and start the harness on EC2
 check       # Fetch current checkpoint (mid-run progress)
-status      # Show Job/pod status + CloudWatch dashboard URL
-results     # Fetch final results JSON from completed Job
-teardown    # Destroy everything
+status      # Show harness process status + CloudWatch dashboard URL
+results     # Fetch final results JSON from EC2
+ssh         # Open an interactive SSH session to the EC2 instance
+teardown    # Destroy everything (Terraform destroy)
 all         # setup + run (default)
 ```
 
@@ -202,10 +209,17 @@ go build -o lt ./loadtest/cmd/loadtest/
 ```
 loadtest/
 ├── README.md                   # This file
-├── Containerfile               # Multi-stage build for the Go harness
-├── run.sh                      # Wrapper script for the full lifecycle
-├── terraform/                  # EKS + RDS + VPC + CloudWatch dashboard
-├── k8s/                        # Job, ServiceAccount, CW Agent config
+├── run.sh                      # Orchestration script (setup, run, check, teardown)
+├── terraform/                  # EC2 + RDS + VPC + CloudWatch dashboard
+│   ├── main.tf                 # Providers and backend
+│   ├── variables.tf            # EC2 instance type, RDS class, key pair name
+│   ├── vpc.tf                  # VPC with public + database subnets
+│   ├── ec2.tf                  # Harness instance + security group + IAM
+│   ├── rds.tf                  # PostgreSQL 16 Multi-AZ + Secrets Manager
+│   ├── cloudwatch.tf           # Dashboard (RDS + pgctl metrics)
+│   ├── outputs.tf              # Instance IP, SSH command, RDS endpoint
+│   ├── cloudwatch-agent-config.json  # CW Agent prometheus scrape config
+│   └── prometheus.yaml         # Scrape target: localhost:9090
 ├── specs/                      # YAML test specifications
 └── cmd/loadtest/               # Go harness source
 ```

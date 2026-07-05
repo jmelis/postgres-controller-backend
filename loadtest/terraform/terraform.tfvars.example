@@ -2,18 +2,15 @@
 #
 #   cp terraform.tfvars.example terraform.tfvars
 #
-# All values shown below are the defaults — uncomment and change only what
-# you need to override.
+# ec2_key_name is required — create a key pair in the AWS console first.
+
+ec2_key_name = "my-key-pair"
 
 # region = "us-east-1"
 # project_name = "pgctl-loadtest"
 
-# --- EKS ---
-# eks_node_instance_type = "m5.2xlarge"
-# eks_node_count         = 2
-# eks_node_min_count     = 1
-# eks_node_max_count     = 4
-# kubernetes_version     = "1.30"
+# --- EC2 ---
+# ec2_instance_type = "m5.xlarge"
 
 # --- RDS ---
 # rds_instance_class     = "db.r6g.large"

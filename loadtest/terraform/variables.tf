@@ -15,37 +15,18 @@ variable "project_name" {
 }
 
 # -----------------------------------------------------------------------------
-# EKS
+# EC2
 # -----------------------------------------------------------------------------
 
-variable "eks_node_instance_type" {
-  description = "EC2 instance type for the EKS managed node group"
+variable "ec2_instance_type" {
+  description = "EC2 instance type for the load test harness"
   type        = string
-  default     = "m5.2xlarge"
+  default     = "m5.xlarge"
 }
 
-variable "eks_node_count" {
-  description = "Desired number of EKS worker nodes"
-  type        = number
-  default     = 2
-}
-
-variable "eks_node_min_count" {
-  description = "Minimum number of EKS worker nodes"
-  type        = number
-  default     = 1
-}
-
-variable "eks_node_max_count" {
-  description = "Maximum number of EKS worker nodes"
-  type        = number
-  default     = 4
-}
-
-variable "kubernetes_version" {
-  description = "Kubernetes version for the EKS cluster"
+variable "ec2_key_name" {
+  description = "EC2 key pair name for SSH access (must already exist in the region)"
   type        = string
-  default     = "1.30"
 }
 
 # -----------------------------------------------------------------------------

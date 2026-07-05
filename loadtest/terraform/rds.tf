@@ -1,10 +1,10 @@
 # -----------------------------------------------------------------------------
-# Security group: allow PostgreSQL traffic only from EKS worker nodes.
+# Security group: allow PostgreSQL traffic only from the EC2 harness.
 # -----------------------------------------------------------------------------
 
 resource "aws_security_group" "rds" {
   name_prefix = "${var.project_name}-rds-"
-  description = "Allow PostgreSQL inbound from EKS nodes only"
+  description = "Allow PostgreSQL inbound from EC2 harness only"
   vpc_id      = module.vpc.vpc_id
 
   tags = {
@@ -16,14 +16,14 @@ resource "aws_security_group" "rds" {
   }
 }
 
-resource "aws_security_group_rule" "rds_ingress_eks" {
+resource "aws_security_group_rule" "rds_ingress_ec2" {
   type                     = "ingress"
   from_port                = 5432
   to_port                  = 5432
   protocol                 = "tcp"
-  description              = "PostgreSQL from EKS nodes"
+  description              = "PostgreSQL from EC2 harness"
   security_group_id        = aws_security_group.rds.id
-  source_security_group_id = module.eks.node_security_group_id
+  source_security_group_id = aws_security_group.ec2.id
 }
 
 resource "aws_security_group_rule" "rds_egress" {
@@ -48,7 +48,7 @@ resource "random_password" "rds_master" {
 resource "aws_secretsmanager_secret" "rds_master_password" {
   name                    = "${var.project_name}/rds-master-password"
   description             = "Master password for the ${var.project_name} RDS instance"
-  recovery_window_in_days = 0 # Test infra — allow immediate deletion.
+  recovery_window_in_days = 0
 }
 
 resource "aws_secretsmanager_secret_version" "rds_master_password" {
@@ -61,7 +61,6 @@ resource "aws_db_parameter_group" "postgres" {
   family      = "postgres16"
   description = "PostgreSQL 16 params for ${var.project_name}"
 
-  # Tune for load testing.
   parameter {
     name  = "shared_preload_libraries"
     value = "pg_stat_statements"
