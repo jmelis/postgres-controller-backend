@@ -1,0 +1,24 @@
+# Copy this file to terraform.tfvars and adjust as needed.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# All values shown below are the defaults — uncomment and change only what
+# you need to override.
+
+# region = "us-east-1"
+# project_name = "pgctl-loadtest"
+
+# --- EKS ---
+# eks_node_instance_type = "m5.2xlarge"
+# eks_node_count         = 2
+# eks_node_min_count     = 1
+# eks_node_max_count     = 4
+# kubernetes_version     = "1.30"
+
+# --- RDS ---
+# rds_instance_class     = "db.r6g.large"
+# rds_allocated_storage  = 100          # GB
+# rds_iops               = 3000
+# rds_storage_throughput = 125          # MiBps (gp3 minimum)
+# rds_multi_az           = true
+# rds_engine_version     = "16.4"

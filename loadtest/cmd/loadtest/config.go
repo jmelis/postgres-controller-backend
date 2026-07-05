@@ -1,0 +1,150 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Config is the top-level load test specification.
+type Config struct {
+	Metadata           MetadataConfig `yaml:"metadata"`
+	RDS                RDSConfig      `yaml:"rds"`
+	Cluster            ClusterConfig  `yaml:"cluster"`
+	Seed               SeedConfig     `yaml:"seed"`
+	Phases             PhasesConfig   `yaml:"phases"`
+	Verifier           VerifierConfig `yaml:"verifier"`
+	CheckpointInterval time.Duration  `yaml:"checkpoint_interval"`
+}
+
+type MetadataConfig struct {
+	Name        string `yaml:"name"`
+	Description string `yaml:"description"`
+}
+
+type RDSConfig struct {
+	InstanceClass string `yaml:"instance_class"`
+	EngineVersion string `yaml:"engine_version"`
+}
+
+type ClusterConfig struct {
+	Buckets              int           `yaml:"buckets"`
+	LeaseTTL             time.Duration `yaml:"lease_ttl"`
+	BaselinePollInterval time.Duration `yaml:"baseline_poll_interval"`
+	DebounceFloor        time.Duration `yaml:"debounce_floor"`
+}
+
+type SeedConfig struct {
+	GVKs []SeedGVK `yaml:"gvks"`
+}
+
+type SeedGVK struct {
+	GVK              string `yaml:"gvk"`
+	SpecSizeBytes    int    `yaml:"spec_size_bytes"`
+	StatusSizeBytes  int    `yaml:"status_size_bytes"`
+	MetadataSizeBytes int   `yaml:"metadata_size_bytes"`
+	ObjectsPerBucket int    `yaml:"objects_per_bucket"`
+}
+
+type PhasesConfig struct {
+	Phase1Ceiling   Phase1Config   `yaml:"phase1_ceiling"`
+	Phase2Steady    Phase2Config   `yaml:"phase2_steady"`
+	Phase2bSkew     Phase2bConfig  `yaml:"phase2b_skew"`
+	Phase3Avalanche Phase3Config   `yaml:"phase3_avalanche"`
+	Phase5Poll      Phase5Config   `yaml:"phase5_poll"`
+}
+
+type Phase1Config struct {
+	Enabled          bool          `yaml:"enabled"`
+	WorkersPerBucket int           `yaml:"workers_per_bucket"`
+	Duration         time.Duration `yaml:"duration"`
+	TargetRPS        float64       `yaml:"target_rps"`
+	TargetP99Ms      int           `yaml:"target_p99_ms"`
+}
+
+type Phase2Config struct {
+	Enabled      bool          `yaml:"enabled"`
+	Duration     time.Duration `yaml:"duration"`
+	TargetRPS    float64       `yaml:"target_rps"`
+	BurstRPS     float64       `yaml:"burst_rps"`
+	TargetCPUPct int           `yaml:"target_cpu_pct"`
+	TargetP50Ms  int           `yaml:"target_p50_ms"`
+}
+
+type Phase2bConfig struct {
+	Enabled           bool `yaml:"enabled"`
+	HotBucketWritePct int  `yaml:"hot_bucket_write_pct"`
+	ColdP99Ms         int  `yaml:"cold_p99_ms"`
+}
+
+type Phase3Config struct {
+	Enabled       bool    `yaml:"enabled"`
+	KillFraction  float64 `yaml:"kill_fraction"`
+	ZombieWriters int     `yaml:"zombie_writers"`
+}
+
+type Phase5Config struct {
+	Enabled                bool          `yaml:"enabled"`
+	NumWatchers            int           `yaml:"num_watchers"`
+	WriteRate              int           `yaml:"write_rate"`
+	WriteCount             int           `yaml:"write_count"`
+	DoorbellDeliveryP99Ms  int           `yaml:"doorbell_delivery_p99_ms"`
+	NotifyLossDrill        bool          `yaml:"notify_loss_drill"`
+}
+
+type VerifierConfig struct {
+	Enabled        bool          `yaml:"enabled"`
+	PollInterval   time.Duration `yaml:"poll_interval"`
+	CanaryInterval time.Duration `yaml:"canary_interval"`
+	SampleBuckets  int           `yaml:"sample_buckets"`
+}
+
+// LoadConfig reads and parses a YAML spec file into a Config.
+func LoadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+
+	cfg := &Config{}
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+
+	if err := cfg.validate(); err != nil {
+		return nil, fmt.Errorf("validate config: %w", err)
+	}
+
+	return cfg, nil
+}
+
+// ComputeTotalObjects returns the total number of objects that will be seeded
+// across all GVKs and all buckets.
+func (c *Config) ComputeTotalObjects() int {
+	total := 0
+	for _, g := range c.Seed.GVKs {
+		total += g.ObjectsPerBucket * c.Cluster.Buckets
+	}
+	return total
+}
+
+func (c *Config) validate() error {
+	if c.Cluster.Buckets <= 0 {
+		return fmt.Errorf("cluster.buckets must be > 0")
+	}
+	if c.Cluster.LeaseTTL <= 0 {
+		c.Cluster.LeaseTTL = 60 * time.Second
+	}
+	if c.Cluster.BaselinePollInterval <= 0 {
+		c.Cluster.BaselinePollInterval = 5 * time.Second
+	}
+	if c.Cluster.DebounceFloor <= 0 {
+		c.Cluster.DebounceFloor = 100 * time.Millisecond
+	}
+	if c.CheckpointInterval <= 0 {
+		c.CheckpointInterval = 5 * time.Minute
+	}
+	return nil
+}

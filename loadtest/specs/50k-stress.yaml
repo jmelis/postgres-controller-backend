@@ -1,0 +1,80 @@
+metadata:
+  name: "50k-stress"
+  description: "50,000-cluster tier stress certification"
+
+rds:
+  instance_class: "db.r6g.2xlarge"
+  engine_version: "16.4"
+
+cluster:
+  buckets: 64
+  lease_ttl: 120s
+  baseline_poll_interval: 5s
+  debounce_floor: 100ms
+
+seed:
+  gvks:
+    - gvk: "hypershift.openshift.io/v1beta1/HostedCluster"
+      spec_size_bytes: 8192
+      status_size_bytes: 12288
+      metadata_size_bytes: 2048
+      objects_per_bucket: 100
+    - gvk: "hypershift.openshift.io/v1beta1/HostedNodePool"
+      spec_size_bytes: 4096
+      status_size_bytes: 6144
+      metadata_size_bytes: 1024
+      objects_per_bucket: 500
+    - gvk: "apps/v1/Deployment"
+      spec_size_bytes: 2048
+      status_size_bytes: 1024
+      metadata_size_bytes: 512
+      objects_per_bucket: 200
+
+phases:
+  phase1_ceiling:
+    enabled: true
+    workers_per_bucket: 50
+    duration: 30s
+    target_rps: 200
+    target_p99_ms: 10
+
+  phase2_steady:
+    enabled: true
+    duration: 48h
+    target_rps: 1870
+    burst_rps: 3740
+    target_cpu_pct: 60
+    target_p50_ms: 15
+
+  phase2b_skew:
+    enabled: true
+    hot_bucket_write_pct: 20
+    cold_p99_ms: 15
+
+  phase3_avalanche:
+    enabled: true
+    kill_fraction: 0.5
+    zombie_writers: 1
+
+  phase5_poll:
+    enabled: true
+    num_watchers: 50
+    write_rate: 100
+    write_count: 5000
+    doorbell_delivery_p99_ms: 150
+    notify_loss_drill: true
+
+  phase6_failover:
+    enabled: true
+    drills: 5
+
+  phase7_backup_restore:
+    enabled: false
+
+verifier:
+  enabled: true
+  poll_interval: 200ms
+  canary_interval: 500ms
+  sample_buckets: 16
+
+checkpoint_interval: 15m

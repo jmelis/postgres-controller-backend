@@ -1,0 +1,70 @@
+metadata:
+  name: "ceiling-hunt"
+  description: "Maximum RPS discovery sweep across bucket counts and GVK sizes"
+
+rds:
+  instance_class: "db.r6g.large"
+  engine_version: "16.4"
+
+cluster:
+  buckets: 32
+  lease_ttl: 120s
+  baseline_poll_interval: 5s
+  debounce_floor: 100ms
+
+seed:
+  gvks:
+    - gvk: "bench/v1/Small"
+      spec_size_bytes: 512
+      status_size_bytes: 256
+      metadata_size_bytes: 128
+      objects_per_bucket: 50
+    - gvk: "bench/v1/Medium"
+      spec_size_bytes: 4096
+      status_size_bytes: 2048
+      metadata_size_bytes: 512
+      objects_per_bucket: 50
+    - gvk: "bench/v1/Large"
+      spec_size_bytes: 20480
+      status_size_bytes: 16384
+      metadata_size_bytes: 4096
+      objects_per_bucket: 50
+
+phases:
+  phase1_ceiling:
+    enabled: true
+    workers_per_bucket: 50
+    duration: 15s
+    target_rps: 100
+    target_p99_ms: 50
+
+  phase2_steady:
+    enabled: false
+
+  phase2b_skew:
+    enabled: false
+
+  phase3_avalanche:
+    enabled: false
+
+  phase5_poll:
+    enabled: true
+    num_watchers: 10
+    write_rate: 50
+    write_count: 500
+    doorbell_delivery_p99_ms: 500
+    notify_loss_drill: false
+
+  phase6_failover:
+    enabled: false
+
+  phase7_backup_restore:
+    enabled: false
+
+verifier:
+  enabled: true
+  poll_interval: 200ms
+  canary_interval: 1s
+  sample_buckets: 8
+
+checkpoint_interval: 1m

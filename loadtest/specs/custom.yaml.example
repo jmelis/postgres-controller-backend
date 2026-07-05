@@ -1,0 +1,77 @@
+# Custom load test specification.
+# Copy this file and modify to your needs.
+# Run with: loadtest --spec=custom.yaml
+
+metadata:
+  name: "custom"
+  description: "Custom load test run"
+
+rds:
+  instance_class: "db.r6g.large"       # Informational — Terraform provisions the actual instance
+  engine_version: "16.4"
+
+cluster:
+  buckets: 16                           # Number of buckets to use
+  lease_ttl: 120s                       # Lease TTL for writers
+  baseline_poll_interval: 5s            # Watcher poll interval when no doorbell
+  debounce_floor: 100ms                 # Minimum time between doorbell-triggered polls
+
+seed:
+  gvks:
+    # Define each GVK you want to populate and test.
+    # spec/status/metadata_size_bytes control the payload size.
+    # objects_per_bucket * cluster.buckets = total objects for this GVK.
+    - gvk: "example.io/v1/MyResource"
+      spec_size_bytes: 2048             # Target JSON payload size
+      status_size_bytes: 1024
+      metadata_size_bytes: 512
+      objects_per_bucket: 100
+
+phases:
+  phase1_ceiling:
+    enabled: true
+    workers_per_bucket: 50              # Concurrent writers per bucket
+    duration: 30s                       # How long to run
+    target_rps: 200                     # Minimum acceptable RPS (pass/fail)
+    target_p99_ms: 10                   # p99 latency target (strict mode)
+
+  phase2_steady:
+    enabled: false
+    duration: 1h                        # Certification requires 48h; start with 1h
+    target_rps: 187                     # Steady-state RPS target
+    burst_rps: 374                      # Burst RPS (2x steady, applied for 10s every 5min)
+    target_cpu_pct: 60                  # Max acceptable RDS CPU
+    target_p50_ms: 15                   # p50 latency target
+
+  phase2b_skew:
+    enabled: false
+    hot_bucket_write_pct: 20            # % of writes going to the hottest bucket
+    cold_p99_ms: 15                     # Cold bucket p99 must stay below this
+
+  phase3_avalanche:
+    enabled: false
+    kill_fraction: 0.5                  # Kill this fraction of writers mid-test
+    zombie_writers: 1                   # Start N stale-epoch writers (must be fenced)
+
+  phase5_poll:
+    enabled: true
+    num_watchers: 10                    # Concurrent watchers
+    write_rate: 20                      # Writes/s during measurement
+    write_count: 1000                   # Total writes per measurement phase
+    doorbell_delivery_p99_ms: 150       # Doorbell delivery p99 target
+    notify_loss_drill: true             # Also run with no LISTEN conn
+
+  phase6_failover:
+    enabled: false                      # Requires manual RDS failover trigger
+    drills: 5
+
+  phase7_backup_restore:
+    enabled: false
+
+verifier:
+  enabled: true
+  poll_interval: 200ms                  # Verifier poll interval
+  canary_interval: 500ms                # Canary write interval
+  sample_buckets: 8                     # Buckets to verify (including hottest)
+
+checkpoint_interval: 5m                   # How often to write progress snapshots (fetchable via ./run.sh check)
