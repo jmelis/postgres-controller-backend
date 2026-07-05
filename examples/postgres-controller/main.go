@@ -70,7 +70,7 @@ func main() {
 		return pgx.Connect(ctx, dsn)
 	}
 
-	// Acquire leases for all three GVKs.
+	// Acquire leases.
 	logger.Info("acquiring leases")
 	leaseConn, err := connFactory()
 	if err != nil {
@@ -78,42 +78,65 @@ func main() {
 		os.Exit(1)
 	}
 
-	mgr := lease.NewBothManager(leaseConn, holderID)
-	gvks := []string{gvkGreeting, gvkGreetingCard, gvkGreetingPolicy}
-	epochs := make(map[string]lease.BothEpochs)
-	for _, gvk := range gvks {
-		// Each GVK uses the same bucket but leases are per-bucket, so a single
-		// AcquireBoth per bucket suffices. We call it once for the bucket.
-		if _, ok := epochs[gvk]; !ok {
-			ep, err := mgr.AcquireBoth(ctx, bucketID, leaseTTL)
-			if err != nil {
-				logger.Error("acquire lease", "gvk", gvk, "err", err)
-				os.Exit(1)
-			}
-			for _, g := range gvks {
-				epochs[g] = ep
-			}
-		}
+	leaseMgr := lease.NewBothManager(leaseConn, holderID)
+	epochs, err := leaseMgr.AcquireBoth(ctx, bucketID, leaseTTL)
+	if err != nil {
+		logger.Error("acquire lease", "err", err)
+		os.Exit(1)
 	}
-	logger.Info("leases acquired", "specEpoch", epochs[gvkGreeting].Spec, "statusEpoch", epochs[gvkGreeting].Status)
+	logger.Info("leases acquired", "specEpoch", epochs.Spec, "statusEpoch", epochs.Status)
 
-	// Create clients and lister-watchers for each GVK.
+	// Common config.
 	assigner := func(_, _ string) int { return bucketID }
 	buckets := []int{bucketID}
+	leaseEpochs := crbridge.LeaseEpochs{Spec: epochs.Spec, Status: epochs.Status}
 
-	clients := map[string]*crbridge.Client{
-		gvkGreeting:       crbridge.NewClient(connFactory, gvkGreeting, assigner, holderID, epochs[gvkGreeting].Spec),
-		gvkGreetingCard:   crbridge.NewClient(connFactory, gvkGreetingCard, assigner, holderID, epochs[gvkGreetingCard].Spec),
-		gvkGreetingPolicy: crbridge.NewClient(connFactory, gvkGreetingPolicy, assigner, holderID, epochs[gvkGreetingPolicy].Spec),
+	// Build typed clients — used by both the controller and the HTTP API.
+	greetingClient := crbridge.NewTypedClient[GreetingSpec, GreetingStatus](
+		crbridge.NewClient(connFactory, gvkGreeting, assigner, holderID, epochs.Spec),
+		crbridge.NewListerWatcher(connFactory, gvkGreeting, buckets),
+	)
+	cardClient := crbridge.NewTypedClient[GreetingCardSpec, GreetingCardStatus](
+		crbridge.NewClient(connFactory, gvkGreetingCard, assigner, holderID, epochs.Spec),
+		crbridge.NewListerWatcher(connFactory, gvkGreetingCard, buckets),
+	)
+	policyClient := crbridge.NewTypedClient[GreetingPolicySpec, GreetingPolicyStatus](
+		crbridge.NewClient(connFactory, gvkGreetingPolicy, assigner, holderID, epochs.Spec),
+		crbridge.NewListerWatcher(connFactory, gvkGreetingPolicy, buckets),
+	)
+
+	// Register the controller with the Manager.
+	reconciler := &GreetingReconciler{
+		Greetings: greetingClient,
+		Cards:     cardClient,
+		Policies:  policyClient,
 	}
 
-	lws := map[string]*crbridge.ListerWatcher{
-		gvkGreeting:       crbridge.NewListerWatcher(connFactory, gvkGreeting, buckets),
-		gvkGreetingCard:   crbridge.NewListerWatcher(connFactory, gvkGreetingCard, buckets),
-		gvkGreetingPolicy: crbridge.NewListerWatcher(connFactory, gvkGreetingPolicy, buckets),
-	}
+	mgr := crbridge.NewManager(crbridge.ManagerConfig{
+		ConnFactory:    connFactory,
+		HolderID:       holderID,
+		BucketAssigner: assigner,
+		BucketIDs:      buckets,
+		LeaseEpochs: map[string]crbridge.LeaseEpochs{
+			gvkGreeting:       leaseEpochs,
+			gvkGreetingCard:   leaseEpochs,
+			gvkGreetingPolicy: leaseEpochs,
+		},
+		Logger: logger,
+	})
 
-	// Build CRD validator.
+	crbridge.NewControllerFor[GreetingSpec, GreetingStatus](mgr, gvkGreeting, reconciler).
+		Watches(gvkGreetingPolicy, reconciler.policyToGreetings).
+		Complete()
+
+	go func() {
+		if err := mgr.Start(ctx); err != nil && ctx.Err() == nil {
+			logger.Error("manager exited", "err", err)
+		}
+	}()
+
+	// Build CRD validator and start HTTP API.
+	// The HTTP API uses untyped clients because it serves raw JSON.
 	logger.Info("loading CRD schemas")
 	validator, err := NewValidator()
 	if err != nil {
@@ -121,20 +144,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Start controller.
-	ctrl := NewController(
-		clients[gvkGreeting], clients[gvkGreetingCard], clients[gvkGreetingPolicy],
-		lws[gvkGreeting], lws[gvkGreetingPolicy], lws[gvkGreetingCard],
-		validator, logger,
-	)
-	go func() {
-		if err := ctrl.Run(ctx); err != nil && ctx.Err() == nil {
-			logger.Error("controller exited", "err", err)
-		}
-	}()
+	untypedClients := map[string]*crbridge.Client{
+		gvkGreeting:       greetingClient.Untyped(),
+		gvkGreetingCard:   cardClient.Untyped(),
+		gvkGreetingPolicy: policyClient.Untyped(),
+	}
+	untypedLWs := map[string]*crbridge.ListerWatcher{
+		gvkGreeting:       greetingClient.ListerWatcher(),
+		gvkGreetingCard:   cardClient.ListerWatcher(),
+		gvkGreetingPolicy: policyClient.ListerWatcher(),
+	}
 
-	// Start HTTP API.
-	apiServer := NewAPIServer(clients, lws, validator, logger)
+	apiServer := NewAPIServer(untypedClients, untypedLWs, validator, logger)
 	httpServer := &http.Server{Addr: listenAddr, Handler: apiServer.Handler()}
 	go func() {
 		logger.Info("HTTP API listening", "addr", listenAddr)
@@ -152,7 +173,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := mgr.RenewBoth(ctx, bucketID, leaseTTL); err != nil {
+				if err := leaseMgr.RenewBoth(ctx, bucketID, leaseTTL); err != nil {
 					logger.Error("lease renewal failed", "err", err)
 				}
 			}
@@ -173,4 +194,3 @@ func main() {
 
 	logger.Info("shutdown complete")
 }
-

@@ -16,7 +16,7 @@ The reconcile logic is identical between the two controllers. The differences
 are in how you talk to the storage layer and how you wire up watches. Here is
 the full list of things that change.
 
-### 1. Types: Go structs → `json.RawMessage`
+### 1. Types: `metav1.ObjectMeta` boilerplate → plain Go structs
 
 **etcd** — typed Go structs with `metav1.ObjectMeta`, `DeepCopyObject()`,
 scheme registration, and code generation boilerplate (~193 lines for three
@@ -32,50 +32,60 @@ type Greeting struct {
 // + DeepCopyObject, DeepCopyInto, SchemeBuilder.Register, ...
 ```
 
-**postgres** — `crbridge.Object` uses `json.RawMessage` for spec, status, and
-metadata. No Go types needed, no deepcopy, no scheme:
+**postgres** — plain Go structs for spec and status, no metadata boilerplate,
+no deepcopy, no scheme registration (~32 lines for three types):
 
 ```go
-type Object struct {
+type GreetingSpec struct {
+    Name string `json:"name"`
+}
+
+type GreetingStatus struct {
+    Message string `json:"message,omitempty"`
+    Phase   string `json:"phase,omitempty"`
+    CardRef string `json:"cardRef,omitempty"`
+}
+```
+
+The `crbridge.TypedObject[S, T]` generic type carries the standard metadata
+(namespace, name, UID, resourceVersion) alongside your typed spec and status:
+
+```go
+type TypedObject[S any, T any] struct {
     GVK             string
     Namespace       string
     Name            string
     UID             uuid.UUID
     ResourceVersion string
-    BucketID        int
-    Spec            json.RawMessage
-    Status          json.RawMessage
-    Metadata        json.RawMessage
-    Deleted         bool
+    Spec            S              // your spec type
+    Status          T              // your status type
+    // ...
 }
 ```
 
-You parse fields inline when you need them:
-
-```go
-var spec struct { Name string `json:"name"` }
-json.Unmarshal(greeting.Spec, &spec)
-```
-
-### 2. CRUD: `client.Client` → `crbridge.Client`
+### 2. CRUD: `client.Client` → `crbridge.TypedClient[S, T]`
 
 | Operation | controller-runtime | crbridge |
 |---|---|---|
 | Get | `r.Get(ctx, key, &obj)` | `client.Get(ctx, ns, name)` |
-| Create | `r.Create(ctx, &obj)` | `client.Create(ctx, ns, name, spec, status, metadata)` |
+| Create | `r.Create(ctx, &obj)` | `client.Create(ctx, ns, name, spec)` |
 | Update spec | `r.Update(ctx, &obj)` | `client.Update(ctx, obj)` |
-| Update status | `r.Status().Update(ctx, &obj)` | `client.Status().Update(obj, statusJSON)` |
+| Update status | `r.Status().Update(ctx, &obj)` | `client.Status().Update(ctx, obj, status)` |
 | Delete | `r.Delete(ctx, &obj)` | `client.Delete(ctx, obj)` |
-| List | `r.List(ctx, &list, opts...)` | `lw.List(ctx)` |
+| List | `r.List(ctx, &list, opts...)` | `client.List(ctx)` |
 
 Key differences:
-- `crbridge.Client` is **per-GVK** (one client per kind). controller-runtime
+- `crbridge.TypedClient` is **per-GVK** (one client per kind). controller-runtime
   uses a single `client.Client` for all types.
-- Create takes the spec, status, and metadata as separate `json.RawMessage`
-  arguments instead of a full typed object.
-- Status updates take the object + new status JSON instead of mutating a struct.
+- Create takes the typed spec directly — status defaults to the zero value.
+- Status updates take the typed object + new typed status value.
 - There is no `CreateOrUpdate` helper — you Get, check `ErrNotFound`, and
   branch into Create or Update yourself.
+- All operations return `*TypedObject[S, T]` with typed fields — no
+  `json.Unmarshal` needed in controller code.
+
+An untyped `crbridge.Client` is also available for code that works with raw
+JSON (e.g., HTTP APIs). Access it via `typedClient.Untyped()`.
 
 ### 3. Error handling: `errors.IsNotFound()` → sentinel errors
 
@@ -89,7 +99,7 @@ Key differences:
 `ErrFenced` is new — it means the lease epoch doesn't match, typically because
 another replica took over. Treat it as a signal to stop processing.
 
-### 4. Watches: `SetupWithManager` → explicit watch loops
+### 4. Watches: `SetupWithManager` → `NewControllerFor`
 
 **etcd** — declarative, one-liner watch setup:
 
@@ -101,42 +111,36 @@ ctrl.NewControllerManagedBy(mgr).
     Complete(r)
 ```
 
-**postgres** — you write the List/Watch loop and work queue yourself:
+**postgres** — same declarative pattern via `crbridge.NewControllerFor`:
 
 ```go
-func (c *Controller) watchGreetings(ctx context.Context) {
-    for ctx.Err() == nil {
-        result, _ := c.greetingLW.List(ctx)
-        for _, obj := range result.Objects {
-            c.enqueue(obj.Namespace, obj.Name)
+crbridge.NewControllerFor[GreetingSpec, GreetingStatus](mgr, gvkGreeting, reconciler).
+    Watches(gvkGreetingPolicy, reconciler.policyToGreetings).
+    Complete()
+```
+
+The `Manager` handles all the list-watch-relist loops, work queue, and
+reconcile dispatch internally. You only write:
+- A `Reconcile(ctx, *TypedObject[S, T]) (Result, error)` method
+- A `MapFunc` for cross-type watches (e.g., policy change → requeue greetings)
+
+The `MapFunc` receives an untyped `*Object` because it operates at the watch
+level. In the common case (requeue by namespace) only `obj.Namespace` is needed:
+
+```go
+func (r *GreetingReconciler) policyToGreetings(ctx context.Context, obj *crbridge.Object) []crbridge.Request {
+    result, _ := r.Greetings.List(ctx)
+    var requests []crbridge.Request
+    for _, g := range result.Objects {
+        if !g.Deleted && g.Namespace == obj.Namespace {
+            requests = append(requests, crbridge.Request{Namespace: g.Namespace, Name: g.Name})
         }
-        wi, _ := c.greetingLW.Watch(ctx, result.ResourceVersion)
-        for ev := range wi.ResultChan() {
-            c.enqueue(ev.Object.Namespace, ev.Object.Name)
-        }
-        // channel closed → relist
     }
+    return requests
 }
 ```
 
-Each GVK you want to watch gets its own `ListerWatcher` and its own goroutine.
-There is no built-in `Owns()` or `EnqueueRequestsFromMapFunc()` — you implement
-the mapping logic in your watch handler:
-
-```go
-// GreetingPolicy changed → requeue all Greetings in that namespace
-func (c *Controller) watchPolicies(ctx context.Context) {
-    // ...
-    for ev := range wi.ResultChan() {
-        c.requeueAllGreetings(ctx, ev.Object.Namespace)
-    }
-}
-```
-
-The work queue is a plain `chan string`. You push `"namespace/name"` keys to
-it, and a reconcile loop drains it.
-
-### 5. Startup: `ctrl.NewManager` → manual bootstrap
+### 5. Startup: `ctrl.NewManager` → `crbridge.NewManager`
 
 **etcd** — 3 lines:
 
@@ -146,7 +150,7 @@ mgr, _ := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{Scheme: scheme})
 mgr.Start(ctrl.SetupSignalHandler())
 ```
 
-**postgres** — you manage the lifecycle yourself:
+**postgres** — connect, migrate, acquire leases, then use the Manager:
 
 ```go
 // 1. Connect to postgres (with retry loop)
@@ -156,16 +160,23 @@ conn, _ := pgx.Connect(ctx, dsn)
 schema.Migrate(ctx, conn)
 
 // 3. Acquire leases
-mgr := lease.NewBothManager(leaseConn, holderID)
-epochs, _ := mgr.AcquireBoth(ctx, bucketID, leaseTTL)
+leaseMgr := lease.NewBothManager(leaseConn, holderID)
+epochs, _ := leaseMgr.AcquireBoth(ctx, bucketID, leaseTTL)
 
-// 4. Create per-GVK clients and lister-watchers
-client := crbridge.NewClient(connFactory, gvk, assigner, holderID, epoch)
-lw := crbridge.NewListerWatcher(connFactory, gvk, bucketIDs)
+// 4. Create typed clients
+greetingClient := crbridge.NewTypedClient[GreetingSpec, GreetingStatus](
+    crbridge.NewClient(connFactory, gvk, assigner, holderID, epochs.Spec),
+    crbridge.NewListerWatcher(connFactory, gvk, buckets),
+)
 
-// 5. Start lease renewal ticker (every ~10s)
-// 6. Start watch goroutines
-// 7. Start reconcile worker
+// 5. Create Manager, register controller, start
+mgr := crbridge.NewManager(crbridge.ManagerConfig{...})
+crbridge.NewControllerFor[GreetingSpec, GreetingStatus](mgr, gvk, reconciler).
+    Watches(gvkGreetingPolicy, reconciler.policyToGreetings).
+    Complete()
+mgr.Start(ctx)
+
+// 6. Start lease renewal ticker (every ~10s)
 ```
 
 New concepts with no etcd equivalent:
@@ -175,7 +186,7 @@ New concepts with no etcd equivalent:
   alive. If it lapses, writes are fenced.
 - **Schema migration** — `schema.Migrate()` creates the postgres tables.
   Idempotent, safe to call on every startup.
-- **Connection factory** — `crbridge.Client` and `ListerWatcher` take a
+- **Connection factory** — `crbridge.TypedClient` and `ListerWatcher` take a
   `func() (*pgx.Conn, error)` rather than a single connection, so each
   operation gets its own connection.
 - **Bucket assignment** — a `func(namespace, name string) int` that maps
@@ -215,55 +226,58 @@ GET    /namespaces/{ns}/greetings          → List
 PUT    /namespaces/{ns}/greetings/{name}   → Update
 ```
 
-This is optional — your controller's reconcile loop only needs `crbridge.Client`
-and `ListerWatcher`. The HTTP API is for external consumers who would otherwise
-use kubectl.
+This is optional — your controller's reconcile loop only needs
+`crbridge.TypedClient` and the `Manager`. The HTTP API is for external
+consumers who would otherwise use kubectl.
 
 ## Line count comparison
 
 | | etcd-controller | postgres-controller |
 |---|---|---|
-| types / deepcopy / scheme | 193 | 0 (uses `json.RawMessage`) |
-| controller + reconcile | 108 | 265 |
-| main / bootstrap | 32 | 176 |
+| types / deepcopy / scheme | 193 | 32 (plain structs) |
+| controller + reconcile | 108 | 93 |
+| main / bootstrap | 32 | 168 |
 | validator | 0 (apiserver does it) | 129 |
 | HTTP API | 0 (apiserver does it) | 242 |
-| **Total** | **333** | **812** |
+| **Total** | **333** | **664** |
 
-The reconcile function itself is roughly the same size. The additional ~480
-lines in the postgres controller are:
-- Bootstrap / lease management (~144 lines)
-- Watch loops + work queue that controller-runtime gives you for free (~157 lines)
+The reconcile function is now roughly the same size as the etcd version. The
+remaining delta is:
+- Bootstrap / lease management (~136 lines)
 - CRD validation (~129 lines)
 - HTTP API for external access (~242 lines, optional)
 
-If you don't need an external HTTP API (your controller is the only consumer),
-the delta drops to ~570 lines.
+Without the optional HTTP API, the delta is ~422 lines — and most of that is
+validation and lease management, not controller logic.
 
 ## Migration checklist
 
-1. **Remove type boilerplate** — delete Go struct types, deepcopy methods,
-   scheme registration. Use `json.RawMessage` and parse fields inline.
+1. **Replace type boilerplate with plain structs** — delete deepcopy methods,
+   scheme registration, `metav1.ObjectMeta` embedding. Define simple Go structs
+   for spec and status fields.
 
-2. **Replace `client.Client` with `crbridge.Client`** — one client per GVK.
-   Update all CRUD calls to the new signatures (see table above).
+2. **Replace `client.Client` with `crbridge.TypedClient[S, T]`** — one typed
+   client per GVK. Update all CRUD calls to the new signatures (see table
+   above). Access `.Spec` and `.Status` directly on the returned
+   `TypedObject` — no `json.Unmarshal` needed.
 
 3. **Replace error checks** — `errors.IsNotFound(err)` → `err == crbridge.ErrNotFound`,
    etc. Add handling for `ErrFenced`.
 
-4. **Replace `SetupWithManager` with watch loops** — write a goroutine per
-   watched GVK that calls `List()` then `Watch()` in a loop, pushing keys to
-   a work queue channel. Implement your own mapping logic for `Owns()`
-   and cross-type triggers.
+4. **Replace `SetupWithManager` with `NewControllerFor`** — implement the
+   `Reconciler[S, T]` interface, use `Watches()` for cross-type triggers,
+   call `Complete()` to register with the Manager. The Manager handles
+   list-watch-relist loops and the work queue internally.
 
 5. **Add bootstrap code** — connect to postgres, migrate schema, acquire leases,
-   create clients and lister-watchers, start lease renewal ticker.
+   create typed clients, create a `Manager`, start lease renewal ticker.
 
 6. **Add CRD validation** — embed CRD YAMLs, build a `Validator`, call
-   `ValidateSpec`/`ValidateStatus` before every write.
+   `ValidateSpec`/`ValidateStatus` before every write in the HTTP API layer.
 
 7. **Add an HTTP API** (if needed) — if external consumers need to read or
-   write your CRs, expose an HTTP server that wraps `crbridge.Client`.
+   write your CRs, expose an HTTP server that wraps `crbridge.Client` (use
+   `typedClient.Untyped()` to get the raw client).
 
 8. **Update deployment manifest** — remove RBAC (ServiceAccount, ClusterRole,
    ClusterRoleBinding). Add postgres connection env vars.
