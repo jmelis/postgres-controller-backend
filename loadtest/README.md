@@ -156,7 +156,7 @@ A single YAML file controls everything: bucket count, GVK payload sizes, which p
 ## Quick start
 
 ```bash
-# Prerequisites: AWS CLI, Terraform >= 1.5, kubectl, Docker, Go 1.22+
+# Prerequisites: AWS CLI, Terraform >= 1.5, kubectl, Podman, Go 1.22+
 
 # 1. Provision infrastructure and run the 5k baseline test
 ./run.sh specs/5k-baseline.yaml all
@@ -202,7 +202,7 @@ go build -o lt ./loadtest/cmd/loadtest/
 ```
 loadtest/
 ├── README.md                   # This file
-├── Dockerfile                  # Multi-stage build for the Go harness
+├── Containerfile               # Multi-stage build for the Go harness
 ├── run.sh                      # Wrapper script for the full lifecycle
 ├── terraform/                  # EKS + RDS + VPC + CloudWatch dashboard
 ├── k8s/                        # Job, ServiceAccount, CW Agent config

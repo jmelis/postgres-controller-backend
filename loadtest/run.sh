@@ -80,13 +80,13 @@ apply_k8s_manifests() {
 build_and_push() {
     log "Building load test image..."
     cd "$SCRIPT_DIR/.."
-    docker build -t "$IMAGE_NAME:$IMAGE_TAG" -f loadtest/Dockerfile .
+    podman build -t "$IMAGE_NAME:$IMAGE_TAG" -f loadtest/Containerfile .
 
     # If using ECR, push; otherwise assume local/kind
     if [[ -n "${ECR_REGISTRY:-}" ]]; then
         log "Pushing to ECR..."
-        docker tag "$IMAGE_NAME:$IMAGE_TAG" "$ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
-        docker push "$ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+        podman tag "$IMAGE_NAME:$IMAGE_TAG" "$ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+        podman push "$ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
     else
         log "No ECR_REGISTRY set — assuming image is available to the cluster"
     fi

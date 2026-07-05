@@ -19,7 +19,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: loadtest
-          image: pgctl-loadtest:latest  # Built from loadtest/Dockerfile
+          image: pgctl-loadtest:latest  # Built from loadtest/Containerfile
           args:
             - --spec=/config/spec.yaml
             - --metrics-addr=:9090
