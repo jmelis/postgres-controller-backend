@@ -1,6 +1,7 @@
 # Compiled binaries
 examples/etcd-controller/etcd-controller
 examples/postgres-controller/postgres-controller
+lt
 
 # Claude Code
 .claude/settings.local.json
