@@ -68,6 +68,46 @@ PostgreSQL 16 is the authoritative store, with:
 - **Timeline epochs** for failover detection
 - **Prometheus instrumentation** across writer, watcher, verifier, and lease paths ([METRICS.md](METRICS.md))
 
+```mermaid
+flowchart LR
+    subgraph Controllers
+        C1[Controller A]
+        C2[Controller B]
+        C3[Controller C]
+    end
+
+    subgraph "writer.Write()"
+        W["pgctl_write()
+        ─────────────
+        1. Fence (FOR SHARE)
+        2. Suppress if no-op
+        3. Counter++
+        4. UPSERT resource"]
+    end
+
+    subgraph PostgreSQL
+        direction TB
+        B1["Bucket 1\n lease + counter + rows"]
+        B2["Bucket 2\n lease + counter + rows"]
+        BN["Bucket N\n lease + counter + rows"]
+    end
+
+    subgraph Watchers
+        WA["Poll loop\n seq > hwm"]
+    end
+
+    C1 --> W
+    C2 --> W
+    C3 --> W
+    W --> B1
+    W --> B2
+    W --> BN
+    B1 -.->|pg_notify| WA
+    B2 -.->|pg_notify| WA
+    BN -.->|pg_notify| WA
+    WA -->|"SELECT\n seq > hwm"| PostgreSQL
+```
+
 ## Correctness
 
 Every mechanism is justified by one of 8 named invariants (I1–I8, DESIGN.md §2) — gapless issuance, commit order = sequence order, no regression across failover, single writer, exactly-once watch delivery, resourceVersion monotonicity, compaction safety, optimistic concurrency.
