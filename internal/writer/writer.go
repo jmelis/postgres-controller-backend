@@ -124,17 +124,23 @@ func (w *Writer) callStoredProc(ctx context.Context, p writeParams) (model.Write
 	var uid uuid.UUID
 	var version, seq int64
 	var changed bool
+	var fenceUs, suppressUs, counterUs, upsertUs int64
 
 	err = tx.QueryRow(ctx, pgctlWriteSQL,
 		p.domain, p.gvk, p.namespace, p.name, p.bucketID,
 		p.holder, p.epoch, p.expectedVersion, p.forceWrite,
 		p.spec, p.status, p.metadata, p.deletionTimestamp,
-	).Scan(&uid, &version, &seq, &changed)
+	).Scan(&uid, &version, &seq, &changed, &fenceUs, &suppressUs, &counterUs, &upsertUs)
 	w.observeStep("stored_proc", time.Since(t0))
 
 	if err != nil {
 		return model.WriteResult{}, mapStoredProcError(err)
 	}
+
+	w.observeStep("fence_check", time.Duration(fenceUs)*time.Microsecond)
+	w.observeStep("suppression_check", time.Duration(suppressUs)*time.Microsecond)
+	w.observeStep("counter_increment", time.Duration(counterUs)*time.Microsecond)
+	w.observeStep("upsert", time.Duration(upsertUs)*time.Microsecond)
 
 	if !changed {
 		t0 = time.Now()
