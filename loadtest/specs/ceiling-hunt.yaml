@@ -1,9 +1,9 @@
 metadata:
   name: "ceiling-hunt"
-  description: "Maximum RPS discovery — bucket count sweep on db.r6g.large"
+  description: "Maximum RPS discovery — bucket count sweep on db.m6g.8xlarge Multi-AZ"
 
 rds:
-  instance_class: "db.r6g.large"
+  instance_class: "db.m6g.8xlarge"
   engine_version: "16.4"
 
 cluster:
@@ -22,21 +22,17 @@ seed:
 
 phases:
   phase0_baseline:
-    enabled: true
-    ping_iterations: 1000
-    write_iterations: 500
-    stored_proc_writes: 500
-    sync_commit_compare: 200
+    enabled: false
 
   phase1_ceiling:
     enabled: true
     workers_per_bucket: 1
     duration: 120s
     warm_up: 15s
-    runs: 3
+    runs: 1
     target_rps: 0
     target_p99_ms: 0
-    bucket_sweep: [1, 4, 8, 16, 32, 64]
+    bucket_sweep: [64, 32, 16, 8, 4, 1]
 
   phase2_steady:
     enabled: false
