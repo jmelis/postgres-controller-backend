@@ -118,25 +118,6 @@ CREATE TABLE compaction_horizon (
     PRIMARY KEY (bucket_id, gvk)
 );
 
--- 6. DynamoDB stream checkpoint (fenced via bucket_leases FOR SHARE)
-CREATE TABLE stream_checkpoints (
-    stream_arn   TEXT        NOT NULL,
-    shard_id     TEXT        NOT NULL,
-    last_seq_num TEXT        NOT NULL,
-    holder_id    TEXT        NOT NULL,
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (stream_arn, shard_id)
-);
-
--- 7. MC registry: authoritative map from MC to bucket and DynamoDB table ARN
-CREATE TABLE mc_registry (
-    mc_id           TEXT PRIMARY KEY,
-    mc_index        INT  NOT NULL UNIQUE,
-    read_table_arn  TEXT NOT NULL,
-    read_stream_arn TEXT,
-    state           TEXT NOT NULL CHECK (state IN ('active', 'draining', 'retired')),
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
 ```
 
 ### 3.2 Composite resourceVersion
@@ -212,7 +193,7 @@ Content-equal writes consume no sequence number, emit no doorbell, and bump no `
 
 **Create-path behavior (ExpectedVersion == 0):** if the row already exists and content matches, the write is treated as a replayed create — returns `Changed: false` with the existing row's version and UID. If content differs, returns `ErrAlreadyExists` as before.
 
-**`WriteResult.Changed`** indicates whether the write produced a new state. Callers can use this to skip downstream side-effects (e.g., the DynamoDB bridge skips doorbell emission on `Changed: false`).
+**`WriteResult.Changed`** indicates whether the write produced a new state. Callers can use this to skip downstream side-effects on no-ops.
 
 **Invariants preserved:**
 

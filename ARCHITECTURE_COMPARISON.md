@@ -15,7 +15,6 @@ User/Platform API --> Hyperfleet API (stateless REST) --> PostgreSQL
 ```
 Platform API --> PostgreSQL (fenced writes, gapless counters)
 Controllers --> PostgreSQL (lease-based watch, reconcile loop)
-Bridge      --> DynamoDB streams --> PostgreSQL (observed MC state)
 ```
 
 ---
@@ -63,8 +62,8 @@ The direct-to-Postgres design is significantly more reliable because:
 | **Write hops**            | HTTP request -> JSON parse -> GORM -> SQL -> PG                                                                     | Single stored procedure call (`pgctl_write()`: fence + suppress + counter + upsert) + external doorbell                                                                      |
 | **Latency (write)**       | HTTP overhead + GORM reflection + connection pool wait. 30s request timeout under pressure; 500s on pool exhaustion | p50=28ms, p99=211ms (single bucket); p50=18ms, p99=45ms (16 buckets). Measured with 50 concurrent writers                                                                    |
 | **Throughput ceiling**    | Not published. Connection pool: 50 max open (default). Transaction-per-write-request middleware                     | **9,622 writes/s** across 64 buckets on RDS db.m6g.2xlarge (Multi-AZ sync commit); near-linear scaling with bucket count. Zero serialization failures                        |
-| **No-op suppression**     | None -- every PATCH/PUT hits the database regardless of whether content changed                                     | Content-equal writes consume no sequence, no version bump, no doorbell, no watch event. Critical for DynamoDB bridge where applier rewrites status every ~3 min              |
-| **Connection efficiency** | 50 max connections shared across all HTTP requests (reads + writes). PgBouncer sidecar optional                     | pgx pool of 4-8 connections + 1 lease connection. ~20 total connections for 2 bridge replicas serving the entire fleet                                                       |
+| **No-op suppression**     | None -- every PATCH/PUT hits the database regardless of whether content changed                                     | Content-equal writes consume no sequence, no version bump, no doorbell, no watch event. Critical for status re-appliers that rewrite identical content periodically           |
+| **Connection efficiency** | 50 max connections shared across all HTTP requests (reads + writes). PgBouncer sidecar optional                     | pgx pool of 4-8 connections + 1 lease connection. ~20 total connections for the entire fleet                                                                                 |
 
 ### Read Path
 
@@ -83,14 +82,6 @@ The direct-to-Postgres design is significantly more reliable because:
 | **Detection -> adapter action** | CloudEvent publish + delivery + Adapter GET from API                                                                     | Controller reconcile loop (already watching)                      |
 | **Action -> status visible**    | Adapter PUT to API -> API writes DB -> next Sentinel poll picks up new state                                             | Controller WriteStatus() -> same PG, same watch stream            |
 | **Total round-trip**            | Sentinel poll + event delivery + Adapter processing + status report + Sentinel re-poll = **multiple seconds to minutes** | Watch delivery + reconcile + WriteStatus = **sub-second typical** |
-
-### Observed State (MC/HyperShift) Bridging
-
-| Metric             | Hyperfleet-API (CLM)                                              | Direct-to-Postgres                                                                                                                              |
-| ------------------ | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Ingestion**      | Not applicable -- adapters report status via REST PUT to the API  | DynamoDB stream consumer + 15-min reconciler per MC. ~4 real writes/s per MC against ~317/s single-connection per-bucket ceiling                 |
-| **No-op handling** | Every status PUT triggers a full write                            | No-op suppression absorbs applier's ~3-min poll refreshes -- potentially 1,600 no-op events/s fleet-wide reduced to zero DB writes              |
-| **Scalability**    | Horizontal API replicas, but each write is a full HTTP round-trip | Per-MC buckets grow additively. Either bridge replica can carry the whole fleet. Connection count stays constant (~20) regardless of MC count   |
 
 ### Performance Verdict
 
