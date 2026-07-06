@@ -14,7 +14,6 @@ var migrationsFS embed.FS
 func Migrate(ctx context.Context, conn *pgx.Conn) error {
 	files := []string{
 		"migrations/001_initial.sql",
-		"migrations/002_bridge_tables.sql",
 	}
 	for _, f := range files {
 		sql, err := migrationsFS.ReadFile(f)
