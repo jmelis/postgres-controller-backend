@@ -16,7 +16,10 @@ CREATE TABLE IF NOT EXISTS bucket_leases (
     PRIMARY KEY (bucket_id, domain)
 );
 
--- Resources: one live row per object + tombstones
+-- Resources: one row per object. Three lifecycle states:
+--   live (deletion_timestamp IS NULL),
+--   dying (deletion_timestamp set, has finalizers),
+--   fully deleted / tombstone (deletion_timestamp set, no finalizers).
 CREATE TABLE IF NOT EXISTS kubernetes_resources (
     gvk                TEXT        NOT NULL,
     namespace          TEXT        NOT NULL,
@@ -34,6 +37,9 @@ CREATE TABLE IF NOT EXISTS kubernetes_resources (
     PRIMARY KEY (gvk, namespace, name)
 );
 
+-- Covers live-only queries (e.g., Get). List uses a broader predicate that
+-- also includes dying objects (deletion_timestamp set, has finalizers) and
+-- falls back to idx_resources_watch.
 CREATE INDEX IF NOT EXISTS idx_resources_list
     ON kubernetes_resources (gvk, bucket_id)
     WHERE deletion_timestamp IS NULL;
@@ -146,7 +152,7 @@ BEGIN
                 END IF;
             ELSE
                 IF v_existing.spec = p_spec
-                   AND v_existing.status = p_status
+                   AND (p_status IS NULL OR v_existing.status = p_status)
                    AND v_existing.metadata = p_metadata
                    AND v_existing.deletion_timestamp IS NOT DISTINCT FROM p_deletion_ts THEN
                     v_suppress_us := extract(microseconds from clock_timestamp() - v_t0)::BIGINT;
@@ -196,14 +202,36 @@ BEGIN
                     1, p_spec, p_status, p_metadata, p_deletion_ts)
             RETURNING uid, object_version INTO v_uid, v_version;
         EXCEPTION WHEN unique_violation THEN
-            RAISE EXCEPTION 'already exists' USING ERRCODE = 'P0003';
+            -- Tombstone revival: if the conflicting row is fully deleted
+            -- (deletion_timestamp set, no finalizers), overwrite it as a
+            -- fresh resource with a new UID. Dying objects (have finalizers)
+            -- and live objects fall through to 'already exists'.
+            UPDATE kubernetes_resources
+               SET uid                = gen_random_uuid(),
+                   bucket_id          = p_bucket_id,
+                   gvk_bucket_seq     = v_seq,
+                   object_version     = 1,
+                   spec               = p_spec,
+                   status             = COALESCE(p_status, '{}'::jsonb),
+                   metadata           = p_metadata,
+                   deletion_timestamp = NULL,
+                   created_at         = now(),
+                   updated_at         = now()
+             WHERE gvk = p_gvk AND namespace = p_namespace AND name = p_name
+               AND deletion_timestamp IS NOT NULL
+               AND (metadata->'finalizers' IS NULL OR metadata->'finalizers' = '[]'::jsonb) -- tombstone filter: also in list.go, compactor.go, writer.go
+            RETURNING uid, object_version INTO v_uid, v_version;
+
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'already exists' USING ERRCODE = 'P0003';
+            END IF;
         END;
     ELSE
         UPDATE kubernetes_resources
            SET gvk_bucket_seq     = v_seq,
                object_version     = object_version + 1,
                spec               = p_spec,
-               status             = p_status,
+               status             = COALESCE(p_status, status),
                metadata           = p_metadata,
                deletion_timestamp = p_deletion_ts,
                updated_at         = now()

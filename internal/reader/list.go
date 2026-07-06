@@ -14,10 +14,13 @@ type ListResult struct {
 	ResourceVersion resourceversion.RV
 }
 
-// List performs a REPEATABLE READ snapshot read of all live resources matching
-// the given GVK across the specified buckets. The returned RV is built from
-// cluster_epoch + per-bucket counters within the same snapshot, so there is
-// no skew between the data and the version (I5/I6 handoff into Watch).
+// List performs a REPEATABLE READ snapshot read of all live and dying resources
+// matching the given GVK across the specified buckets. Fully-deleted tombstones
+// (deletion_timestamp set, no finalizers) are excluded by the query. Dying
+// objects (deletion_timestamp set, has finalizers) are included so controllers
+// can perform cleanup before removing their finalizers. The returned RV is
+// built from cluster_epoch + per-bucket counters within the same snapshot,
+// so there is no skew between the data and the version (I5/I6 handoff into Watch).
 func List(ctx context.Context, conn *pgx.Conn, gvk string, bucketIDs []int) (*ListResult, error) {
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel:   pgx.RepeatableRead,
@@ -64,14 +67,13 @@ func List(ctx context.Context, conn *pgx.Conn, gvk string, bucketIDs []int) (*Li
 		}
 	}
 
-	// Read live resources (uses idx_resources_list partial index)
 	resourceRows, err := tx.Query(ctx, `
 		SELECT gvk, namespace, name, uid, bucket_id, gvk_bucket_seq,
 		       object_version, spec, status, metadata,
 		       deletion_timestamp, created_at, updated_at
 		FROM kubernetes_resources
 		WHERE gvk = $1 AND bucket_id = ANY($2)
-		  AND deletion_timestamp IS NULL
+		  AND (deletion_timestamp IS NULL OR metadata->'finalizers' != '[]'::jsonb) -- tombstone filter: also in compactor.go, 001_initial.sql, writer.go
 		ORDER BY bucket_id, gvk_bucket_seq`, gvk, bucketIDs)
 	if err != nil {
 		return nil, fmt.Errorf("list resources: %w", err)

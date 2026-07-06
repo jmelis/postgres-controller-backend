@@ -92,7 +92,7 @@ func TestListExcludesTombstones(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Create a tombstone (deletion_timestamp set)
+	// Create a tombstone (deletion_timestamp set, no finalizers)
 	now := time.Now()
 	_, err = w.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "deleted",
@@ -107,8 +107,61 @@ func TestListExcludesTombstones(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, result.Resources, 1)
 	assert.Equal(t, "live", result.Resources[0].Name)
-	// RV reflects both writes even though tombstone is excluded from results
 	assert.Equal(t, int64(2), result.ResourceVersion.Buckets[1])
+}
+
+func TestListIncludesDyingWithFinalizers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres")
+	}
+	db := testinfra.StartPostgres(t)
+	ctx := context.Background()
+
+	leaseConn := db.Connect(t)
+	mgr := lease.NewSpecManager(leaseConn, "replica-1")
+	epoch, err := mgr.Acquire(ctx, 1, 30*time.Second)
+	require.NoError(t, err)
+
+	writerConn := db.Connect(t)
+	w := writer.New(writerConn, nil)
+
+	// Create a live resource
+	_, err = w.Write(ctx, model.WriteRequest{
+		GVK: "apps/v1/Deployment", Namespace: "default", Name: "live",
+		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Metadata: json.RawMessage(`{}`), LeaseHolder: "replica-1", LeaseEpoch: epoch,
+	})
+	require.NoError(t, err)
+
+	// Create a dying resource (deletion_timestamp set, has finalizers)
+	now := time.Now()
+	_, err = w.Write(ctx, model.WriteRequest{
+		GVK: "apps/v1/Deployment", Namespace: "default", Name: "dying",
+		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Metadata:          json.RawMessage(`{"finalizers":["cleanup.example.com"]}`),
+		DeletionTimestamp: &now,
+		LeaseHolder:       "replica-1", LeaseEpoch: epoch,
+	})
+	require.NoError(t, err)
+
+	// Create a tombstone (deletion_timestamp set, no finalizers)
+	_, err = w.Write(ctx, model.WriteRequest{
+		GVK: "apps/v1/Deployment", Namespace: "default", Name: "tombstone",
+		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Metadata:          json.RawMessage(`{}`),
+		DeletionTimestamp: &now,
+		LeaseHolder:       "replica-1", LeaseEpoch: epoch,
+	})
+	require.NoError(t, err)
+
+	listConn := db.Connect(t)
+	result, err := reader.List(ctx, listConn, "apps/v1/Deployment", []int{1})
+	require.NoError(t, err)
+	assert.Len(t, result.Resources, 2)
+	names := []string{result.Resources[0].Name, result.Resources[1].Name}
+	assert.Contains(t, names, "live")
+	assert.Contains(t, names, "dying")
+	assert.Equal(t, int64(3), result.ResourceVersion.Buckets[1])
 }
 
 func TestListMultipleBuckets(t *testing.T) {

@@ -16,8 +16,10 @@ type Result struct {
 	Deleted int64
 }
 
-// Compact deletes tombstones older than retention and advances the compaction
-// horizon atomically in a single CTE statement (I7: horizon never lags delete).
+// Compact deletes fully-deleted tombstones (deletion_timestamp set, no active
+// finalizers) older than retention and advances the compaction horizon
+// atomically in a single CTE statement (I7: horizon never lags delete).
+// Dying objects with active finalizers are preserved regardless of age.
 func Compact(ctx context.Context, conn *pgx.Conn, cfg Config) (*Result, error) {
 	if cfg.Retention == 0 {
 		cfg.Retention = 24 * time.Hour
@@ -30,7 +32,8 @@ func Compact(ctx context.Context, conn *pgx.Conn, cfg Config) (*Result, error) {
 		WITH del AS (
 			DELETE FROM kubernetes_resources
 			WHERE deletion_timestamp IS NOT NULL
-			  AND deletion_timestamp < now() - $1::interval
+			  AND GREATEST(deletion_timestamp, updated_at) < now() - $1::interval
+			  AND (metadata->'finalizers' IS NULL OR metadata->'finalizers' = '[]'::jsonb) -- tombstone filter: also in list.go, 001_initial.sql, writer.go
 			RETURNING bucket_id, gvk, gvk_bucket_seq
 		),
 		horizon AS (

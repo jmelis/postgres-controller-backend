@@ -18,6 +18,9 @@ loadtest/terraform/.terraform.lock.hcl
 loadtest/terraform/terraform.tfvars
 loadtest/terraform/terraform.tfstate*
 
+# envtest binaries
+.envtest/
+
 # Talk build artifacts
 talk/build/
 talk/output.mp4

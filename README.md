@@ -32,28 +32,21 @@ Otherwise, use `etcd` or `kine`, for example.
 
 ## Getting started
 
-The [`examples/`](examples/) directory contains the same controller implemented twice — once with controller-runtime against etcd, once with [`pkg/crbridge`](pkg/crbridge/) against PostgreSQL — showing exactly what changes when migrating. The postgres wiring looks like:
+The [`examples/`](examples/) directory contains the same controller implemented twice — once with controller-runtime against etcd, once with [`pkg/pgruntime`](pkg/pgruntime/) against PostgreSQL — showing exactly what changes when migrating. The postgres wiring looks like:
 
 ```go
-conn, _ := pgx.Connect(ctx, dsn)
-schema.Migrate(ctx, conn)                                // idempotent
+mgr, _ := pgruntime.NewManager(pgruntime.Options{
+    Scheme:   scheme,
+    DSN:      dsn,
+    HolderID: holderID,
+    Logger:   log,
+})
 
-leaseMgr := lease.NewBothManager(leaseConn, holderID)
-epochs, _ := leaseMgr.AcquireBoth(ctx, bucketID, leaseTTL)
-
-greetingClient := crbridge.NewTypedClient[GreetingSpec, GreetingStatus](
-    crbridge.NewClient(connFactory, gvk, assigner, holderID, epochs.Spec),
-    crbridge.NewListerWatcher(connFactory, gvk, buckets),
-)
-
-mgr := crbridge.NewManager(crbridge.ManagerConfig{...})
-crbridge.NewControllerFor[GreetingSpec, GreetingStatus](mgr, gvk, reconciler).
-    Watches(gvkGreetingPolicy, reconciler.policyToGreetings).
-    Complete()
+(&GreetingReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr)
 mgr.Start(ctx)
 ```
 
-See [`examples/README.md`](examples/README.md) for the full migration guide, a line-count breakdown, and a step-by-step checklist.
+`pgruntime.NewManager` handles connection pooling, schema migration, and lease acquisition internally — the caller provides a DSN and a scheme, and gets back a standard `manager.Manager`. See [`examples/README.md`](examples/README.md) for the full migration guide, a line-count breakdown, and a step-by-step checklist.
 
 ## Architecture
 
@@ -61,10 +54,10 @@ PostgreSQL 16 is the authoritative store, with:
 
 - **Server-side stored procedure (`pgctl_write()`)** — fence check, no-op suppression, counter increment, and upsert in a single server-side call, with the `pg_notify` doorbell fired after commit to avoid the global notification-queue lock
 - **Per-(GVK, bucket) gapless sequence counters** for commit-ordered event streams, each created on first use
-- **Independent spec/status fencing** — one `bucket_leases` table with a `domain` column (`'spec'`/`'status'`); each row is fenced independently, so both write paths (`Write`, `WriteStatus`) share the same sequence and `object_version` while holding separate leases
-- **No-op write suppression** — content-equal writes consume no sequence number, emit no doorbell, and bump no `object_version`, matching API-server semantics where a no-change update does not advance resourceVersion. Default on; `ForceWrite` opts out; `WriteResult.Changed` lets callers skip downstream side-effects
-- **Single-goroutine poll-primary watch** — all polling in one goroutine with snapshot-isolated (`REPEATABLE READ`) poll cycles, LISTEN/NOTIFY doorbell with automatic reconnection (`ListenConnFactory`, exponential backoff)
-- **Tombstone compaction** via a single CTE (atomic delete + horizon advancement)
+- **Independent spec/status fencing** — one `bucket_leases` table with a `domain` column (`'spec'`/`'status'`), each row fenced independently with `FOR SHARE` lock for single-writer semantics per sub-resource; both write paths (`Write`, `WriteSpec`, `WriteStatus`) share the same sequence and `object_version` while holding separate leases
+- **No-op write suppression** — content-equal writes consume no sequence number, emit no doorbell, and bump no `object_version`, matching Kubernetes API-server semantics where an update that changes nothing does not advance resourceVersion. Default on; `ForceWrite` opts out; `WriteResult.Changed` lets callers skip downstream side-effects
+- **Single-goroutine poll-primary watch** with LISTEN/NOTIFY doorbell as a latency-only optimization; all polling in one goroutine with snapshot-isolated (`REPEATABLE READ`) poll cycles; automatic LISTEN reconnection via `ListenConnFactory` with exponential backoff
+- **Tombstone compaction** via a single CTE (atomic delete + horizon advancement) with finalizer guard — only fully-deleted objects (no active finalizers) are compacted; dying objects with finalizers survive past retention
 - **Timeline epochs** for failover detection
 - **Prometheus instrumentation** across writer, watcher, verifier, and lease paths ([METRICS.md](METRICS.md))
 
@@ -126,6 +119,15 @@ R3 and R5 additionally have Toxiproxy variants that inject network-level faults 
 
 Beyond tests, the [`internal/verifier`](internal/verifier/) package runs the same checks continuously in production (DESIGN.md §6): it subscribes via the ordinary poll path and verifies monotonic high-water marks (I3/I6) and that all gaps are explained by the compaction horizon (I7), with O(buckets) state. An optional canary writer measures write-to-delivery latency (p99 via bounded ring buffer, exported as `pgctl_verifier_canary_delivery_seconds`). The same code is the acceptance oracle for load tests.
 
+## Spec/Status Split
+
+All three write paths (`Write` for full writes, `WriteSpec` for spec + metadata only, `WriteStatus` for status only) share the same `gvk_bucket_counters` sequence and `object_version`, so watchers see a single ordered event stream covering both spec and status changes. All paths support no-op write suppression — `Write` compares all four content fields (spec, status, metadata, deletion_timestamp), `WriteSpec` compares spec, metadata, and deletion_timestamp (not status), `WriteStatus` compares only the status field. `WriteSpec` passes null status to the stored procedure, which uses `COALESCE(p_status, status)` to preserve the existing status column — this matches the Kubernetes API server's `Update` behavior where spec and status are independent subresources. `WriteResult.Changed` indicates whether the write produced a new state; callers can use this to skip downstream side-effects on no-ops.
+
+Lease management matches the ownership pattern (see Assumption 4):
+
+- **Single owner:** `BothManager` provides atomic `AcquireBoth`/`RenewBoth`/`ReleaseBoth` — single multi-row statements against the `bucket_leases` table (no explicit transaction needed).
+- **Split ownership:** `NewSpecManager` and `NewStatusManager` operate independently. A spec writer and a status writer hold leases on the same bucket without interfering — the fence locks are on different rows (`domain='spec'` vs `domain='status'`).
+
 ## Performance
 
 AWS RDS Multi-AZ (synchronous commit), stored procedure write path, one writer per bucket, 64 buckets:
@@ -140,6 +142,55 @@ AWS RDS Multi-AZ (synchronous commit), stored procedure write path, one writer p
 All correctness invariants (I1–I8) verified under load: zero serialization failures, zero sequence gaps, zero verifier violations across all runs.
 
 Full perfscale suite: [`loadtest/README.md`](loadtest/README.md).
+
+**16-bucket scaling** (48 workers total): **2,874 writes/s**, p50=18ms, p99=45ms
+
+All runs: zero serialization failures, zero fencing false-positives, zero invariant violations.
+
+Against DESIGN.md §4 sizing tiers:
+
+| Tier            | Steady RPS | Burst RPS | Buckets needed (local) |
+| --------------- | ---------- | --------- | ---------------------- |
+| 5,000 clusters  | 187        | 374       | 1                      |
+| 50,000 clusters | 1,870      | 3,740     | 4–8                    |
+
+Bucket count caps the maximum controller replicas. The recommended default is **16 buckets**, expandable via epoch-bump migration (same mechanism as failover — all watchers 410 + relist).
+
+### Poll cost & delivery latency (Phase 5)
+
+4 buckets, 2,000 seeded resources, 10 watchers:
+
+| Metric                            | p50    | p99    |
+| --------------------------------- | ------ | ------ |
+| Idle poll cycle                   | 4.1 ms | 9.5 ms |
+| Doorbell write-to-delivery        | 25 ms  | 62 ms  |
+| Baseline-only (notify-loss drill) | 527 ms | 996 ms |
+
+All 1,000 events delivered under notify-loss (no doorbell), verifier silent. The baseline-only latency is bounded by the 1s polling interval used in the drill — in production the default 5s baseline is the worst case, but doorbells keep typical delivery under 100ms.
+
+## Read Model: Direct Reads vs. Cached Reads
+
+`Client.Get()` reads directly from PostgreSQL on every call — no in-memory cache. This differs from standard controller-runtime, where `Get()` inside a `Reconcile` reads from an informer cache populated by the List/Watch stream.
+
+**Why direct reads are the default:** A fleet controller has low read rates (reconcilers read a handful of objects per cycle, not thousands). Direct reads are simpler, always return committed state, and avoid a class of staleness bugs. The `ListerWatcher` already feeds the watch stream for event-driven reconciliation; `Get()` is a point-read for the current object, not a scan.
+
+**When to consider a cached model:** If reconcilers perform many `Get()` calls per cycle, or if multiple informers share the same `ListerWatcher`, wiring it into controller-runtime's standard cache reduces DB load and read latency. The `ListerWatcher` already implements the List/Watch contract, so the integration is mechanical — the hard part (gapless, ordered, exactly-once event stream) is already done.
+
+**Trade-offs:**
+
+|              | Direct reads (current)                | Cached reads                                                  |
+| ------------ | ------------------------------------- | ------------------------------------------------------------- |
+| Read latency | ~1–5ms (Postgres round-trip)          | ~0ms (memory)                                                 |
+| Freshness    | Always committed state                | Up to one poll interval stale (5s worst case, ~100ms typical) |
+| DB load      | One query per `Get()`                 | Zero read queries from reconcilers                            |
+| Memory       | None beyond the connection            | Full working set in memory per controller                     |
+| Complexity   | Simpler — no cache coherence concerns | Requires trusting the watch stream entirely                   |
+
+For conflict resolution and ambiguous-commit read-back, the direct `Get()` (or `ReadBack`) is always needed regardless of the read model — those paths require the live database value.
+
+## Examples
+
+The [`examples/`](examples/) directory contains the same controller implemented twice — once against etcd, once against PostgreSQL — showing exactly what changes when migrating from one to the other. See [`examples/README.md`](examples/README.md) for the full migration guide, a line-count breakdown, and a step-by-step checklist.
 
 ## Documentation
 

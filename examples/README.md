@@ -1,7 +1,7 @@
 # Migrating a controller-runtime controller to postgres-controller-backend
 
 This directory contains two implementations of the same controller — one using
-controller-runtime against etcd, and one using `crbridge` against PostgreSQL.
+controller-runtime against etcd, and one using `pgruntime` against PostgreSQL.
 Both manage three CRDs that exercise the three common controller patterns:
 
 | CR | Pattern | Description |
@@ -47,7 +47,7 @@ type GreetingStatus struct {
 }
 ```
 
-The `crbridge.TypedObject[S, T]` generic type carries the standard metadata
+The `pgruntime.TypedObject[S, T]` generic type carries the standard metadata
 (namespace, name, UID, resourceVersion) alongside your typed spec and status:
 
 ```go
@@ -63,9 +63,9 @@ type TypedObject[S any, T any] struct {
 }
 ```
 
-### 2. CRUD: `client.Client` → `crbridge.TypedClient[S, T]`
+### 2. CRUD: `client.Client` → `pgruntime.TypedClient[S, T]`
 
-| Operation | controller-runtime | crbridge |
+| Operation | controller-runtime | pgruntime |
 |---|---|---|
 | Get | `r.Get(ctx, key, &obj)` | `client.Get(ctx, ns, name)` |
 | Create | `r.Create(ctx, &obj)` | `client.Create(ctx, ns, name, spec)` |
@@ -75,7 +75,7 @@ type TypedObject[S any, T any] struct {
 | List | `r.List(ctx, &list, opts...)` | `client.List(ctx)` |
 
 Key differences:
-- `crbridge.TypedClient` is **per-GVK** (one client per kind). controller-runtime
+- `pgruntime.TypedClient` is **per-GVK** (one client per kind). controller-runtime
   uses a single `client.Client` for all types.
 - Create takes the typed spec directly — status defaults to the zero value.
 - Status updates take the typed object + new typed status value.
@@ -84,17 +84,17 @@ Key differences:
 - All operations return `*TypedObject[S, T]` with typed fields — no
   `json.Unmarshal` needed in controller code.
 
-An untyped `crbridge.Client` is also available for code that works with raw
+An untyped `pgruntime.Client` is also available for code that works with raw
 JSON (e.g., HTTP APIs). Access it via `typedClient.Untyped()`.
 
 ### 3. Error handling: `errors.IsNotFound()` → sentinel errors
 
-| Condition | controller-runtime | crbridge |
+| Condition | controller-runtime | pgruntime |
 |---|---|---|
-| Not found | `errors.IsNotFound(err)` | `err == crbridge.ErrNotFound` |
-| Already exists | `errors.IsAlreadyExists(err)` | `err == crbridge.ErrAlreadyExists` |
-| Conflict | `errors.IsConflict(err)` | `err == crbridge.ErrConflict` |
-| Fenced | N/A | `err == crbridge.ErrFenced` |
+| Not found | `errors.IsNotFound(err)` | `err == pgruntime.ErrNotFound` |
+| Already exists | `errors.IsAlreadyExists(err)` | `err == pgruntime.ErrAlreadyExists` |
+| Conflict | `errors.IsConflict(err)` | `err == pgruntime.ErrConflict` |
+| Fenced | N/A | `err == pgruntime.ErrFenced` |
 
 `ErrFenced` is new — it means the lease epoch doesn't match, typically because
 another replica took over. Treat it as a signal to stop processing.
@@ -111,10 +111,10 @@ ctrl.NewControllerManagedBy(mgr).
     Complete(r)
 ```
 
-**postgres** — same declarative pattern via `crbridge.NewControllerFor`:
+**postgres** — same declarative pattern via `pgruntime.NewControllerFor`:
 
 ```go
-crbridge.NewControllerFor[GreetingSpec, GreetingStatus](mgr, gvkGreeting, reconciler).
+pgruntime.NewControllerFor[GreetingSpec, GreetingStatus](mgr, gvkGreeting, reconciler).
     Watches(gvkGreetingPolicy, reconciler.policyToGreetings).
     Complete()
 ```
@@ -128,19 +128,19 @@ The `MapFunc` receives an untyped `*Object` because it operates at the watch
 level. In the common case (requeue by namespace) only `obj.Namespace` is needed:
 
 ```go
-func (r *GreetingReconciler) policyToGreetings(ctx context.Context, obj *crbridge.Object) []crbridge.Request {
+func (r *GreetingReconciler) policyToGreetings(ctx context.Context, obj *pgruntime.Object) []pgruntime.Request {
     result, _ := r.Greetings.List(ctx)
-    var requests []crbridge.Request
+    var requests []pgruntime.Request
     for _, g := range result.Objects {
         if !g.Deleted && g.Namespace == obj.Namespace {
-            requests = append(requests, crbridge.Request{Namespace: g.Namespace, Name: g.Name})
+            requests = append(requests, pgruntime.Request{Namespace: g.Namespace, Name: g.Name})
         }
     }
     return requests
 }
 ```
 
-### 5. Startup: `ctrl.NewManager` → `crbridge.NewManager`
+### 5. Startup: `ctrl.NewManager` → `pgruntime.NewManager`
 
 **etcd** — 3 lines:
 
@@ -164,14 +164,14 @@ leaseMgr := lease.NewBothManager(leaseConn, holderID)
 epochs, _ := leaseMgr.AcquireBoth(ctx, bucketID, leaseTTL)
 
 // 4. Create typed clients
-greetingClient := crbridge.NewTypedClient[GreetingSpec, GreetingStatus](
-    crbridge.NewClient(connFactory, gvk, assigner, holderID, epochs.Spec),
-    crbridge.NewListerWatcher(connFactory, gvk, buckets),
+greetingClient := pgruntime.NewTypedClient[GreetingSpec, GreetingStatus](
+    pgruntime.NewClient(connFactory, gvk, assigner, holderID, epochs.Spec),
+    pgruntime.NewListerWatcher(connFactory, gvk, buckets),
 )
 
 // 5. Create Manager, register controller, start
-mgr := crbridge.NewManager(crbridge.ManagerConfig{...})
-crbridge.NewControllerFor[GreetingSpec, GreetingStatus](mgr, gvk, reconciler).
+mgr := pgruntime.NewManager(pgruntime.ManagerConfig{...})
+pgruntime.NewControllerFor[GreetingSpec, GreetingStatus](mgr, gvk, reconciler).
     Watches(gvkGreetingPolicy, reconciler.policyToGreetings).
     Complete()
 mgr.Start(ctx)
@@ -186,7 +186,7 @@ New concepts with no etcd equivalent:
   alive. If it lapses, writes are fenced.
 - **Schema migration** — `schema.Migrate()` creates the postgres tables.
   Idempotent, safe to call on every startup.
-- **Connection factory** — `crbridge.TypedClient` and `ListerWatcher` take a
+- **Connection factory** — `pgruntime.TypedClient` and `ListerWatcher` take a
   `func() (*pgx.Conn, error)` rather than a single connection, so each
   operation gets its own connection.
 - **Bucket assignment** — a `func(namespace, name string) int` that maps
@@ -227,7 +227,7 @@ PUT    /namespaces/{ns}/greetings/{name}   → Update
 ```
 
 This is optional — your controller's reconcile loop only needs
-`crbridge.TypedClient` and the `Manager`. The HTTP API is for external
+`pgruntime.TypedClient` and the `Manager`. The HTTP API is for external
 consumers who would otherwise use kubectl.
 
 ## Line count comparison
@@ -256,12 +256,12 @@ validation and lease management, not controller logic.
    scheme registration, `metav1.ObjectMeta` embedding. Define simple Go structs
    for spec and status fields.
 
-2. **Replace `client.Client` with `crbridge.TypedClient[S, T]`** — one typed
+2. **Replace `client.Client` with `pgruntime.TypedClient[S, T]`** — one typed
    client per GVK. Update all CRUD calls to the new signatures (see table
    above). Access `.Spec` and `.Status` directly on the returned
    `TypedObject` — no `json.Unmarshal` needed.
 
-3. **Replace error checks** — `errors.IsNotFound(err)` → `err == crbridge.ErrNotFound`,
+3. **Replace error checks** — `errors.IsNotFound(err)` → `err == pgruntime.ErrNotFound`,
    etc. Add handling for `ErrFenced`.
 
 4. **Replace `SetupWithManager` with `NewControllerFor`** — implement the
@@ -276,7 +276,7 @@ validation and lease management, not controller logic.
    `ValidateSpec`/`ValidateStatus` before every write in the HTTP API layer.
 
 7. **Add an HTTP API** (if needed) — if external consumers need to read or
-   write your CRs, expose an HTTP server that wraps `crbridge.Client` (use
+   write your CRs, expose an HTTP server that wraps `pgruntime.Client` (use
    `typedClient.Untyped()` to get the raw client).
 
 8. **Update deployment manifest** — remove RBAC (ServiceAccount, ClusterRole,

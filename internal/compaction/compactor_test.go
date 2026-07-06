@@ -48,6 +48,12 @@ func TestCompactDeletesExpiredTombstones(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	// Backdate updated_at so GREATEST(deletion_timestamp, updated_at) is old enough to compact
+	backdateConn := db.Connect(t)
+	_, err = backdateConn.Exec(ctx, `UPDATE kubernetes_resources SET updated_at = deletion_timestamp WHERE name = 'old-tombstone'`)
+	require.NoError(t, err)
+	backdateConn.Close(ctx)
+
 	// Compact with 1h retention — the 2h-old tombstone should be deleted
 	compactConn := db.Connect(t)
 	result, err := compaction.Compact(ctx, compactConn, compaction.Config{Retention: 1 * time.Hour})
@@ -115,3 +121,4 @@ func TestCompactNoop(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), result.Deleted)
 }
+

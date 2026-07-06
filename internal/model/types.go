@@ -50,6 +50,20 @@ type StatusWriteRequest struct {
 	ForceWrite      bool // skip no-op suppression; default false = suppress content-equal writes
 }
 
+type SpecWriteRequest struct {
+	GVK               string
+	Namespace         string
+	Name              string
+	BucketID          int
+	Spec              json.RawMessage
+	Metadata          json.RawMessage
+	DeletionTimestamp *time.Time
+	ExpectedVersion   int64
+	LeaseHolder       string
+	LeaseEpoch        int64
+	ForceWrite        bool
+}
+
 type WriteResult struct {
 	Seq           int64
 	ObjectVersion int64
