@@ -115,9 +115,13 @@ Against DESIGN.md §4 sizing tiers:
 
 Bucket count caps the maximum controller replicas. The recommended default is **64 buckets**, expandable via epoch-bump migration (same mechanism as failover — all watchers 410 + relist).
 
-### Poll cost & delivery latency (Phase 5)
+The bottleneck is WAL sync (Multi-AZ synchronous replication round-trip), not CPU — a 4x larger instance (db.m6g.8xlarge) only adds +22% at 64 buckets. The 2xlarge is the right production choice.
 
-4 buckets, 2,000 seeded resources, 10 watchers:
+For the full perfscale suite (Phase 0–7 certification, scaling analysis, infrastructure setup), see [`loadtest/README.md`](loadtest/README.md).
+
+### Poll cost & delivery latency
+
+Local podman measurements (4 buckets, 2,000 seeded resources, 10 watchers):
 
 | Metric | p50 | p99 |
 |--------|-----|-----|
@@ -156,6 +160,7 @@ The [`examples/`](examples/) directory contains the same controller implemented 
 - [DESIGN.md](DESIGN.md) — full design, invariant catalog (I1–I8), race catalog (R1–R18), and certification plan
 - [WALKTHROUGH.md](WALKTHROUGH.md) — narrative explanation of why each mechanism exists and how the pieces fit together
 - [METRICS.md](METRICS.md) — Prometheus metrics reference (all `pgctl_*` metrics, labels, integration guide)
+- [loadtest/README.md](loadtest/README.md) — RDS perfscale suite: ceiling hunt, Phase 0–7 certification, Terraform infrastructure, and scaling analysis
 
 ## Running Tests
 

@@ -1,11 +1,12 @@
 # Write Ceiling Analysis — postgres-controller-backend
 
-**Date:** 2026-07-05
+**Date:** 2026-07-05 (pre-stored-procedure baseline), updated 2026-07-06 (post-stored-procedure)
 **Region:** us-east-1
 **Engine:** PostgreSQL 16.4
 **Storage:** gp3, 100 GB (baseline 3,000 IOPS / 125 MiBps)
-**Write path:** fence check (FOR SHARE) -> no-op suppression -> counter increment -> UPSERT -> pg_notify -> sync COMMIT (5 round-trips + 1 sync commit per write)
 **Workers per bucket:** 1 (matches production: exactly 1 lease holder per bucket)
+
+> **Note:** Tests 1–3 below were run with the old multi-statement write path (5 SQL round-trips + pg_notify inside the transaction). The stored procedure optimization recommended at the bottom has since been implemented — see the [loadtest README](../README.md) for current results (9,622 w/s @ 64 buckets on db.m6g.2xlarge).
 
 ## Raw Results
 
@@ -75,72 +76,51 @@ Three ceilings constrain write throughput, in order of dominance:
    Even on Single-AZ, each commit must fsync to durable storage. gp3 baseline gives
    3,000 IOPS — at ~970 w/s with 5 round-trips each, we're approaching that.
 
-### Why adding buckets doesn't help past 4
+### Why adding buckets didn't help past 4 (old multi-statement path)
 
-Each bucket has exactly 1 writer (the lease holder). Adding buckets adds parallelism —
-but the shared resource (CPU / replication / storage IOPS) saturates quickly.
+With the old 5-round-trip write path, each bucket had exactly 1 writer but the shared
+resources (CPU + `pg_notify` global lock) saturated at 4 buckets on r6g.large. The
+`pg_notify` inside the transaction acquired a global exclusive lock on the notification
+queue, serializing all concurrent commits regardless of bucket count.
 
-- At 1 bucket: single-threaded, one CPU core busy, the other idle
-- At 4 buckets: both CPUs saturated, ceiling reached
-- At 8+ buckets: same throughput, but latency rises linearly (more connections contending
-  for the same CPU time)
-
-### Why latency rises linearly with bucket count
-
-With N buckets at the ceiling, each write waits in a queue for CPU time.
-Average wait = (N-1) * per-write-time / 2. This is visible in the data:
-- 4 buckets: p50 = 5.7ms
-- 8 buckets: p50 = 11.4ms (2x)
-- 16 buckets: p50 = 22.9ms (4x)
-- 32 buckets: p50 = 46.1ms (8x)
-
-Linear scaling = classic CPU queueing, not lock contention.
+**This is no longer the case.** The stored procedure eliminated the extra round-trips
+and moving `pg_notify` outside the transaction removed the global lock. With the current
+code, throughput scales near-linearly with bucket count (~150 w/s per bucket on 2xlarge),
+reaching 9,622 w/s at 64 buckets. The remaining bottleneck is per-connection WAL sync
+latency, which is inherently parallelizable across buckets.
 
 ## Production Implications
 
 ### Fleet sizing (Multi-AZ, which production requires)
 
-| Metric | Value |
-|--------|-------|
-| Write ceiling (Multi-AZ) | ~685 w/s |
-| Writes per reconcile | 1 |
-| Reconcile interval | 10 min = 600s |
-| Writes per cluster per second | 2 GVKs / 600s = 0.0033 |
-| Steady-state bursts (scale-up, etc.) | ~10x = 0.037 w/s per cluster |
-| Max clusters at 100% utilization | 685 / 0.037 = 18,500 |
-| Max clusters at 60% headroom | **~11,100** |
-| Max clusters at 40% headroom | **~7,400** |
+Pre-stored-procedure (old baseline for reference):
 
-### Instance class doesn't matter (for writes)
+| Metric | Old (multi-statement) | Current (stored proc, 64 buckets) |
+|--------|----------------------|-----------------------------------|
+| Write ceiling (Multi-AZ) | ~685 w/s | **9,622 w/s** |
+| Burst rate per cluster | 0.0748 w/s | 0.0748 w/s |
+| Max clusters at burst | ~9,200 | **~128,000** |
 
-The Multi-AZ sync commit dominates. db.r6g.large (2 vCPU, ~$0.43/hr) gives the same
-write throughput as db.m6g.2xlarge (8 vCPU, ~$0.87/hr). Upsizing the RDS instance
-does NOT increase write throughput.
+### Instance class matters less than expected
 
-A larger instance only helps for:
-- Read throughput (LIST/WATCH queries, which are not write-path bound)
-- More connections (pgbouncer is better for this)
-- More memory for shared_buffers / OS page cache
+With the old multi-statement path, the Multi-AZ sync commit dominated and instance class
+was irrelevant (r6g.large and m6g.2xlarge both hit ~685 w/s). With the stored procedure,
+the bottleneck is still WAL sync but instance class now helps modestly at high bucket
+counts: 8xlarge adds +22% at 64 buckets (11,728 vs 9,622 w/s), but nothing at 32 and
+below. The 2xlarge is the right cost/performance choice.
 
 ### What WOULD increase the write ceiling
 
-| Option | Expected improvement | Trade-off |
-|--------|---------------------|-----------|
-| **Disable Multi-AZ** | +42% (685 -> 970 w/s) | No HA — failover requires manual intervention or restore from backup |
-| **Batch writes** | 2-5x | Requires application-level changes to group multiple writes per COMMIT |
-| **Async commit** | ~2x | Risk of losing last ~100ms of committed data on crash |
-| **Reduce round-trips** | ~30-50% | Collapse fence+counter+upsert into a single stored procedure |
-| **Horizontal sharding** | Linear | Multiple RDS instances, each owning a subset of buckets — adds operational complexity |
-| **Switch to io2 storage** | Marginal | Lower fsync latency, but replication still dominates in Multi-AZ |
+| Option | Expected improvement | Trade-off | Status |
+|--------|---------------------|-----------|--------|
+| **Reduce round-trips** | ~14x (685 -> 9,622 w/s @ 64 buckets) | — | **Done.** `pgctl_write()` stored procedure + external `pg_notify`. |
+| **Disable Multi-AZ** | +42% (on old path) | No HA — failover requires manual intervention or restore from backup | Not recommended |
+| **Batch writes** | 2-5x | Requires application-level changes to group multiple writes per COMMIT | Not needed at current ceiling |
+| **Async commit** | ~2x | Risk of losing last ~100ms of committed data on crash | Next lever if needed |
+| **Horizontal sharding** | Linear | Multiple RDS instances, each owning a subset of buckets — adds operational complexity | Not needed |
 
-### Recommendation
+### Recommendation (updated)
 
-**db.r6g.large with Multi-AZ is the right production config.** At ~685 w/s it supports
-~11,000 clusters at 60% headroom. That's well beyond current fleet sizes. The write
-ceiling is architecturally determined by the gapless-sequence design (I4 invariant) +
-Multi-AZ sync replication, not by the instance class. Spending more on a bigger instance
-won't help writes.
+**db.m6g.2xlarge with Multi-AZ is the right production config.** After implementing the stored procedure (`pgctl_write()`) and moving `pg_notify` outside the transaction, the ceiling rose from ~685 w/s to **9,622 w/s** at 64 buckets — near-linear scaling that removed the old flat ceiling. The 8xlarge (4x cost) adds only +22%, confirming the bottleneck is WAL sync, not CPU. Fleet capacity at burst: ~128k clusters on 2xlarge.
 
-If write throughput ever becomes a bottleneck, the highest-ROI change is **collapsing the
-5 round-trips into a stored procedure** (single round-trip per write), which would roughly
-triple single-bucket throughput and raise the ceiling proportionally.
+The next optimization lever, if ever needed, is `synchronous_commit = off` (async commit) which would remove the WAL sync bottleneck entirely. See [loadtest/README.md](../README.md) for the full current results.
