@@ -216,44 +216,36 @@ COMMIT dominates write latency (~61% of total time) — this is the Multi-AZ syn
 
 Measured with the `ceiling-hunt` spec: 1 worker per bucket, 120s duration, 15s warm-up.
 
-**db.m6g.2xlarge (8 vCPU)**
+| Buckets | large (2 vCPU) | xlarge (4 vCPU) | 2xlarge (8 vCPU) | 8xlarge (32 vCPU) |
+|---------|---------------|-----------------|------------------|-------------------|
+| 64      | 2,852 w/s     | 5,770 w/s       | 9,622 w/s        | 11,728 w/s        |
+| 32      | 2,745         | 5,224           | 6,663            | 6,815             |
+| 16      | 2,376         | 3,271           | 3,803            | 3,719             |
+| 8       | 1,709         | 1,790           | 2,049            | 1,918             |
+| 4       | 931           | 931             | 1,068            | 974               |
+| 1       | 339           | 292             | 317              | 306               |
 
-| Buckets | w/s    | p50    | p99     | p999     |
-|---------|--------|--------|---------|----------|
-| 64      | 9,622  | 6.1ms  | 13.2ms  | 212.9ms  |
-| 32      | 6,663  | 4.4ms  | 7.3ms   | 24.8ms   |
-| 16      | 3,803  | 4.1ms  | 5.6ms   | 15.6ms   |
-| 8       | 2,049  | 3.8ms  | 5.5ms   | 12.1ms   |
-| 4       | 1,068  | 3.7ms  | 4.6ms   | 9.0ms    |
-| 1       | 317    | 3.1ms  | 3.7ms   | 6.5ms    |
-
-**db.m6g.8xlarge (32 vCPU)**
-
-| Buckets | w/s    | p50    | p99     | p999     |
-|---------|--------|--------|---------|----------|
-| 64      | 11,728 | 5.0ms  | 7.7ms   | 58.9ms   |
-| 32      | 6,815  | 4.5ms  | 6.1ms   | 17.4ms   |
-| 16      | 3,719  | 4.2ms  | 5.5ms   | 13.9ms   |
-| 8       | 1,918  | 4.1ms  | 5.0ms   | 8.7ms    |
-| 4       | 974    | 4.1ms  | 4.5ms   | 7.8ms    |
-| 1       | 306    | 3.2ms  | 3.6ms   | 4.7ms    |
+p99 latency at 64 buckets: large 68.5ms, xlarge 23.4ms, 2xlarge 13.2ms, 8xlarge 7.7ms.
 
 ### Scaling characteristics
 
-- **Near-linear with bucket count** — ~150 w/s per bucket on 2xlarge, ~183 on 8xlarge.
-- **Instance class barely matters.** The 8xlarge (4x cost, 4x vCPU) only adds 22% at 64 buckets. At 32 buckets and below, throughput is identical or slightly worse. The bottleneck is WAL sync latency, not CPU.
-- **Single-bucket baseline** — ~310 w/s. This is the per-connection sync-commit ceiling for Multi-AZ.
+- **Near-linear with bucket count** up to the instance's CPU ceiling. Single-bucket baseline is ~300 w/s regardless of instance class (WAL sync limited).
+- **CPU-bound at high parallelism.** The large (2 vCPU) saturates at ~2,850 w/s with spiking latencies. The xlarge (4 vCPU) saturates at ~5,800 w/s. The 2xlarge and 8xlarge both plateau around 10-12k w/s — at that point the bottleneck shifts from CPU to WAL sync latency.
+- **Diminishing returns past 2xlarge.** The 8xlarge (4x cost vs 2xlarge) adds only 22% at 64 buckets. At 32 and below, it's identical or slightly worse.
+- **At 8 buckets and below, all instances converge.** The write path is WAL-sync-bound, not CPU-bound, at low parallelism.
 
 ### Fleet capacity
 
 Per [DESIGN.md §4](../DESIGN.md): 0.0374 w/s per cluster steady, 0.0748 w/s per cluster at burst (2x).
 
-| Instance | Ceiling (64 buckets) | Max fleet at burst |
-|----------|---------------------|--------------------|
-| db.m6g.2xlarge | 9,622 w/s | ~128k clusters |
-| db.m6g.8xlarge | 11,728 w/s | ~157k clusters |
+| Instance | vCPU | Ceiling (64 buckets) | Max fleet at burst |
+|----------|------|---------------------|--------------------|
+| db.m6g.large   | 2  | 2,852 w/s  | ~38k clusters  |
+| db.m6g.xlarge  | 4  | 5,770 w/s  | ~77k clusters  |
+| db.m6g.2xlarge | 8  | 9,622 w/s  | ~128k clusters |
+| db.m6g.8xlarge | 32 | 11,728 w/s | ~157k clusters |
 
-The 2xlarge is the right production choice. The DESIGN.md 50k-cluster tier requires 3,740 burst w/s — the measured ceiling is 2.6x that.
+The 2xlarge is the sweet spot — the 50k-cluster tier requires 3,740 burst w/s, and the measured ceiling is 2.6x that. Even the large handles 38k clusters, well above the 5k-cluster default tier.
 
 ### Remaining optimization lever: async commit
 

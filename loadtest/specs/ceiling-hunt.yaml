@@ -1,9 +1,9 @@
 metadata:
   name: "ceiling-hunt"
-  description: "Maximum RPS discovery — bucket count sweep on db.m6g.8xlarge Multi-AZ"
+  description: "Maximum RPS discovery — bucket count sweep on db.m6g.xlarge Multi-AZ"
 
 rds:
-  instance_class: "db.m6g.8xlarge"
+  instance_class: "db.m6g.xlarge"
   engine_version: "16.4"
 
 cluster:
