@@ -3,7 +3,6 @@
     "metrics_collected": {
       "prometheus": {
         "log_group_name": "pgctl-loadtest",
-        "log_stream_name": "metrics",
         "prometheus_config_path": "/opt/loadtest/prometheus.yaml",
         "emf_processor": {
           "metric_namespace": "pgctl-loadtest",

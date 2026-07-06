@@ -204,6 +204,62 @@ go build -o lt ./loadtest/cmd/loadtest/
 ./lt --spec=loadtest/specs/5k-baseline.yaml --dsn="postgres://user:pass@localhost:5432/pgctl"
 ```
 
+## Performance findings and optimization paths
+
+### Write path bottleneck: network round-trips
+
+The Go writer (`internal/writer/writer.go:execWriteInner`) performs 7 sequential network round-trips per write: BEGIN, fence SELECT FOR SHARE, suppression SELECT, counter UPSERT, resource INSERT/UPDATE, pg_notify, COMMIT. With no pgx pipelining, each round-trip pays the full EC2-to-RDS network RTT.
+
+Phase 0 baseline measurements on db.m6g.2xlarge Multi-AZ:
+
+| Metric | Value |
+|--------|-------|
+| Network RTT (p50) | ~430µs |
+| Single-threaded Go writer | ~210 w/s |
+| Single-threaded stored proc (2 RTTs) | ~360 w/s |
+| Sync commit off (single-threaded) | ~285 w/s |
+
+Per-step instrumentation (`pgctl_writer_write_step_duration_seconds`) confirmed that **COMMIT accounts for ~61% of total write time** — this is the Multi-AZ synchronous replication wait. The other 6 steps are ~0.5ms each (one RTT + execution). The commit step is the shared bottleneck: all concurrent writers funnel through the same WAL pipeline and sync replication queue.
+
+Phase 1 bucket sweep showed scaling plateaus at 4-8 buckets (~745 w/s) with the current Go writer — adding more concurrent writers increases commit contention without proportional throughput gains.
+
+### Optimization 1: Stored procedure (reduces round-trips from 7 to 2)
+
+A PL/pgSQL function `pgctl_fenced_write()` combines fence check + counter increment + upsert + pg_notify into a single server-side call. The transaction becomes: BEGIN, function call, COMMIT — 2 network round-trips instead of 7.
+
+Phase 0 measured a **75% single-writer throughput improvement** (360 vs 210 w/s). The stored proc also reduces the transaction's wall-clock duration, which means less time holding locks and less WAL data per commit — potentially pushing the multi-bucket contention ceiling higher.
+
+If adopted for production, two considerations:
+- **Suppression check**: the test proc skips it. The production version would need to include it or keep suppression client-side (adding back one round-trip).
+- **Hooks**: `execWriteInner` fires pre/post hooks between steps. These would fire before/after the single proc call rather than interleaved with individual queries.
+
+### Optimization 2: Asynchronous commit (removes sync replication wait)
+
+Setting `synchronous_commit = off` on the session eliminates the ~1.4x penalty from waiting for the Multi-AZ standby to acknowledge each commit. Phase 0 measured 285 w/s (async) vs 208 w/s (sync) single-threaded.
+
+**Read-path safety**: a WAL-tail loss from async commit is a consistent prefix rewind — counters, resource rows, and leases all rewind together because they're updated transactionally. This is the same scenario the timeline epoch was designed for (same reasoning as Phase 7 backup/restore in DESIGN.md). Bump the epoch, every stale RV gets 410 Gone, clients relist, sequence numbers are re-issued under the new epoch. For the **read path**, epoch bump + relist is sufficient: watchers converge, I3/I5/I6/I7 hold.
+
+**Hole 1 — rewind without epoch bump**: `synchronous_commit = off` means the commit returns before WAL is flushed locally. A postmaster crash-and-restart-in-place (no failover, no promotion) loses the WAL tail. Multi-AZ doesn't help — the standby only has what the primary's WAL flush produced. Result: `cluster_epoch` stays the same, `current_seq` rewinds, new writes re-issue sequence numbers with different contents under the same epoch. Watchers holding a high-water-mark past the rewind point silently skip all re-issued writes — permanent divergence, no 410, no signal. This is a hard I3/I6 violation. **Mitigation**: bump the epoch on every postmaster start after crash recovery (not just promotion), treating any restart as a possible rewind. Doable via a recovery-time hook or a startup guard that refuses writes until the bump commits, but means every crash forces a full relist storm from all clients even when nothing was actually lost. The epoch bump itself must be ordered before the first accepted write on the recovered primary; under rapid double-failovers an async-replicated epoch row could theoretically miss the previous bump — derive it from the Postgres timeline ID or wall clock rather than simple +1.
+
+**Hole 2 — durability vs consistency**: relist restores consistency but not durability. A controller that does `WriteStatus()`, gets a commit ack, and takes an external action (provisions a cloud resource, sends a webhook, reports success) — that write may evaporate. Relisting makes everyone agree on the rewound state, but the external side effect isn't rewound. Level-triggered controllers that re-reconcile from observed state will usually re-converge (they'll redo the write), so for controller-runtime-style usage the blast radius is smaller than in a generic API. But anything non-idempotent keyed on an acknowledged write is silently wrong, and clients will observe status/spec regress which some controllers handle badly.
+
+**Middle ground — `synchronous_commit = remote_write`**: waits for the standby to receive the WAL but not for local fsync. You get standby durability (the data survives primary crash as long as the standby is healthy) without paying the full local flush latency. This closes Hole 1 for the failover case while still being faster than `on`. It doesn't help with the crash-restart-in-place case if the standby also missed the WAL, but that window is much smaller.
+
+**Recommendation**: if the fleet contains anything non-idempotent downstream of a write acknowledgment, keep `synchronous_commit = on` (or at least `remote_write`). If all controllers are level-triggered and re-converge from observed state, async + epoch-bump-on-every-recovery is a coherent design — document the tradeoff explicitly per deployment.
+
+**Note**: across ~218 RDS instances in our fleet (app-interface), only 1 database uses `synchronous_commit = off`. The standard is to use the Postgres default (`on`). This optimization is non-standard and should be a conscious, documented choice — always paired with Multi-AZ and the epoch-bump-on-recovery guard.
+
+### Combined impact estimate
+
+| Configuration | Single-writer | Multi-bucket ceiling (est.) |
+|--------------|---------------|----------------------------|
+| Current Go writer, sync commit | ~210 w/s | ~745 w/s |
+| Stored proc, sync commit | ~360 w/s | TBD |
+| Current Go writer, async commit | ~285 w/s | ~1,040 w/s (est.) |
+| Stored proc + async commit | ~500 w/s (est.) | ~1,800 w/s (est.) |
+
+The 5,000-cluster tier (374 burst RPS) is achievable with the current Go writer. The 50,000-cluster tier (3,740 burst RPS) likely requires stored proc + async commit + a larger instance class, or a redesign of the write path to use pgx pipelining.
+
 ## Directory structure
 
 ```

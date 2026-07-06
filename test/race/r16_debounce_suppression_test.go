@@ -129,14 +129,32 @@ func TestR16_TrailingEdgeTiming(t *testing.T) {
 		return len(pollTimestamps) >= 1
 	}, 3*time.Second, 10*time.Millisecond, "initial poll must fire")
 
-	// Record baseline count after initial poll.
+	// Warm-up: confirm LISTEN is active before measuring timing.
+	// listenLoop starts after the initial poll, so we retry notifications
+	// until one triggers a poll (lost notifications before LISTEN are harmless).
+	notifyConn := connectManualShared(t)
+	defer notifyConn.Close(context.Background())
+
+	mu.Lock()
+	warmupBase := len(pollTimestamps)
+	mu.Unlock()
+
+	require.Eventually(t, func() bool {
+		notifyConn.Exec(ctx, `SELECT pg_notify('resource_changes_b1', '')`) //nolint:errcheck
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pollTimestamps) >= warmupBase+1
+	}, 3*time.Second, 50*time.Millisecond, "LISTEN must become active")
+
+	// Wait for debounce floor to elapse so next doorbell hits leading edge.
+	time.Sleep(debounceFloor)
+
+	// Record baseline count for the actual timing test.
 	mu.Lock()
 	baseCount := len(pollTimestamps)
 	mu.Unlock()
 
 	// Fire one doorbell — triggers leading-edge poll.
-	notifyConn := connectManualShared(t)
-	defer notifyConn.Close(context.Background())
 	_, err := notifyConn.Exec(ctx, `SELECT pg_notify('resource_changes_b1', '')`)
 	require.NoError(t, err)
 

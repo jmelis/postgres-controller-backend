@@ -49,6 +49,7 @@ type SeedGVK struct {
 }
 
 type PhasesConfig struct {
+	Phase0Baseline  Phase0Config   `yaml:"phase0_baseline"`
 	Phase1Ceiling   Phase1Config   `yaml:"phase1_ceiling"`
 	Phase2Steady    Phase2Config   `yaml:"phase2_steady"`
 	Phase2bSkew     Phase2bConfig  `yaml:"phase2b_skew"`
@@ -56,12 +57,23 @@ type PhasesConfig struct {
 	Phase5Poll      Phase5Config   `yaml:"phase5_poll"`
 }
 
+type Phase0Config struct {
+	Enabled           bool `yaml:"enabled"`
+	PingIterations    int  `yaml:"ping_iterations"`
+	WriteIterations   int  `yaml:"write_iterations"`
+	StoredProcWrites  int  `yaml:"stored_proc_writes"`
+	SyncCommitCompare int  `yaml:"sync_commit_compare"`
+}
+
 type Phase1Config struct {
 	Enabled          bool          `yaml:"enabled"`
 	WorkersPerBucket int           `yaml:"workers_per_bucket"`
 	Duration         time.Duration `yaml:"duration"`
+	WarmUp           time.Duration `yaml:"warm_up"`
+	Runs             int           `yaml:"runs"`
 	TargetRPS        float64       `yaml:"target_rps"`
 	TargetP99Ms      int           `yaml:"target_p99_ms"`
+	BucketSweep      []int         `yaml:"bucket_sweep"`
 }
 
 type Phase2Config struct {
@@ -145,6 +157,26 @@ func (c *Config) validate() error {
 	}
 	if c.CheckpointInterval <= 0 {
 		c.CheckpointInterval = 5 * time.Minute
+	}
+	p0 := &c.Phases.Phase0Baseline
+	if p0.PingIterations <= 0 {
+		p0.PingIterations = 1000
+	}
+	if p0.WriteIterations <= 0 {
+		p0.WriteIterations = 500
+	}
+	if p0.StoredProcWrites <= 0 {
+		p0.StoredProcWrites = 500
+	}
+	if p0.SyncCommitCompare <= 0 {
+		p0.SyncCommitCompare = 200
+	}
+	p1 := &c.Phases.Phase1Ceiling
+	if p1.WarmUp < 0 {
+		p1.WarmUp = 0
+	}
+	if p1.Runs <= 0 {
+		p1.Runs = 1
 	}
 	return nil
 }

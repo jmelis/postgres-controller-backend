@@ -9,6 +9,15 @@ lt
 # macOS
 .DS_Store
 
+# SSH keys
+*.pem
+
+# Terraform
+loadtest/terraform/.terraform/
+loadtest/terraform/.terraform.lock.hcl
+loadtest/terraform/terraform.tfvars
+loadtest/terraform/terraform.tfstate*
+
 # Talk build artifacts
 talk/build/
 talk/output.mp4

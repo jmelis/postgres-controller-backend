@@ -118,6 +118,15 @@ func Seed(ctx context.Context, conn *pgx.Conn, cfg *Config) error {
 	}
 
 	log.Printf("seeder: total %d objects seeded across %d GVKs", totalSeeded, len(cfg.Seed.GVKs))
+
+	// Release all leases so phases can acquire them.
+	for b := 1; b <= numBuckets; b++ {
+		if err := leaseMgr.Release(ctx, b); err != nil {
+			return fmt.Errorf("release lease for bucket %d: %w", b, err)
+		}
+	}
+	log.Printf("seeder: released leases for %d buckets", numBuckets)
+
 	return nil
 }
 
@@ -133,4 +142,12 @@ func acquireAllLeases(ctx context.Context, conn *pgx.Conn, numBuckets int, holde
 		epochs[b] = epoch
 	}
 	return epochs, nil
+}
+
+// releaseAllLeases releases spec leases for all buckets.
+func releaseAllLeases(ctx context.Context, conn *pgx.Conn, numBuckets int, holder string) {
+	mgr := lease.NewSpecManager(conn, holder).WithMetrics(libLeaseMetrics)
+	for b := 1; b <= numBuckets; b++ {
+		_ = mgr.Release(ctx, b)
+	}
 }

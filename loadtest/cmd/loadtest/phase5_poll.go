@@ -466,6 +466,8 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 		totalWriteCount += int64(writeCount)
 	}
 
+	releaseAllLeases(ctx, leaseConn, numBuckets, holder)
+
 	return &PhaseResult{
 		Name:        phase5Name,
 		Passed:      passed,

@@ -2,8 +2,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SPEC_FILE="${1:-specs/5k-baseline.yaml}"
 TF_DIR="$SCRIPT_DIR/terraform"
+
+COMMANDS="setup|run|check|status|results|ssh|teardown|all|help"
+
+# If $1 looks like a command (not a file path), treat it as the command.
+if [[ "${1:-}" =~ ^($COMMANDS)$ ]]; then
+    SPEC_FILE="specs/5k-baseline.yaml"
+    COMMAND="${1}"
+else
+    SPEC_FILE="${1:-specs/5k-baseline.yaml}"
+    COMMAND="${2:-all}"
+fi
 
 usage() {
     cat <<EOF
@@ -38,13 +48,17 @@ get_instance_ip() {
 }
 
 get_ssh_key() {
-    cd "$TF_DIR"
     local key_name
-    key_name=$(terraform output -raw ssh_command 2>/dev/null | grep -oP '(?<=-i ~/\.ssh/)[^ ]+(?=\.pem)' || true)
+    key_name=$(grep 'ec2_key_name' "$TF_DIR/terraform.tfvars" 2>/dev/null | sed 's/.*= *"\(.*\)"/\1/' || true)
     if [[ -z "$key_name" ]]; then
-        key_name=$(grep 'ec2_key_name' "$TF_DIR/terraform.tfvars" 2>/dev/null | sed 's/.*= *"\(.*\)"/\1/' || true)
+        key_name="pgctl-loadtest"
     fi
-    echo "$HOME/.ssh/${key_name}.pem"
+    # Prefer local .pem next to Terraform files, fall back to ~/.ssh/
+    if [[ -f "$TF_DIR/${key_name}.pem" ]]; then
+        echo "$TF_DIR/${key_name}.pem"
+    else
+        echo "$HOME/.ssh/${key_name}.pem"
+    fi
 }
 
 remote() {
@@ -92,17 +106,20 @@ deploy() {
     ip=$(get_instance_ip)
 
     log "Uploading harness binary, spec, and configs..."
+    # Copy spec as spec.yaml to avoid filename ambiguity on the remote.
+    cp "$SCRIPT_DIR/$SPEC_FILE" "$SCRIPT_DIR/loadtest-spec.yaml"
     remote_copy \
         "$SCRIPT_DIR/loadtest-bin" \
-        "$SCRIPT_DIR/$SPEC_FILE" \
+        "$SCRIPT_DIR/loadtest-spec.yaml" \
         "$TF_DIR/cloudwatch-agent-config.json" \
         "$TF_DIR/prometheus.yaml" \
         "ec2-user@$ip:/tmp/"
+    rm -f "$SCRIPT_DIR/loadtest-spec.yaml"
 
     remote <<'SETUP'
         sudo mv /tmp/loadtest-bin /opt/loadtest/loadtest
         sudo chmod +x /opt/loadtest/loadtest
-        sudo mv /tmp/spec.yaml /opt/loadtest/spec.yaml 2>/dev/null || sudo mv /tmp/*.yaml /opt/loadtest/spec.yaml
+        sudo mv /tmp/loadtest-spec.yaml /opt/loadtest/spec.yaml
 
         # Configure and start CloudWatch Agent.
         sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
@@ -216,8 +233,6 @@ teardown() {
     cd "$SCRIPT_DIR"
     log "Teardown complete"
 }
-
-COMMAND="${2:-all}"
 
 case "$COMMAND" in
     setup)

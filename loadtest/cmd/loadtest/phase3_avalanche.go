@@ -363,6 +363,8 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 		passed = false
 	}
 
+	releaseAllLeases(ctx, leaseConn, numBuckets, holder)
+
 	return &PhaseResult{
 		Name:        phase3Name,
 		Passed:      passed,

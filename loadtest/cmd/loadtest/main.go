@@ -60,8 +60,12 @@ func main() {
 	}
 	log.Printf("schema migration complete")
 
-	// Seed data.
+	// Clear previous run data and seed fresh.
 	if len(cfg.Seed.GVKs) > 0 && cfg.ComputeTotalObjects() > 0 {
+		log.Printf("clearing previous data...")
+		if _, err := conn.Exec(ctx, "TRUNCATE kubernetes_resources, gvk_bucket_counters, bucket_leases, compaction_horizon"); err != nil {
+			log.Fatalf("truncate failed: %v", err)
+		}
 		log.Printf("seeding data...")
 		if err := Seed(ctx, conn, cfg); err != nil {
 			log.Fatalf("seed failed: %v", err)
@@ -131,6 +135,7 @@ func main() {
 		enabled bool
 		run     func(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, error)
 	}{
+		{"phase0_baseline", cfg.Phases.Phase0Baseline.Enabled, RunPhase0},
 		{"phase1_ceiling", cfg.Phases.Phase1Ceiling.Enabled, RunPhase1},
 		{"phase2_steady", cfg.Phases.Phase2Steady.Enabled, RunPhase2},
 		{"phase2b_skew", cfg.Phases.Phase2bSkew.Enabled, RunPhase2b},

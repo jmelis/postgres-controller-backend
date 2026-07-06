@@ -23,7 +23,7 @@ output "rds_endpoint" {
 
 output "rds_connection_string" {
   description = "PostgreSQL connection string"
-  value       = "postgresql://pgctl:${random_password.rds_master.result}@${aws_db_instance.postgres.endpoint}/pgctl"
+  value       = "postgresql://pgctl:${urlencode(random_password.rds_master.result)}@${aws_db_instance.postgres.endpoint}/pgctl"
   sensitive   = true
 }
 

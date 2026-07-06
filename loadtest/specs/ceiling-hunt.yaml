@@ -1,42 +1,42 @@
 metadata:
   name: "ceiling-hunt"
-  description: "Maximum RPS discovery sweep across bucket counts and GVK sizes"
+  description: "Maximum RPS discovery — bucket count sweep on db.r6g.large"
 
 rds:
   instance_class: "db.r6g.large"
   engine_version: "16.4"
 
 cluster:
-  buckets: 32
+  buckets: 16
   lease_ttl: 120s
   baseline_poll_interval: 5s
   debounce_floor: 100ms
 
 seed:
   gvks:
-    - gvk: "bench/v1/Small"
-      spec_size_bytes: 512
-      status_size_bytes: 256
-      metadata_size_bytes: 128
-      objects_per_bucket: 50
-    - gvk: "bench/v1/Medium"
-      spec_size_bytes: 4096
-      status_size_bytes: 2048
-      metadata_size_bytes: 512
-      objects_per_bucket: 50
-    - gvk: "bench/v1/Large"
-      spec_size_bytes: 20480
-      status_size_bytes: 16384
-      metadata_size_bytes: 4096
+    - gvk: "hypershift.openshift.io/v1beta1/HostedCluster"
+      spec_size_bytes: 8192
+      status_size_bytes: 12288
+      metadata_size_bytes: 2048
       objects_per_bucket: 50
 
 phases:
+  phase0_baseline:
+    enabled: true
+    ping_iterations: 1000
+    write_iterations: 500
+    stored_proc_writes: 500
+    sync_commit_compare: 200
+
   phase1_ceiling:
     enabled: true
-    workers_per_bucket: 50
-    duration: 15s
-    target_rps: 100
-    target_p99_ms: 50
+    workers_per_bucket: 1
+    duration: 120s
+    warm_up: 15s
+    runs: 3
+    target_rps: 0
+    target_p99_ms: 0
+    bucket_sweep: [1, 4, 8, 16, 32, 64]
 
   phase2_steady:
     enabled: false
@@ -48,12 +48,7 @@ phases:
     enabled: false
 
   phase5_poll:
-    enabled: true
-    num_watchers: 10
-    write_rate: 50
-    write_count: 500
-    doorbell_delivery_p99_ms: 500
-    notify_loss_drill: false
+    enabled: false
 
   phase6_failover:
     enabled: false
@@ -65,6 +60,6 @@ verifier:
   enabled: true
   poll_interval: 200ms
   canary_interval: 1s
-  sample_buckets: 8
+  sample_buckets: 4
 
 checkpoint_interval: 1m

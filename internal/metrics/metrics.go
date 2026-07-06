@@ -5,8 +5,10 @@ import "github.com/prometheus/client_golang/prometheus"
 // WriterMetrics holds Prometheus metrics for the write path.
 type WriterMetrics struct {
 	WriteDuration         *prometheus.HistogramVec
+	WriteStepDuration     *prometheus.HistogramVec
 	WritesTotal           *prometheus.CounterVec
 	NoopSuppressionsTotal prometheus.Counter
+	DoorbellErrorsTotal   prometheus.Counter
 }
 
 func NewWriterMetrics(reg prometheus.Registerer) *WriterMetrics {
@@ -21,6 +23,13 @@ func NewWriterMetrics(reg prometheus.Registerer) *WriterMetrics {
 			Help:      "Duration of write operations.",
 			Buckets:   []float64{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0},
 		}, []string{"gvk", "bucket_id", "result"}),
+		WriteStepDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "pgctl",
+			Subsystem: "writer",
+			Name:      "write_step_duration_seconds",
+			Help:      "Duration of individual steps within a write transaction.",
+			Buckets:   []float64{0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1},
+		}, []string{"step"}),
 		WritesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "pgctl",
 			Subsystem: "writer",
@@ -33,8 +42,14 @@ func NewWriterMetrics(reg prometheus.Registerer) *WriterMetrics {
 			Name:      "noop_suppressions_total",
 			Help:      "Total number of writes suppressed due to identical content.",
 		}),
+		DoorbellErrorsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: "pgctl",
+			Subsystem: "writer",
+			Name:      "doorbell_errors_total",
+			Help:      "Failed pg_notify doorbell sends (fire-and-forget, non-fatal).",
+		}),
 	}
-	reg.MustRegister(m.WriteDuration, m.WritesTotal, m.NoopSuppressionsTotal)
+	reg.MustRegister(m.WriteDuration, m.WriteStepDuration, m.WritesTotal, m.NoopSuppressionsTotal, m.DoorbellErrorsTotal)
 	return m
 }
 

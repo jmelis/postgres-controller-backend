@@ -278,6 +278,8 @@ loop:
 		passed = false
 	}
 
+	releaseAllLeases(ctx, leaseConn, numBuckets, holder)
+
 	return &PhaseResult{
 		Name:        phase2Name,
 		Passed:      passed,

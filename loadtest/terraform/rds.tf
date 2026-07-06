@@ -62,8 +62,9 @@ resource "aws_db_parameter_group" "postgres" {
   description = "PostgreSQL 16 params for ${var.project_name}"
 
   parameter {
-    name  = "shared_preload_libraries"
-    value = "pg_stat_statements"
+    name         = "shared_preload_libraries"
+    value        = "pg_stat_statements"
+    apply_method = "pending-reboot"
   }
 
   parameter {
@@ -86,8 +87,6 @@ resource "aws_db_instance" "postgres" {
   allocated_storage     = var.rds_allocated_storage
   max_allocated_storage = var.rds_allocated_storage * 2
   storage_type          = "gp3"
-  iops                  = var.rds_iops
-  storage_throughput    = var.rds_storage_throughput
   storage_encrypted     = true
 
   db_name  = "pgctl"

@@ -23,11 +23,108 @@ import (
 
 const phase1Name = "phase1_ceiling"
 
-// RunPhase1 runs the counter ceiling test.
-// N workers per bucket, all write unique objects for the configured duration.
+// RunPhase1 runs the counter ceiling test, optionally sweeping bucket counts.
 func RunPhase1(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, error) {
 	pCfg := cfg.Phases.Phase1Ceiling
-	numBuckets := cfg.Cluster.Buckets
+
+	if len(pCfg.BucketSweep) == 0 {
+		return runPhase1Single(ctx, dsn, cfg, cfg.Cluster.Buckets)
+	}
+
+	runs := pCfg.Runs
+	log.Printf("phase1: bucket sweep — %v (%d runs each)", pCfg.BucketSweep, runs)
+
+	var sweepResults []SweepEntry
+	bestRPS := 0.0
+	allPassed := true
+	totalDuration := time.Duration(0)
+
+	for _, buckets := range pCfg.BucketSweep {
+		var rpsValues []float64
+		var bestResult *PhaseResult
+		var totalErrors int64
+
+		for run := 0; run < runs; run++ {
+			// Truncate and reseed with this bucket count.
+			conn, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				return nil, fmt.Errorf("phase1 sweep: connect: %w", err)
+			}
+			if run == 0 {
+				log.Printf("phase1: sweep — clearing and reseeding for %d buckets", buckets)
+			}
+			if _, err := conn.Exec(ctx, "TRUNCATE kubernetes_resources, gvk_bucket_counters, bucket_leases, compaction_horizon"); err != nil {
+				conn.Close(context.Background())
+				return nil, fmt.Errorf("phase1 sweep: truncate: %w", err)
+			}
+
+			sweepCfg := *cfg
+			sweepCfg.Cluster.Buckets = buckets
+			if err := Seed(ctx, conn, &sweepCfg); err != nil {
+				conn.Close(context.Background())
+				return nil, fmt.Errorf("phase1 sweep: seed %d buckets: %w", buckets, err)
+			}
+			conn.Close(context.Background())
+
+			result, err := runPhase1Single(ctx, dsn, cfg, buckets)
+			if err != nil {
+				return nil, fmt.Errorf("phase1 sweep %d buckets run %d: %w", buckets, run+1, err)
+			}
+
+			rpsValues = append(rpsValues, result.RPS)
+			totalDuration += result.Duration
+			for _, c := range result.Errors {
+				totalErrors += c
+			}
+			if bestResult == nil || result.RPS > bestResult.RPS {
+				bestResult = result
+			}
+			if !result.Passed {
+				allPassed = false
+			}
+
+			if runs > 1 {
+				log.Printf("phase1: sweep — %d buckets run %d/%d: %.1f w/s",
+					buckets, run+1, runs, result.RPS)
+			}
+		}
+
+		meanRPS := mean(rpsValues)
+		stddevRPS := stddev(rpsValues)
+
+		sweepResults = append(sweepResults, SweepEntry{
+			Buckets:    buckets,
+			RPS:        meanRPS,
+			RPSStdDev:  stddevRPS,
+			P50:        bestResult.P50,
+			P99:        bestResult.P99,
+			P999:       bestResult.P999,
+			ErrorCount: totalErrors,
+			Runs:       runs,
+		})
+
+		log.Printf("phase1: sweep — %d buckets: %.1f ± %.1f w/s, p50=%v, p99=%v, errors=%d",
+			buckets, meanRPS, stddevRPS, bestResult.P50, bestResult.P99, totalErrors)
+
+		if meanRPS > bestRPS {
+			bestRPS = meanRPS
+		}
+	}
+
+	log.Printf("phase1: sweep complete — best RPS: %.1f", bestRPS)
+
+	return &PhaseResult{
+		Name:        phase1Name,
+		Passed:      allPassed,
+		Duration:    totalDuration,
+		TotalWrites: 0,
+		RPS:         bestRPS,
+		Sweep:       sweepResults,
+	}, nil
+}
+
+func runPhase1Single(ctx context.Context, dsn string, cfg *Config, numBuckets int) (*PhaseResult, error) {
+	pCfg := cfg.Phases.Phase1Ceiling
 	workersPerBucket := pCfg.WorkersPerBucket
 	totalWorkers := workersPerBucket * numBuckets
 	duration := pCfg.Duration
@@ -40,8 +137,10 @@ func RunPhase1(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 		gvk = cfg.Seed.GVKs[0].GVK
 	}
 
-	log.Printf("phase1: starting ceiling test — %d workers x %d buckets, duration %v",
-		workersPerBucket, numBuckets, duration)
+	warmUp := pCfg.WarmUp
+
+	log.Printf("phase1: starting ceiling test — %d workers x %d buckets, duration %v (warm-up %v)",
+		workersPerBucket, numBuckets, duration, warmUp)
 
 	// Acquire leases for all buckets.
 	leaseConn, err := pgx.Connect(ctx, dsn)
@@ -99,6 +198,7 @@ func RunPhase1(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	var wg sync.WaitGroup
 
 	start := time.Now()
+	warmUpEnd := start.Add(warmUp)
 	deadline := start.Add(duration)
 
 	for w := 0; w < totalWorkers; w++ {
@@ -116,8 +216,13 @@ func RunPhase1(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 			bucketID := (workerID % numBuckets) + 1
 			wr := writer.New(conn, nil).WithMetrics(libWriterMetrics)
 			var writeNum int
+			warmedUp := warmUp == 0
 
 			for time.Now().Before(deadline) {
+				if !warmedUp && time.Now().After(warmUpEnd) {
+					warmedUp = true
+				}
+
 				name := fmt.Sprintf("p1-w%d-r%d", workerID, writeNum)
 				req := model.WriteRequest{
 					GVK:         gvk,
@@ -146,9 +251,11 @@ func RunPhase1(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 					continue
 				}
 
-				results[workerID].latencies = append(results[workerID].latencies, lat)
-				results[workerID].writes++
-				totalWrites.Add(1)
+				if warmedUp {
+					results[workerID].latencies = append(results[workerID].latencies, lat)
+					results[workerID].writes++
+					totalWrites.Add(1)
+				}
 				writeLatency.WithLabelValues(phase1Name, gvk).Observe(lat.Seconds())
 				writesTotal.WithLabelValues(phase1Name, gvk, strconv.Itoa(bucketID)).Inc()
 				writeNum++
@@ -157,6 +264,10 @@ func RunPhase1(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	}
 
 	wg.Wait()
+	measureDuration := duration - warmUp
+	if measureDuration <= 0 {
+		measureDuration = duration
+	}
 	elapsed := time.Since(start)
 	phaseDuration.WithLabelValues(phase1Name).Observe(elapsed.Seconds())
 
@@ -187,7 +298,7 @@ func RunPhase1(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	})
 
 	total := totalWrites.Load()
-	rps := float64(total) / elapsed.Seconds()
+	rps := float64(total) / measureDuration.Seconds()
 
 	var p50, p99, p999 time.Duration
 	if len(allLatencies) > 0 {
@@ -229,6 +340,8 @@ func RunPhase1(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	if len(violations) > 0 {
 		passed = false
 	}
+
+	releaseAllLeases(ctx, leaseConn, numBuckets, holder)
 
 	return &PhaseResult{
 		Name:        phase1Name,
@@ -282,4 +395,28 @@ func makeBucketIDs(n int) []int {
 		ids[i] = i + 1
 	}
 	return ids
+}
+
+func mean(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	sum := 0.0
+	for _, v := range vals {
+		sum += v
+	}
+	return sum / float64(len(vals))
+}
+
+func stddev(vals []float64) float64 {
+	if len(vals) < 2 {
+		return 0
+	}
+	m := mean(vals)
+	sum := 0.0
+	for _, v := range vals {
+		d := v - m
+		sum += d * d
+	}
+	return math.Sqrt(sum / float64(len(vals)-1))
 }

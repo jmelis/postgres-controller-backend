@@ -33,10 +33,10 @@ seed:
 phases:
   phase1_ceiling:
     enabled: true
-    workers_per_bucket: 50
+    workers_per_bucket: 1
     duration: 30s
-    target_rps: 200
-    target_p99_ms: 10
+    target_rps: 1000
+    target_p99_ms: 50
 
   phase2_steady:
     enabled: true
