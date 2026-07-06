@@ -1,4 +1,4 @@
-.PHONY: test test-unit test-integration test-race test-race-stress test-toxirace lint vet build
+.PHONY: test test-unit test-integration test-race test-race-stress test-toxirace test-parity lint vet build
 
 build:
 	go build ./...
@@ -27,4 +27,9 @@ test-toxirace:
 test-load:
 	go test -race -v -count=1 -timeout=120s ./test/loadtest/
 
-test: test-unit test-integration test-race
+test-parity:
+	@which setup-envtest > /dev/null 2>&1 || go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+	KUBEBUILDER_ASSETS=$$(setup-envtest use --bin-dir $$(pwd)/.envtest -p path) \
+	go test -race -v -count=1 -timeout=180s ./test/parity/
+
+test: test-unit test-integration test-race test-parity

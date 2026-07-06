@@ -3,6 +3,7 @@
 ## System Overview
 
 **Current (CLM pattern):**
+
 ```
 User/Platform API --> Hyperfleet API (stateless REST) --> PostgreSQL
       Sentinel --> polls Hyperfleet API --> publishes CloudEvents
@@ -10,6 +11,7 @@ User/Platform API --> Hyperfleet API (stateless REST) --> PostgreSQL
 ```
 
 **Proposed (direct-to-Postgres):**
+
 ```
 Platform API --> PostgreSQL (fenced writes, gapless counters)
 Controllers --> PostgreSQL (lease-based watch, reconcile loop)
@@ -22,19 +24,19 @@ Bridge      --> DynamoDB streams --> PostgreSQL (observed MC state)
 
 ### Failure Modes & Recovery
 
-| Dimension | Hyperfleet-API (CLM) | Direct-to-Postgres |
-|-----------|---------------------|---------------------|
-| **Component count in write path** | 3-4 (API caller -> API server -> GORM -> PG) | 2 (controller -> PG, single atomic txn) |
-| **Component count in reconcile loop** | 5+ (Sentinel polls API -> CloudEvent -> Adapter fetches full state from API -> Adapter acts -> Adapter PUTs status to API) | 2 (controller watches PG -> controller acts -> controller writes PG) |
-| **Postgres failure** | API returns 500s; Sentinel/Adapters retry. No fencing -- concurrent reconnects may race | Writers block with backpressure (never skip). Lease fencing prevents stale-epoch commits post-failover. Timeline epoch forces watchers to relist (I3/I6) |
-| **Intermediate service failure** | If the API goes down, Sentinel can't poll, Adapters can't read or report status -- **full stop** on all reconciliation until API recovers | No intermediate service; only PG availability matters |
-| **Split-brain / zombie writers** | No mechanism -- two API replicas can write the same resource concurrently; GORM has no epoch fencing | Lease-based `FOR SHARE` fencing (I4): stale writers are physically blocked by row locks. Every write is fenced; every checkpoint is fenced |
-| **Event ordering** | CloudEvents are "anemic" (ID + generation only); Adapters fetch full state. No sequence guarantee -- Sentinel polls on a cadence and may miss intermediate states | Gapless per-(GVK, bucket) sequence (I1/I2). Watchers see every committed state-change in commit order. Poll-primary ensures delivery even under total LISTEN/NOTIFY failure (I5) |
-| **Lost events** | If a CloudEvent is lost (Sentinel -> broker -> Adapter), the resource stalls until the next Sentinel poll cycle discovers it's unreconciled | Poll-primary watch: events are pulled from the DB, not pushed. Doorbell (pg_notify) is latency-only. 5s baseline poll = hard upper bound on delivery delay under total notification loss |
-| **Consistency model** | READ operations run outside transactions (no isolation). List `total` can be inconsistent with `items` under concurrent deletes (documented as "cosmetic") | List runs under `REPEATABLE READ` snapshot. resourceVersion is consistent with data -- built from the same snapshot (I5/I6). No skew window |
-| **Optimistic concurrency** | `generation` counter increments on spec change; no version check on write path (PATCH does not check generation) | `object_version` checked on every write (I8). 409 Conflict on stale version. Counter increment aborts with the txn on conflict -- no gap (I1) |
-| **Failover data loss** | Depends on PG replication config (not specified in the design). If async, acknowledged writes can be lost | Synchronous Multi-AZ standby: **zero acknowledged-write loss** by construction. Writer tripwire detects sequence regression post-failover |
-| **Continuous correctness verification** | None -- correctness is tested pre-deployment only | Production verifier (O(buckets) state) continuously checks I3/I6/I7 on sampled buckets. Canary writer measures write-to-delivery latency |
+| Dimension                               | Hyperfleet-API (CLM)                                                                                                                                              | Direct-to-Postgres                                                                                                                                                                       |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Component count in write path**       | 3-4 (API caller -> API server -> GORM -> PG)                                                                                                                      | 2 (controller -> PG, single atomic txn)                                                                                                                                                  |
+| **Component count in reconcile loop**   | 5+ (Sentinel polls API -> CloudEvent -> Adapter fetches full state from API -> Adapter acts -> Adapter PUTs status to API)                                        | 2 (controller watches PG -> controller acts -> controller writes PG)                                                                                                                     |
+| **Postgres failure**                    | API returns 500s; Sentinel/Adapters retry. No fencing -- concurrent reconnects may race                                                                           | Writers block with backpressure (never skip). Lease fencing prevents stale-epoch commits post-failover. Timeline epoch forces watchers to relist (I3/I6)                                 |
+| **Intermediate service failure**        | If the API goes down, Sentinel can't poll, Adapters can't read or report status -- **full stop** on all reconciliation until API recovers                         | No intermediate service; only PG availability matters                                                                                                                                    |
+| **Split-brain / zombie writers**        | No mechanism -- two API replicas can write the same resource concurrently; GORM has no epoch fencing                                                              | Lease-based `FOR SHARE` fencing (I4): stale writers are physically blocked by row locks. Every write is fenced; every checkpoint is fenced                                               |
+| **Event ordering**                      | CloudEvents are "anemic" (ID + generation only); Adapters fetch full state. No sequence guarantee -- Sentinel polls on a cadence and may miss intermediate states | Gapless per-(GVK, bucket) sequence (I1/I2). Watchers see every committed state-change in commit order. Poll-primary ensures delivery even under total LISTEN/NOTIFY failure (I5)         |
+| **Lost events**                         | If a CloudEvent is lost (Sentinel -> broker -> Adapter), the resource stalls until the next Sentinel poll cycle discovers it's unreconciled                       | Poll-primary watch: events are pulled from the DB, not pushed. Doorbell (pg_notify) is latency-only. 5s baseline poll = hard upper bound on delivery delay under total notification loss |
+| **Consistency model**                   | READ operations run outside transactions (no isolation). List `total` can be inconsistent with `items` under concurrent deletes (documented as "cosmetic")        | List runs under `REPEATABLE READ` snapshot. resourceVersion is consistent with data -- built from the same snapshot (I5/I6). No skew window                                              |
+| **Optimistic concurrency**              | `generation` counter increments on spec change; no version check on write path (PATCH does not check generation)                                                  | `object_version` checked on every write (I8). 409 Conflict on stale version. Counter increment aborts with the txn on conflict -- no gap (I1)                                            |
+| **Failover data loss**                  | Depends on PG replication config (not specified in the design). If async, acknowledged writes can be lost                                                         | Synchronous Multi-AZ standby: **zero acknowledged-write loss** by construction. Writer tripwire detects sequence regression post-failover                                                |
+| **Continuous correctness verification** | None -- correctness is tested pre-deployment only                                                                                                                 | Production verifier (O(buckets) state) continuously checks I3/I6/I7 on sampled buckets. Canary writer measures write-to-delivery latency                                                 |
 
 ### Reliability Verdict
 
@@ -56,39 +58,39 @@ The direct-to-Postgres design is significantly more reliable because:
 
 ### Write Path
 
-| Metric | Hyperfleet-API (CLM) | Direct-to-Postgres |
-|--------|---------------------|---------------------|
-| **Write hops** | HTTP request -> JSON parse -> GORM -> SQL -> PG | Single stored procedure call (`pgctl_write()`: fence + suppress + counter + upsert) + external doorbell |
-| **Latency (write)** | HTTP overhead + GORM reflection + connection pool wait. 30s request timeout under pressure; 500s on pool exhaustion | p50=28ms, p99=211ms (single bucket); p50=18ms, p99=45ms (16 buckets). Measured with 50 concurrent writers |
-| **Throughput ceiling** | Not published. Connection pool: 50 max open (default). Transaction-per-write-request middleware | **9,622 writes/s** across 64 buckets on RDS db.m6g.2xlarge (Multi-AZ sync commit); near-linear scaling with bucket count. Zero serialization failures |
-| **No-op suppression** | None -- every PATCH/PUT hits the database regardless of whether content changed | Content-equal writes consume no sequence, no version bump, no doorbell, no watch event. Critical for DynamoDB bridge where applier rewrites status every ~3 min |
-| **Connection efficiency** | 50 max connections shared across all HTTP requests (reads + writes). PgBouncer sidecar optional | pgx pool of 4-8 connections + 1 lease connection. ~20 total connections for 2 bridge replicas serving the entire fleet |
+| Metric                    | Hyperfleet-API (CLM)                                                                                                | Direct-to-Postgres                                                                                                                                                           |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Write hops**            | HTTP request -> JSON parse -> GORM -> SQL -> PG                                                                     | Single stored procedure call (`pgctl_write()`: fence + suppress + counter + upsert) + external doorbell                                                                      |
+| **Latency (write)**       | HTTP overhead + GORM reflection + connection pool wait. 30s request timeout under pressure; 500s on pool exhaustion | p50=28ms, p99=211ms (single bucket); p50=18ms, p99=45ms (16 buckets). Measured with 50 concurrent writers                                                                    |
+| **Throughput ceiling**    | Not published. Connection pool: 50 max open (default). Transaction-per-write-request middleware                     | **9,622 writes/s** across 64 buckets on RDS db.m6g.2xlarge (Multi-AZ sync commit); near-linear scaling with bucket count. Zero serialization failures                        |
+| **No-op suppression**     | None -- every PATCH/PUT hits the database regardless of whether content changed                                     | Content-equal writes consume no sequence, no version bump, no doorbell, no watch event. Critical for DynamoDB bridge where applier rewrites status every ~3 min              |
+| **Connection efficiency** | 50 max connections shared across all HTTP requests (reads + writes). PgBouncer sidecar optional                     | pgx pool of 4-8 connections + 1 lease connection. ~20 total connections for 2 bridge replicas serving the entire fleet                                                       |
 
 ### Read Path
 
-| Metric | Hyperfleet-API (CLM) | Direct-to-Postgres |
-|--------|---------------------|---------------------|
-| **Read model** | HTTP GET -> GORM query (no transaction). Status conditions synthesized per-request from `adapter_statuses` table | Direct PG read (~1-5ms). Or controller-runtime cache fed by watch stream (~0ms, up to 5s stale) |
-| **List performance** | GORM with pagination. Count and items are separate queries (no snapshot consistency) | Single `REPEATABLE READ` txn: epoch + counters + filtered scan (partial index on live rows) |
-| **Watch/event delivery** | Sentinel polls API periodically -> publishes CloudEvent -> Adapter GETs full state from API. **Three network hops minimum** per state change | Single-goroutine poll on PG index every 5s (or ~100ms with doorbell). **Zero network hops beyond PG** |
-| **Watch fan-out** | Every event requires Adapter to `GET` full resource from API -- **N adapters = N reads per event** | Watchers read directly from PG index. Coalescing is free (latest seq per object). N controllers = N poll queries, but each is a cheap indexed range scan |
+| Metric                   | Hyperfleet-API (CLM)                                                                                                                         | Direct-to-Postgres                                                                                                                                       |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Read model**           | HTTP GET -> GORM query (no transaction). Status conditions synthesized per-request from `adapter_statuses` table                             | Direct PG read (~1-5ms). Or controller-runtime cache fed by watch stream (~0ms, up to 5s stale)                                                          |
+| **List performance**     | GORM with pagination. Count and items are separate queries (no snapshot consistency)                                                         | Single `REPEATABLE READ` txn: epoch + counters + filtered scan (excludes fully-deleted tombstones, includes dying objects with finalizers)               |
+| **Watch/event delivery** | Sentinel polls API periodically -> publishes CloudEvent -> Adapter GETs full state from API. **Three network hops minimum** per state change | Single-goroutine poll on PG index every 5s (or ~100ms with doorbell). **Zero network hops beyond PG**                                                    |
+| **Watch fan-out**        | Every event requires Adapter to `GET` full resource from API -- **N adapters = N reads per event**                                           | Watchers read directly from PG index. Coalescing is free (latest seq per object). N controllers = N poll queries, but each is a cheap indexed range scan |
 
 ### End-to-End Reconciliation Latency
 
-| Phase | Hyperfleet-API (CLM) | Direct-to-Postgres |
-|-------|---------------------|---------------------|
-| **Spec change -> detection** | Sentinel poll interval (configurable, likely seconds to minutes) | Doorbell: ~100ms typical; poll fallback: <=5s |
-| **Detection -> adapter action** | CloudEvent publish + delivery + Adapter GET from API | Controller reconcile loop (already watching) |
-| **Action -> status visible** | Adapter PUT to API -> API writes DB -> next Sentinel poll picks up new state | Controller WriteStatus() -> same PG, same watch stream |
-| **Total round-trip** | Sentinel poll + event delivery + Adapter processing + status report + Sentinel re-poll = **multiple seconds to minutes** | Watch delivery + reconcile + WriteStatus = **sub-second typical** |
+| Phase                           | Hyperfleet-API (CLM)                                                                                                     | Direct-to-Postgres                                                |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------- |
+| **Spec change -> detection**    | Sentinel poll interval (configurable, likely seconds to minutes)                                                         | Doorbell: ~100ms typical; poll fallback: <=5s                     |
+| **Detection -> adapter action** | CloudEvent publish + delivery + Adapter GET from API                                                                     | Controller reconcile loop (already watching)                      |
+| **Action -> status visible**    | Adapter PUT to API -> API writes DB -> next Sentinel poll picks up new state                                             | Controller WriteStatus() -> same PG, same watch stream            |
+| **Total round-trip**            | Sentinel poll + event delivery + Adapter processing + status report + Sentinel re-poll = **multiple seconds to minutes** | Watch delivery + reconcile + WriteStatus = **sub-second typical** |
 
 ### Observed State (MC/HyperShift) Bridging
 
-| Metric | Hyperfleet-API (CLM) | Direct-to-Postgres |
-|--------|---------------------|---------------------|
-| **Ingestion** | Not applicable -- adapters report status via REST PUT to the API | DynamoDB stream consumer + 15-min reconciler per MC. ~4 real writes/s per MC against ~317/s single-connection per-bucket ceiling |
-| **No-op handling** | Every status PUT triggers a full write | No-op suppression absorbs applier's ~3-min poll refreshes -- potentially 1,600 no-op events/s fleet-wide reduced to zero DB writes |
-| **Scalability** | Horizontal API replicas, but each write is a full HTTP round-trip | Per-MC buckets grow additively. Either bridge replica can carry the whole fleet. Connection count stays constant (~20) regardless of MC count |
+| Metric             | Hyperfleet-API (CLM)                                              | Direct-to-Postgres                                                                                                                              |
+| ------------------ | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Ingestion**      | Not applicable -- adapters report status via REST PUT to the API  | DynamoDB stream consumer + 15-min reconciler per MC. ~4 real writes/s per MC against ~317/s single-connection per-bucket ceiling                 |
+| **No-op handling** | Every status PUT triggers a full write                            | No-op suppression absorbs applier's ~3-min poll refreshes -- potentially 1,600 no-op events/s fleet-wide reduced to zero DB writes              |
+| **Scalability**    | Horizontal API replicas, but each write is a full HTTP round-trip | Per-MC buckets grow additively. Either bridge replica can carry the whole fleet. Connection count stays constant (~20) regardless of MC count   |
 
 ### Performance Verdict
 
@@ -110,30 +112,30 @@ The direct-to-Postgres design is substantially faster:
 
 The CLM pattern isn't without advantages:
 
-| Advantage | CLM Pattern | Direct-to-Postgres |
-|-----------|------------|---------------------|
-| **Simplicity for consumers** | Standard REST API with OpenAPI spec, Swagger UI, curl-testable | Requires controller-runtime integration; not a general-purpose API |
-| **Horizontal scaling** | Stateless API replicas scale trivially behind a load balancer | Writers are bucket-scoped; max controller replicas = bucket count (16 default) |
-| **Decoupling** | Adapters need only HTTP + CloudEvents -- polyglot-friendly | Controllers must speak pgx and understand lease/fencing semantics |
-| **Operational familiarity** | Standard REST service + GORM -- well-understood ops model | Novel storage layer with custom invariants; requires specialized operational knowledge |
-| **Schema flexibility** | GORM migrations + plugin system for generic entities | Fixed schema per DESIGN.md; changes require understanding invariant implications |
-| **Existing ecosystem** | Sentinel, Adapters, authentication, search (TSL queries), audit trails, OpenAPI validation all exist | Would need to be rebuilt or adapted for the new architecture |
+| Advantage                    | CLM Pattern                                                                                          | Direct-to-Postgres                                                                     |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| **Simplicity for consumers** | Standard REST API with OpenAPI spec, Swagger UI, curl-testable                                       | Requires controller-runtime integration; not a general-purpose API                     |
+| **Horizontal scaling**       | Stateless API replicas scale trivially behind a load balancer                                        | Writers are bucket-scoped; max controller replicas = bucket count (16 default)         |
+| **Decoupling**               | Adapters need only HTTP + CloudEvents -- polyglot-friendly                                           | Controllers must speak pgx and understand lease/fencing semantics                      |
+| **Operational familiarity**  | Standard REST service + GORM -- well-understood ops model                                            | Novel storage layer with custom invariants; requires specialized operational knowledge |
+| **Schema flexibility**       | GORM migrations + plugin system for generic entities                                                 | Fixed schema per DESIGN.md; changes require understanding invariant implications       |
+| **Existing ecosystem**       | Sentinel, Adapters, authentication, search (TSL queries), audit trails, OpenAPI validation all exist | Would need to be rebuilt or adapted for the new architecture                           |
 
 ---
 
 ## 4. Summary
 
-| Dimension | Winner | Magnitude |
-|-----------|--------|-----------|
-| **Reliability -- data correctness** | Direct-to-Postgres | Large. Formal invariants + fencing vs. convention-based |
-| **Reliability -- failure recovery** | Direct-to-Postgres | Large. Fewer components, zero-loss failover, self-healing |
-| **Reliability -- split-brain protection** | Direct-to-Postgres | Critical. CLM has none |
-| **Performance -- write latency** | Direct-to-Postgres | ~5-10x (tens of ms vs. hundreds) |
-| **Performance -- event delivery** | Direct-to-Postgres | ~10-100x (100ms vs. seconds-minutes) |
-| **Performance -- connection efficiency** | Direct-to-Postgres | ~5-10x fewer connections |
-| **Performance -- no-op suppression** | Direct-to-Postgres | CLM has no equivalent |
-| **Operational simplicity** | CLM (Hyperfleet-API) | Moderate. Standard REST patterns |
-| **Consumer accessibility** | CLM (Hyperfleet-API) | Moderate. HTTP + curl vs. pgx |
-| **Ecosystem maturity** | CLM (Hyperfleet-API) | Significant. Already built and deployed |
+| Dimension                                 | Winner               | Magnitude                                                 |
+| ----------------------------------------- | -------------------- | --------------------------------------------------------- |
+| **Reliability -- data correctness**       | Direct-to-Postgres   | Large. Formal invariants + fencing vs. convention-based   |
+| **Reliability -- failure recovery**       | Direct-to-Postgres   | Large. Fewer components, zero-loss failover, self-healing |
+| **Reliability -- split-brain protection** | Direct-to-Postgres   | Critical. CLM has none                                    |
+| **Performance -- write latency**          | Direct-to-Postgres   | ~5-10x (tens of ms vs. hundreds)                          |
+| **Performance -- event delivery**         | Direct-to-Postgres   | ~10-100x (100ms vs. seconds-minutes)                      |
+| **Performance -- connection efficiency**  | Direct-to-Postgres   | ~5-10x fewer connections                                  |
+| **Performance -- no-op suppression**      | Direct-to-Postgres   | CLM has no equivalent                                     |
+| **Operational simplicity**                | CLM (Hyperfleet-API) | Moderate. Standard REST patterns                          |
+| **Consumer accessibility**                | CLM (Hyperfleet-API) | Moderate. HTTP + curl vs. pgx                             |
+| **Ecosystem maturity**                    | CLM (Hyperfleet-API) | Significant. Already built and deployed                   |
 
 **Bottom line:** The direct-to-Postgres design is dramatically better on reliability and performance -- the two primary evaluation dimensions. The CLM pattern's advantages are real but are primarily about operational familiarity and consumer convenience, not about the quality of the system under load or failure. The formal invariant catalog, deterministic race tests, and continuous production verifier in the Postgres design represent a qualitative leap in correctness assurance that the CLM pattern simply doesn't attempt.

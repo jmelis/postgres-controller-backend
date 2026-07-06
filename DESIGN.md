@@ -21,14 +21,16 @@ The system must deliver gap-free, commit-ordered event streams per (GVK, bucket)
 
 These are the properties the system promises. Everything else exists to uphold them.
 
-* **I1 — Gapless issuance.** Within a (GVK, bucket), committed sequence numbers are exactly 1, 2, 3, … with no holes. (Aborted transactions leave no hole because the counter increment aborts with them.)
-* **I2 — Commit order = sequence order.** Within a (GVK, bucket), if seq(A) < seq(B) then A committed before B became visible. No watcher can observe B while A is still invisible.
-* **I3 — No regression.** `current_seq` for any (GVK, bucket) never decreases — across crashes, failovers, promotions, restores. `(timeline_epoch, seq)` is strictly monotonic even in disaster scenarios.
-* **I4 — Single writer.** At most one replica's writes for a (GVK, bucket) can commit at any instant; a replica holding a stale lease cannot commit even if it believes it holds the lease.
-* **I5 — Exactly-once delivery per state.** A watcher starting from resourceVersion RV receives every object state-change with seq > RV exactly once (coalescing rapid updates to the latest state per object is permitted — Kubernetes watch semantics), with no duplicates and no losses, regardless of doorbell behavior.
-* **I6 — RV monotonicity.** The composite resourceVersion observed by any client never moves backwards, including across failover and lease rebalancing.
-* **I7 — Compaction safety.** A watcher can never silently skip a compacted event: if its RV predates the compaction horizon for any bucket, it receives `410 Gone` and relists; otherwise its stream is complete.
-* **I8 — Optimistic concurrency.** An update presenting a stale `object_version` is rejected (409); no lost updates on a single object.
+- **I1 — Gapless issuance.** Within a (GVK, bucket), committed sequence numbers are exactly 1, 2, 3, … with no holes. (Aborted transactions leave no hole because the counter increment aborts with them.)
+- **I2 — Commit order = sequence order.** Within a (GVK, bucket), if seq(A) < seq(B) then A committed before B became visible. No watcher can observe B while A is still invisible.
+- **I3 — No regression.** `current_seq` for any (GVK, bucket) never decreases — across crashes, failovers, promotions, restores. `(timeline_epoch, seq)` is strictly monotonic even in disaster scenarios.
+- **I4 — Single writer.** At most one replica's writes for a (GVK, bucket) can commit at any instant; a replica holding a stale lease cannot commit even if it believes it holds the lease.
+- **I5 — Exactly-once delivery per state.** A watcher starting from resourceVersion RV receives every object state-change with seq > RV exactly once (coalescing rapid updates to the latest state per object is permitted — Kubernetes watch semantics), with no duplicates and no losses, regardless of doorbell behavior.
+- **I6 — RV monotonicity.** The composite resourceVersion observed by any client never moves backwards, including across failover and lease rebalancing.
+- **I7 — Compaction safety.** A watcher can never silently skip a compacted event: if its RV predates the compaction horizon for any bucket, it receives `410 Gone` and relists; otherwise its stream is complete.
+- **I8 — Optimistic concurrency.** An update presenting a stale `object_version` is rejected (409); no lost updates on a single object.
+
+**Not provided:** Owner-reference garbage collection is intentionally left to controllers. In Kubernetes, the API server's GC cascade-deletes dependents when their owner is removed; here, controllers handle this via standard controller-runtime patterns (`Owns()` watches + finalizer-driven cleanup). This keeps the storage layer simple — no cross-object graph traversal, no bypass of lease fencing for cascade writes.
 
 ## 3. Architectural Design
 
@@ -75,7 +77,10 @@ CREATE TABLE bucket_leases (
     PRIMARY KEY (bucket_id, domain)
 );
 
--- 3. Resources: one live row per object + tombstones
+-- 3. Resources: one row per object. Three lifecycle states:
+--    live (deletion_timestamp IS NULL),
+--    dying (deletion_timestamp set, has finalizers — still visible to controllers),
+--    fully deleted / tombstone (deletion_timestamp set, no finalizers — compactable).
 CREATE TABLE kubernetes_resources (
     gvk                TEXT NOT NULL,
     namespace          TEXT NOT NULL,
@@ -95,7 +100,7 @@ CREATE TABLE kubernetes_resources (
 
 CREATE INDEX idx_resources_list
     ON kubernetes_resources (gvk, bucket_id)
-    WHERE deletion_timestamp IS NULL;                 -- List: live rows only
+    WHERE deletion_timestamp IS NULL;                 -- Covers live-only queries (not used by List, which returns all states)
 CREATE INDEX idx_resources_watch
     ON kubernetes_resources (gvk, bucket_id, gvk_bucket_seq);  -- Poll: ordered range
 
@@ -167,6 +172,8 @@ Inside `pgctl_write()`, the steps are:
 
 **(a) FENCE** — upholds I4. `FOR SHARE` on the `bucket_leases` row for the requested domain, held to COMMIT (see §3.4 for why). Zero rows ⇒ `RAISE EXCEPTION` with error code `P0001` (fence violation).
 
+**Tombstone revival:** A create that hits `unique_violation` may be blocked by a tombstone awaiting compaction. The write path attempts to revive it: `UPDATE ... SET uid = gen_random_uuid(), object_version = 1, deletion_timestamp = NULL ... WHERE deletion_timestamp IS NOT NULL AND (no finalizers)`. A fresh UID ensures watchers and owner references treat this as a new object. If the blocking row is live or dying (has finalizers), the UPDATE matches zero rows and the write returns `AlreadyExists`. The counter increment from step (b) survives the failed INSERT via PL/pgSQL's implicit savepoint (stored proc) or an explicit `SAVEPOINT` (multi-statement path).
+
 **(b) SUPPRESSION CHECK** — upholds I1/I5. PK-read the existing row; if content is identical (see §3.3c), return `(uid, version, 0, false)` immediately — no counter increment, no upsert. The `FOR SHARE` lock is still held for the duration of the transaction even on suppression (§3.4/RB4g).
 
 **(c) SEQUENCE + UPSERT** — upholds I1/I2/I8. The counter `INSERT ... ON CONFLICT DO UPDATE SET current_seq = current_seq + 1` takes an exclusive row lock, serializing commit order with sequence order. The upsert checks `object_version = $expected_version`; zero rows ⇒ `RAISE EXCEPTION` with `P0002` (409 Conflict). A version conflict rolls back the entire stored procedure call, including the counter increment — no gap (I1).
@@ -190,6 +197,8 @@ The fencing guarantees (I4) apply independently per domain: `FOR SHARE` on the `
 
 Most controllers own both spec and status for their resources. `BothManager` provides `AcquireBoth`/`RenewBoth`/`ReleaseBoth` — each is a single multi-row statement against `bucket_leases` (atomic without an explicit transaction). For the minority of controllers that split ownership (e.g., API server writes spec, a separate controller writes status), `NewSpecManager` and `NewStatusManager` operate independently.
 
+**Symmetric `WriteSpec` path:** `WriteSpec` mirrors `WriteStatus` — it updates only `spec`, `metadata`, and `deletion_timestamp`, leaving `status` untouched. This is the write path used by controller-runtime's `client.Update()` (via pgruntime), matching the Kubernetes API server's behavior where `Update` writes spec + metadata only. `WriteSpec` passes `null` for the status parameter; the stored procedure uses `COALESCE(p_status, status)` to preserve the existing status column. Fencing is against the `'spec'` row in `bucket_leases`. Like `WriteStatus`, `ExpectedVersion` must be > 0 (no create path).
+
 ### 3.3c No-Op Write Suppression
 
 Content-equal writes consume no sequence number, emit no doorbell, and bump no `object_version`. This matches Kubernetes API-server semantics where an update that changes nothing does not advance resourceVersion. The feature is default-on; callers set `ForceWrite: true` to bypass it.
@@ -197,14 +206,16 @@ Content-equal writes consume no sequence number, emit no doorbell, and bump no `
 **Mechanism:** inside `pgctl_write()`, after the fence check and before the counter increment, the stored procedure reads the existing row by primary key. If the row exists and all compared fields are equal to the incoming values, the procedure returns `(uid, version, 0, false)` immediately — no counter increment, no upsert. The caller sees `changed=FALSE` and skips the doorbell. The `FOR SHARE` lock on the lease row is still held for the duration of the transaction even on suppression (§3.4/RB4g).
 
 **Field comparison rules (inside `pgctl_write()`):**
-- `domain='spec'` compares all four content fields: `spec`, `status`, `metadata`, `deletion_timestamp`. JSONB equality (`=`) is key-order-insensitive.
-- `domain='status'` compares only `status`.
+- `domain='spec'` (used by `Write()`) compares all four content fields: `spec`, `status`, `metadata`, `deletion_timestamp`. JSONB equality (`=`) is key-order-insensitive; timestamp comparison uses `time.Equal()` to handle timezone normalization.
+- `domain='spec'` with null status (used by `WriteSpec()`) compares `spec`, `metadata`, and `deletion_timestamp` (not `status`). The stored procedure handles null status via `(p_status IS NULL OR v_existing.status = p_status)` in the suppression check.
+- `domain='status'` (used by `WriteStatus()`) compares only `status`.
 
-**Create-path behavior (ExpectedVersion == 0):** if the row already exists and content matches, the write is treated as a replayed create — returns `changed=false` with the existing row's version and UID. If content differs, returns `ErrAlreadyExists` as before.
+**Create-path behavior (ExpectedVersion == 0):** if the row already exists and content matches, the write is treated as a replayed create — returns `Changed: false` with the existing row's version and UID. If content differs, returns `ErrAlreadyExists` as before.
 
 **`WriteResult.Changed`** indicates whether the write produced a new state. Callers can use this to skip downstream side-effects (e.g., the DynamoDB bridge skips doorbell emission on `Changed: false`).
 
 **Invariants preserved:**
+
 - **I1 (gapless):** suppressed writes don't touch the counter — no gap possible.
 - **I2 (commit order):** no counter change, no ordering concern.
 - **I4 (single writer):** the `FOR SHARE` lock is still held for the duration of the transaction, even on suppression. A lease grant blocks until the suppressed transaction commits (RB4g).
@@ -217,16 +228,16 @@ Content-equal writes consume no sequence number, emit no doorbell, and bump no `
 
 ### 3.4 Lease Fencing — closing the expiry race (hardening added in v4)
 
-The v3 fence checked the lease at transaction start, leaving a window: lease expires (or is reassigned) *after* the check but *before* COMMIT — a paused writer could commit under an epoch that is no longer authoritative.
+The v3 fence checked the lease at transaction start, leaving a window: lease expires (or is reassigned) _after_ the check but _before_ COMMIT — a paused writer could commit under an epoch that is no longer authoritative.
 
 v4 closes it with lock discipline, not timestamps:
 
-* The writer's fence takes **`FOR SHARE`** on the lease row (`bucket_leases WHERE bucket_id=$b AND domain=$d`) and holds it to COMMIT.
-* The coordinator's **grant/steal is an `UPDATE bucket_leases SET holder=$new, epoch=epoch+1 WHERE bucket_id=$b AND domain=$d`** — a row `UPDATE` requires the exclusive lock, which **conflicts with `FOR SHARE`**.
+- The writer's fence takes **`FOR SHARE`** on the lease row (`bucket_leases WHERE bucket_id=$b AND domain=$d`) and holds it to COMMIT.
+- The coordinator's **grant/steal is an `UPDATE bucket_leases SET holder=$new, epoch=epoch+1 WHERE bucket_id=$b AND domain=$d`** — a row `UPDATE` requires the exclusive lock, which **conflicts with `FOR SHARE`**.
 
 The same mechanism applies to both domains. The two rows are independent: a status lease grant does not block a spec writer, and vice versa — they are different rows with different row-level locks.
 
-Consequence: a new epoch cannot be granted for a bucket while any in-flight fenced write on that bucket is between fence-check and COMMIT. Either the old writer's transaction commits first (it was still the legitimate holder for that write — I4 holds), or the coordinator's grant commits first and the late writer's fence finds the new epoch and aborts. There is no interleaving in which a stale-epoch write commits after a new epoch exists. Lease *renewal* by the current holder updates only `expires_at` and also serializes behind in-flight shares; renewals are cheap and infrequent (10 s cadence) so the contention is negligible.
+Consequence: a new epoch cannot be granted for a bucket while any in-flight fenced write on that bucket is between fence-check and COMMIT. Either the old writer's transaction commits first (it was still the legitimate holder for that write — I4 holds), or the coordinator's grant commits first and the late writer's fence finds the new epoch and aborts. There is no interleaving in which a stale-epoch write commits after a new epoch exists. Lease _renewal_ by the current holder updates only `expires_at` and also serializes behind in-flight shares; renewals are cheap and infrequent (10 s cadence) so the contention is negligible.
 
 Time is thus advisory (`expires_at` bounds how long a dead holder blocks reassignment); the epoch + lock conflict is the actual safety mechanism. Clock skew cannot violate I4 — at worst it delays a grant.
 
@@ -234,7 +245,7 @@ Writer regression tripwire (defense in depth for I3): each writer caches its hig
 
 ### 3.5 List
 
-Single `REPEATABLE READ` transaction: read `cluster_epoch` + counters (build RV), then live rows via the partial index, COMMIT. Snapshot and RV are the same instant — no skew window (supports I5/I6 handoff into Watch).
+Single `REPEATABLE READ` transaction: read `cluster_epoch` + counters (build RV), then live and dying resource rows ordered by `(bucket_id, gvk_bucket_seq)`, COMMIT. Fully-deleted tombstones (deletion_timestamp set, no finalizers) are excluded by the query: `AND (deletion_timestamp IS NULL OR metadata->'finalizers' != '[]'::jsonb)`. Dying objects (deletion_timestamp set, has finalizers) are included so controllers can perform cleanup — matching the Kubernetes API server's finalizer contract. Snapshot and RV are the same instant — no skew window (supports I5/I6 handoff into Watch).
 
 ### 3.5b Read Model: Direct Reads vs. Cached Reads
 
@@ -258,13 +269,14 @@ For conflict resolution and ambiguous-commit read-back, the direct `Get()` (or `
 
 ### 3.6 Watch — Single-Goroutine Poll-Primary with Doorbell
 
-Polling is the correctness mechanism (**I5**); the doorbell only changes *when* a poll happens.
+Polling is the correctness mechanism (**I5**); the doorbell only changes _when_ a poll happens.
 
-**Poll cycle** per (GVK, leased bucket): a single **REPEATABLE READ read-only transaction** per poll cycle covers the epoch check, per-bucket compaction horizon checks, and all row queries. This snapshot isolation means mid-poll compaction is invisible (B3 defense). `SELECT ... WHERE gvk=$1 AND bucket_id=$b AND gvk_bucket_seq > $hwm ORDER BY gvk_bucket_seq ASC` (served by `idx_resources_watch`, no sort). Dispatch Added/Modified/Deleted (tombstone ⇒ Deleted); advance the high-water mark per row. Rapid updates to one object coalesce naturally — the delivered sequence numbers are not contiguous under coalescing, which is correct Kubernetes watch semantics (I5).
+**Poll cycle** per (GVK, leased bucket): a single **REPEATABLE READ read-only transaction** per poll cycle covers the epoch check, per-bucket compaction horizon checks, and all row queries. This snapshot isolation means mid-poll compaction is invisible (B3 defense). `SELECT ... WHERE gvk=$1 AND bucket_id=$b AND gvk_bucket_seq > $hwm ORDER BY gvk_bucket_seq ASC` (served by `idx_resources_watch`, no sort). Dispatch Added/Modified/Deleted (`deletion_timestamp` set ⇒ Deleted); advance the high-water mark per row. The client layer (e.g., pgruntime) further classifies Deleted events based on finalizer state: objects with active finalizers dispatch OnUpdate (the object is dying but still visible to controllers), while objects with no finalizers dispatch OnDelete (the object is fully gone). Rapid updates to one object coalesce naturally — the delivered sequence numbers are not contiguous under coalescing, which is correct Kubernetes watch semantics (I5).
 
 **Single-goroutine scheduler** — one loop owns all polling, one timer, and local state (`lastPoll`, `doorbellPending`). The listen goroutine only forwards notifications into a 1-buffered channel; it uses a child context that is cancelled when the main loop exits, ensuring prompt shutdown on poll errors. The `hwm` map is never accessed concurrently (R13 defense).
 
 **Scheduling** — three triggers, one timer:
+
 1. **Baseline timer: 5 s** unconditional (liveness backstop; sole guarantee under doorbell loss).
 2. **Doorbell:** `LISTEN resource_changes_b{N}`; any notification for a leased bucket requests an early poll.
 3. **Debounce floor 100 ms, leading + trailing edge.** If `time.Since(lastPoll) >= DebounceFloor` → leading edge, poll immediately. Otherwise → trailing edge: set `doorbellPending`, reset timer to `lastPoll + DebounceFloor`. Every poll error (including epoch mismatch) terminates `Run` uniformly — no error is silently swallowed (R14 defense).
@@ -273,7 +285,7 @@ Polling is the correctness mechanism (**I5**); the doorbell only changes *when* 
 
 ### 3.7 Tombstone Compaction
 
-A **single CTE** atomically deletes tombstones and advances the compaction horizon — the horizon must never lag the physical delete, or a watcher could see an unexplained gap (I7):
+A **single CTE** atomically deletes fully-deleted tombstones (deletion_timestamp set, no active finalizers) and advances the compaction horizon — the horizon must never lag the physical delete, or a watcher could see an unexplained gap (I7):
 
 ```sql
 WITH deleted AS (
@@ -281,6 +293,7 @@ WITH deleted AS (
     WHERE gvk = $1 AND bucket_id = $2
       AND deletion_timestamp IS NOT NULL
       AND deletion_timestamp < now() - $retention
+      AND (metadata->'finalizers' IS NULL OR metadata->'finalizers' = '[]'::jsonb)
     RETURNING gvk_bucket_seq
 )
 INSERT INTO compaction_horizon (bucket_id, gvk, compacted_seq)
@@ -292,24 +305,26 @@ DO UPDATE SET compacted_seq = GREATEST(
 );
 ```
 
+The finalizer guard (`metadata->'finalizers' IS NULL OR metadata->'finalizers' = '[]'::jsonb`) ensures that dying objects — those with `deletion_timestamp` set but still carrying active finalizers — survive past the retention window. Controllers need these objects visible to complete cleanup before removing their finalizers; only after all finalizers are removed does the object become a fully-deleted tombstone eligible for compaction.
+
 Default retention: 24 h. Retention must exceed the slowest legitimate watcher resume interval; enforce with an alarm on watcher hwm age approaching retention/2. The `GREATEST` in the upsert ensures the horizon never moves backwards even under concurrent compaction runs.
 
 ### 3.8 Failover
 
-* **Unplanned:** Multi-AZ promotes the sync standby (~60–120 s). No acknowledged commit lost ⇒ I1–I3 hold by construction. All connections drop; writers run tripwires; watchers reconnect and the next baseline poll reconciles; timeline epoch increments (I6).
-* **Planned:** orchestrated in a window (quiesce, verify lag 0, fail over, resume) so the reconnect surge is scheduled.
-* Async read replicas are never unplanned-promotion candidates.
+- **Unplanned:** Multi-AZ promotes the sync standby (~60–120 s). No acknowledged commit lost ⇒ I1–I3 hold by construction. All connections drop; writers run tripwires; watchers reconnect and the next baseline poll reconciles; timeline epoch increments (I6).
+- **Planned:** orchestrated in a window (quiesce, verify lag 0, fail over, resume) so the reconnect surge is scheduled.
+- Async read replicas are never unplanned-promotion candidates.
 
 ## 4. Infrastructure & Sizing
 
-| Item | 5,000-cluster tier (default) | 50,000-cluster path |
-|---|---|---|
-| Instance | `db.r6g.large` or `xlarge` (Multi-AZ) | resize in place to `db.r6g.2xlarge` |
-| Data | ~2.6 GB (RAM-resident many times over) | ~26 GB (still RAM-resident) |
-| Load | ~187 RPS steady / ~374 burst | 1,870 / 3,740 RPS |
-| Engine | PostgreSQL 16/17 (avoid Extended Support cliff) | same |
-| Storage | gp3, IOPS = write path + WAL, ×3 headroom | raise IOPS |
-| Doorbell extras | single channel fine; skip writer debounce | enable per-bucket channels/debounce per Phase 5 |
+| Item            | 5,000-cluster tier (default)                    | 50,000-cluster path                             |
+| --------------- | ----------------------------------------------- | ----------------------------------------------- |
+| Instance        | `db.r6g.large` or `xlarge` (Multi-AZ)           | resize in place to `db.r6g.2xlarge`             |
+| Data            | ~2.6 GB (RAM-resident many times over)          | ~26 GB (still RAM-resident)                     |
+| Load            | ~187 RPS steady / ~374 burst                    | 1,870 / 3,740 RPS                               |
+| Engine          | PostgreSQL 16/17 (avoid Extended Support cliff) | same                                            |
+| Storage         | gp3, IOPS = write path + WAL, ×3 headroom       | raise IOPS                                      |
+| Doorbell extras | single channel fine; skip writer debounce       | enable per-bucket channels/debounce per Phase 5 |
 
 Correctness controls are identical at both tiers — races don't scale down.
 
@@ -317,58 +332,58 @@ Correctness controls are identical at both tiers — races don't scale down.
 
 Every entry names the invariant at stake, the interleaving, the defense, and the test that forces the interleaving (not hopes for it). Go tests use the race detector plus explicit synchronization points (test hooks that pause a goroutine between fence and commit, etc.); DB-level interleavings are forced with two sessions and explicit `pg_sleep`/lock ordering, or with a proxy (e.g. Toxiproxy) injecting drops at exact protocol moments.
 
-* **R1 — Fence-expiry race (I4).** Writer passes fence, GC-pauses 40 s, coordinator reassigns, writer's COMMIT arrives late. *Defense:* §3.4 share-lock — the grant UPDATE blocks until the in-flight txn ends. *Test:* two DB sessions; session A fences and pauses before COMMIT (test hook); session B attempts the epoch-bump UPDATE and must block; assert B completes only after A, and a subsequent A-write under the old epoch aborts. Run both orderings.
-* **R2 — Debounce swallow (latency only, but test anyway).** Doorbell arrives during a poll cycle. *Defense:* single-goroutine scheduler with leading/trailing debounce (§3.6) — a doorbell during a poll sets `doorbellPending`, guaranteeing a trailing poll after DebounceFloor. *Test:* inject a doorbell during the poll snapshot window; assert a trailing poll follows within DebounceFloor. Run under `-race`.
-* **R3 — Doorbell loss (I5).** LISTEN connection drops silently; notifications lost. *Defense:* poll-primary. *Test:* proxy kills the LISTEN socket mid-burst without client error; assert every event still delivered within baseline interval, zero dups.
-* **R4 — Counter first-write race (I1).** Two txns race the counter's first INSERT. *Defense:* `ON CONFLICT` upsert under the unique PK. *Test:* two sessions insert concurrently; assert seqs are exactly {1, 2}.
-* **R5 — Ambiguous commit (I1/I5).** Connection drops during COMMIT; client doesn't know if the write landed. *Defense:* read-back protocol (§3.3). *Test:* proxy drops the connection after COMMIT is sent but before the OK; assert the client's read-back + retry yields exactly one committed state change and no seq is skipped or double-issued.
-* **R6 — Lease handover overlap (I4/I5).** Old holder's last write vs. new holder's first write on the same bucket. *Defense:* R1 mechanism + new holder's scoped List starts from post-grant counter state. *Test:* scripted handover under write load; verification watcher asserts a single totally-ordered gapless stream across the handover.
-* **R7 — Compaction vs. slow watcher (I7).** Watcher resumes with hwm just below a freshly advanced horizon. *Defense:* horizon advanced transactionally with the delete; boundary check on poll. *Test:* freeze a watcher, compact past its hwm, resume; assert `410 Gone` (never a silent gap). Also the off-by-one: hwm == horizon exactly must succeed.
-* **R8 — Failover mid-transaction (I1–I3).** Failover strikes between counter increment and COMMIT. *Defense:* the whole txn aborts atomically; sync standby has all acknowledged commits. *Test:* Phase 6 drill with writes in flight; assert no gap (aborted increment leaves none) and no regression.
-* **R9 — RV backwards exposure (I6).** Client presents an RV from a previous timeline epoch after failover. *Defense:* epoch comparison → `410 Gone`, relist. *Test:* replay a pre-failover RV post-failover; assert rejection, never a partial stream.
-* **R10 — 409 handling corrupting the stream (I1).** Buggy client retries the upsert inside the same txn after a version conflict. *Defense:* client library makes it structurally impossible (txn helper owns BEGIN/COMMIT); assert in code review + a library test that a conflict always rolls back the counter increment.
-* **R11 — Status fence-expiry race (I4).** Mirrors R1 for the status write path: `FOR SHARE` on the `bucket_leases` status row (`domain='status'`) must block a coordinator's grant while a status writer is mid-transaction. *Defense:* same §3.4 share-lock mechanism on the status domain row. *Test:* session A does `WriteStatus()` with hook pausing at BeforeCommit, session B attempts Grant on the status lease — must block; unblock A, verify B completes; A's next `WriteStatus()` with the old epoch returns fence violation.
-* **R12 — Concurrent spec/status writes (I1/I2).** holder-A writes spec, holder-B writes status to the same resource. The shared counter must produce a gapless sequence; the watcher must see the correct stream; cross-domain fencing must be enforced (holder-B cannot Write, holder-A cannot WriteStatus). *Defense:* shared `gvk_bucket_counters`, independent `bucket_leases` rows (different `domain` values). *Test:* interleaved spec and status writes produce consecutive seqs {1,2,3,4}; watcher starting from hwm sees correct state; holder-B's Write attempt is fenced; holder-A's WriteStatus attempt is fenced.
-* **R13 — Single-goroutine poll serialization (I5).** Rapid doorbell bursts overlapping with the baseline timer must not produce concurrent poll cycles — the `hwm` map is not safe for concurrent access and concurrent polls could deliver events out of order. *Defense:* single-goroutine scheduler (§3.6) — only one goroutine reads `hwm`, the listen goroutine only forwards into a buffered channel. *Test:* fire 10 rapid doorbells while baseline timer is due; assert exactly one poll executes at a time and events arrive in seq order.
-* **R14 — Epoch mismatch on doorbell-triggered poll (I6/I7).** A doorbell triggers a poll after the cluster epoch has been bumped. The watcher must terminate with 410 Gone, not silently swallow the error. *Defense:* every poll error (including epoch mismatch) causes `Run()` to return, closing the events channel — the watch adapter sees the channel close and propagates (§3.6). The listen goroutine uses a child context that is cancelled when `Run()` exits, ensuring prompt shutdown. *Test:* start watcher, bump `cluster_epoch`, trigger a doorbell to force a poll; assert the watcher terminates and the events channel closes within 5 s.
-* **R15 — Mid-poll compaction (I7).** Compaction runs and advances the horizon while a watcher is mid-poll. The watcher must not see an inconsistent state (some rows deleted, horizon advanced, within a single poll cycle). *Defense:* REPEATABLE READ snapshot isolation — the poll transaction sees the database as of its snapshot instant; the compaction's DELETE and horizon UPDATE are invisible within the poll cycle. *Test:* start a watcher poll (paused via hook), run compaction in a separate session, resume the poll; assert the watcher sees all pre-compaction rows and no unexplained gaps.
-* **RB4 — No-op write suppression (I1/I4/I5).** Content-equal writes must be suppressed without violating any invariant. Seven sub-cases:
+- **R1 — Fence-expiry race (I4).** Writer passes fence, GC-pauses 40 s, coordinator reassigns, writer's COMMIT arrives late. _Defense:_ §3.4 share-lock — the grant UPDATE blocks until the in-flight txn ends. _Test:_ two DB sessions; session A fences and pauses before COMMIT (test hook); session B attempts the epoch-bump UPDATE and must block; assert B completes only after A, and a subsequent A-write under the old epoch aborts. Run both orderings.
+- **R2 — Debounce swallow (latency only, but test anyway).** Doorbell arrives during a poll cycle. _Defense:_ single-goroutine scheduler with leading/trailing debounce (§3.6) — a doorbell during a poll sets `doorbellPending`, guaranteeing a trailing poll after DebounceFloor. _Test:_ inject a doorbell during the poll snapshot window; assert a trailing poll follows within DebounceFloor. Run under `-race`.
+- **R3 — Doorbell loss (I5).** LISTEN connection drops silently; notifications lost. _Defense:_ poll-primary. _Test:_ proxy kills the LISTEN socket mid-burst without client error; assert every event still delivered within baseline interval, zero dups.
+- **R4 — Counter first-write race (I1).** Two txns race the counter's first INSERT. _Defense:_ `ON CONFLICT` upsert under the unique PK. _Test:_ two sessions insert concurrently; assert seqs are exactly {1, 2}.
+- **R5 — Ambiguous commit (I1/I5).** Connection drops during COMMIT; client doesn't know if the write landed. _Defense:_ read-back protocol (§3.3). _Test:_ proxy drops the connection after COMMIT is sent but before the OK; assert the client's read-back + retry yields exactly one committed state change and no seq is skipped or double-issued.
+- **R6 — Lease handover overlap (I4/I5).** Old holder's last write vs. new holder's first write on the same bucket. _Defense:_ R1 mechanism + new holder's scoped List starts from post-grant counter state. _Test:_ scripted handover under write load; verification watcher asserts a single totally-ordered gapless stream across the handover.
+- **R7 — Compaction vs. slow watcher (I7).** Watcher resumes with hwm just below a freshly advanced horizon. _Defense:_ horizon advanced transactionally with the delete; boundary check on poll. _Test:_ freeze a watcher, compact past its hwm, resume; assert `410 Gone` (never a silent gap). Also the off-by-one: hwm == horizon exactly must succeed.
+- **R8 — Failover mid-transaction (I1–I3).** Failover strikes between counter increment and COMMIT. _Defense:_ the whole txn aborts atomically; sync standby has all acknowledged commits. _Test:_ Phase 6 drill with writes in flight; assert no gap (aborted increment leaves none) and no regression.
+- **R9 — RV backwards exposure (I6).** Client presents an RV from a previous timeline epoch after failover. _Defense:_ epoch comparison → `410 Gone`, relist. _Test:_ replay a pre-failover RV post-failover; assert rejection, never a partial stream.
+- **R10 — 409 handling corrupting the stream (I1).** Buggy client retries the upsert inside the same txn after a version conflict. _Defense:_ client library makes it structurally impossible (txn helper owns BEGIN/COMMIT); assert in code review + a library test that a conflict always rolls back the counter increment.
+- **R11 — Status fence-expiry race (I4).** Mirrors R1 for the status write path: `FOR SHARE` on the `bucket_leases` status row (`domain='status'`) must block a coordinator's grant while a status writer is mid-transaction. _Defense:_ same §3.4 share-lock mechanism on the status domain row. _Test:_ session A does `WriteStatus()` with hook pausing at BeforeCommit, session B attempts Grant on the status lease — must block; unblock A, verify B completes; A's next `WriteStatus()` with the old epoch returns fence violation.
+- **R12 — Concurrent spec/status writes (I1/I2).** holder-A writes spec, holder-B writes status to the same resource. The shared counter must produce a gapless sequence; the watcher must see the correct stream; cross-domain fencing must be enforced (holder-B cannot Write, holder-A cannot WriteStatus). _Defense:_ shared `gvk_bucket_counters`, independent `bucket_leases` rows (different `domain` values). _Test:_ interleaved spec and status writes produce consecutive seqs {1,2,3,4}; watcher starting from hwm sees correct state; holder-B's Write attempt is fenced; holder-A's WriteStatus attempt is fenced.
+- **R13 — Single-goroutine poll serialization (I5).** Rapid doorbell bursts overlapping with the baseline timer must not produce concurrent poll cycles — the `hwm` map is not safe for concurrent access and concurrent polls could deliver events out of order. _Defense:_ single-goroutine scheduler (§3.6) — only one goroutine reads `hwm`, the listen goroutine only forwards into a buffered channel. _Test:_ fire 10 rapid doorbells while baseline timer is due; assert exactly one poll executes at a time and events arrive in seq order.
+- **R14 — Epoch mismatch on doorbell-triggered poll (I6/I7).** A doorbell triggers a poll after the cluster epoch has been bumped. The watcher must terminate with 410 Gone, not silently swallow the error. _Defense:_ every poll error (including epoch mismatch) causes `Run()` to return, closing the events channel — the watch adapter sees the channel close and propagates (§3.6). The listen goroutine uses a child context that is cancelled when `Run()` exits, ensuring prompt shutdown. _Test:_ start watcher, bump `cluster_epoch`, trigger a doorbell to force a poll; assert the watcher terminates and the events channel closes within 5 s.
+- **R15 — Mid-poll compaction (I7).** Compaction runs and advances the horizon while a watcher is mid-poll. The watcher must not see an inconsistent state (some rows deleted, horizon advanced, within a single poll cycle). _Defense:_ REPEATABLE READ snapshot isolation — the poll transaction sees the database as of its snapshot instant; the compaction's DELETE and horizon UPDATE are invisible within the poll cycle. _Test:_ start a watcher poll (paused via hook), run compaction in a separate session, resume the poll; assert the watcher sees all pre-compaction rows and no unexplained gaps.
+- **RB4 — No-op write suppression (I1/I4/I5).** Content-equal writes must be suppressed without violating any invariant. Seven sub-cases:
   - **RB4a** — Identical write suppressed: no seq consumed, no version bump, counter unchanged.
   - **RB4b** — Real change after no-op correctly sequenced (gets next seq, watcher sees exactly one event).
   - **RB4c** — Watcher sees no event for suppressed write (I5).
   - **RB4d** — Replayed create with identical content suppressed (counter unchanged).
   - **RB4e** — WriteStatus suppression (only status field compared).
   - **RB4f** — ForceWrite bypasses suppression.
-  - **RB4g** — Suppression under fence interleaving (I4): `AfterSuppressionCheck` hook pauses a suppressed write; grant attempt must block because `FOR SHARE` is held. *Defense:* same §3.4 share-lock — the suppressed transaction holds the share lock for its entire lifetime, even though it performs no counter increment or upsert. *Test:* session A writes identical content (suppressed), paused after suppression check; session B attempts Grant — must block; unblock A, verify A completes as no-op, B completes after A.
+  - **RB4g** — Suppression under fence interleaving (I4): `AfterSuppressionCheck` hook pauses a suppressed write; grant attempt must block because `FOR SHARE` is held. _Defense:_ same §3.4 share-lock — the suppressed transaction holds the share lock for its entire lifetime, even though it performs no counter increment or upsert. _Test:_ session A writes identical content (suppressed), paused after suppression check; session B attempts Grant — must block; unblock A, verify A completes as no-op, B completes after A.
 
 ## 6. Continuous Invariant Verification (production, not just tests)
 
 Correctness that is only tested pre-GA decays. Run a **verifier** as a permanent, low-priority consumer in every environment:
 
-* Subscribes (via the ordinary poll path) to a sample of buckets — including the hottest — and checks per (GVK, bucket):
+- Subscribes (via the ordinary poll path) to a sample of buckets — including the hottest — and checks per (GVK, bucket):
   - **I3/I6 — monotonic high-water marks:** `seq > prevHWM` per bucket. Any regression is an invariant violation.
   - **I7 — gaps explained by compaction:** all gaps between delivered seq numbers are below the compaction horizon.
-* **No per-event gap checking (I1).** Under coalescing (two writes to the same key between polls), the delivered sequence numbers are not contiguous — only the latest seq per object survives. This is correct Kubernetes watch semantics (I5 permits coalescing). Gap auditing, if needed, must cross-check the table directly (out of scope for the stream-side verifier).
-* **Duplicate detection** uses monotonicity: `seq <= prevHWM` is reported as an I3 violation. No per-key map is maintained — verifier state is **O(buckets)**, bounded.
-* A second probe writes a synthetic canary object per bucket at low rate and measures write→delivery latency (doorbell health) via a **bounded ring buffer** (1,000 samples) with p99 tracking.
-* Any violation pages; I3/I4 violations additionally trip a write-freeze on the affected bucket (tripwire, §3.4).
-* The verifier is also the acceptance oracle for every phase in §7 — the same code judges tests and production.
+- **No per-event gap checking (I1).** Under coalescing (two writes to the same key between polls), the delivered sequence numbers are not contiguous — only the latest seq per object survives. This is correct Kubernetes watch semantics (I5 permits coalescing). Gap auditing, if needed, must cross-check the table directly (out of scope for the stream-side verifier).
+- **Duplicate detection** uses monotonicity: `seq <= prevHWM` is reported as an I3 violation. No per-key map is maintained — verifier state is **O(buckets)**, bounded.
+- A second probe writes a synthetic canary object per bucket at low rate and measures write→delivery latency (doorbell health) via a **bounded ring buffer** (1,000 samples) with p99 tracking.
+- Any violation pages; I3/I4 violations additionally trip a write-freeze on the affected bucket (tripwire, §3.4).
+- The verifier is also the acceptance oracle for every phase in §7 — the same code judges tests and production.
 
 ## 7. Certification Test Plan
 
-* **Phase 0 — Race catalog (new, gating).** All §5 tests green under `-race`, 1,000× repetition for the timing-sensitive ones, before any load phase runs. These are unit/two-session tests — cheap, deterministic, first.
-* **Phase 1 — Counter ceiling.** 50 workers, one (bucket, GVK), target instance with sync standby in the commit path. ≥200 commits/s, p99 ≤10 ms, zero serialization failures, zero fencing false-positives. Record ceiling as the bucket-sizing budget.
-* **Phase 2 — Steady state.** Tier load (187 RPS at 5k; 1,870 at 50k cert) for 48 h, verifier attached. CPU <60%, read IOPS ≈0, p50 write <15 ms, verifier silent.
-* **Phase 2b — Hot-bucket skew.** Zipfian: hottest bucket 20% of writes. Phase 2 criteria + cold-bucket p99 <15 ms (no starvation).
-* **Phase 3 — Avalanche & rebalancing.** Kill half the replicas under load; include one deliberately zombied stale-epoch writer. No CPU exhaustion or dropped connections; verifier reports zero dups/gaps across handover; zero stale-epoch commits.
-* **Phase 4 — 7-day soak.** Autovacuum sawtooth on dead tuples; table+index ≤1.5× live set; counter HOT ratio ≥90%; `idx_resources_watch` bloat contained; compactor bounded; sub-horizon RVs get `410`.
-* **Phase 5 — Poll & doorbell.** At tier burst with 10/50/200 watchers: baseline poll adds <5% CPU; healthy-doorbell delivery p99 <150 ms; **notify-loss drill:** disable pg_notify mid-run — delivery continues within baseline interval, verifier silent.
-* **Phase 6 — Failover drills.** Unplanned (reboot-with-failover) under load + one orchestrated planned failover, repeated ≥5×. RTO ≤120 s; zero acknowledged-write loss; tripwires silent; epoch increments exactly once per promotion; verifier confirms gapless continuity through every drill. Include R8/R9 assertions.
-* **Phase 7 — Backup/restore regression (new).** Restore a snapshot into a fresh instance (DR path). Because a restore *can* legitimately rewind state, the runbook must bump the timeline epoch manually before accepting writes; the drill asserts clients relist via `410` and no stale RV is honored (I3/I6 under the one scenario sync replication doesn't cover).
+- **Phase 0 — Race catalog (new, gating).** All §5 tests green under `-race`, 1,000× repetition for the timing-sensitive ones, before any load phase runs. These are unit/two-session tests — cheap, deterministic, first.
+- **Phase 1 — Counter ceiling.** 50 workers, one (bucket, GVK), target instance with sync standby in the commit path. ≥200 commits/s, p99 ≤10 ms, zero serialization failures, zero fencing false-positives. Record ceiling as the bucket-sizing budget.
+- **Phase 2 — Steady state.** Tier load (187 RPS at 5k; 1,870 at 50k cert) for 48 h, verifier attached. CPU <60%, read IOPS ≈0, p50 write <15 ms, verifier silent.
+- **Phase 2b — Hot-bucket skew.** Zipfian: hottest bucket 20% of writes. Phase 2 criteria + cold-bucket p99 <15 ms (no starvation).
+- **Phase 3 — Avalanche & rebalancing.** Kill half the replicas under load; include one deliberately zombied stale-epoch writer. No CPU exhaustion or dropped connections; verifier reports zero dups/gaps across handover; zero stale-epoch commits.
+- **Phase 4 — 7-day soak.** Autovacuum sawtooth on dead tuples; table+index ≤1.5× live set; counter HOT ratio ≥90%; `idx_resources_watch` bloat contained; compactor bounded; sub-horizon RVs get `410`.
+- **Phase 5 — Poll & doorbell.** At tier burst with 10/50/200 watchers: baseline poll adds <5% CPU; healthy-doorbell delivery p99 <150 ms; **notify-loss drill:** disable pg_notify mid-run — delivery continues within baseline interval, verifier silent.
+- **Phase 6 — Failover drills.** Unplanned (reboot-with-failover) under load + one orchestrated planned failover, repeated ≥5×. RTO ≤120 s; zero acknowledged-write loss; tripwires silent; epoch increments exactly once per promotion; verifier confirms gapless continuity through every drill. Include R8/R9 assertions.
+- **Phase 7 — Backup/restore regression (new).** Restore a snapshot into a fresh instance (DR path). Because a restore _can_ legitimately rewind state, the runbook must bump the timeline epoch manually before accepting writes; the drill asserts clients relist via `410` and no stale RV is honored (I3/I6 under the one scenario sync replication doesn't cover).
 
 ## 8. Open Items
 
-* Bucket count (64) vs. Phase 1 ceiling — hot bucket ≤50% of ceiling.
-* Baseline poll interval (5 s launch) vs. Phase 5 idle-load data.
-* Compaction retention (24 h) vs. slowest informer restart — confirm with ops; alarm at retention/2.
-* Verifier sampling breadth vs. its own read load — start with 8 buckets incl. hottest.
+- Bucket count (64) vs. Phase 1 ceiling — hot bucket ≤50% of ceiling.
+- Baseline poll interval (5 s launch) vs. Phase 5 idle-load data.
+- Compaction retention (24 h) vs. slowest informer restart — confirm with ops; alarm at retention/2.
+- Verifier sampling breadth vs. its own read load — start with 8 buckets incl. hottest.

@@ -1,4 +1,4 @@
-package main
+package greeting
 
 import (
 	"context"
@@ -38,7 +38,6 @@ func (r *GreetingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	message := fmt.Sprintf("%s, %s!", prefix, greeting.Spec.Name)
 	cardName := greeting.Name + "-card"
 
-	// Create or update the GreetingCard (controller owns spec).
 	card := &GreetingCard{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cardName,
@@ -50,14 +49,13 @@ func (r *GreetingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			GreetingName: greeting.Name,
 			Message:      message,
 		}
-		return controllerutil.SetControllerReference(&greeting, card, scheme)
+		return controllerutil.SetControllerReference(&greeting, card, Scheme)
 	})
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("create/update GreetingCard: %w", err)
 	}
 	logger.Info("GreetingCard reconciled", "name", cardName, "result", result)
 
-	// Update Greeting status (controller owns status).
 	greeting.Status = GreetingStatus{
 		Message: message,
 		Phase:   "Ready",
@@ -83,7 +81,12 @@ func (r *GreetingReconciler) getPrefix(ctx context.Context, namespace string) st
 }
 
 func (r *GreetingReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return r.SetupWithManagerNamed(mgr, "greeting")
+}
+
+func (r *GreetingReconciler) SetupWithManagerNamed(mgr ctrl.Manager, name string) error {
 	return ctrl.NewControllerManagedBy(mgr).
+		Named(name).
 		For(&Greeting{}).
 		Owns(&GreetingCard{}).
 		Watches(&GreetingPolicy{}, handler.EnqueueRequestsFromMapFunc(r.policyToGreetings)).

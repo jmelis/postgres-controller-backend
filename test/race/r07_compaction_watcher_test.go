@@ -35,8 +35,14 @@ func TestR7_CompactionVsSlowWatcher(t *testing.T) {
 		require.NoError(t, err)
 	}
 
+	// Backdate updated_at so GREATEST(deletion_timestamp, updated_at) is old enough to compact
+	backdateConn := freshConn(t)
+	_, err := backdateConn.Exec(ctx, `UPDATE kubernetes_resources SET updated_at = deletion_timestamp WHERE name LIKE 'compact-victim-%'`)
+	require.NoError(t, err)
+	backdateConn.Close(context.Background())
+
 	// Write a live resource at seq=4
-	_, err := wr.Write(ctx, makeWriteReq("apps/v1/Deployment", "default",
+	_, err = wr.Write(ctx, makeWriteReq("apps/v1/Deployment", "default",
 		"survivor", 1, "holder-a", epoch))
 	require.NoError(t, err)
 
@@ -86,6 +92,12 @@ func TestR7_CompactionBoundary_Exact(t *testing.T) {
 	req.DeletionTimestamp = &past
 	_, err := wr.Write(ctx, req)
 	require.NoError(t, err)
+
+	// Backdate updated_at so GREATEST(deletion_timestamp, updated_at) is old enough to compact
+	backdateConn2 := freshConn(t)
+	_, err = backdateConn2.Exec(ctx, `UPDATE kubernetes_resources SET updated_at = deletion_timestamp WHERE name = 'compact-exact'`)
+	require.NoError(t, err)
+	backdateConn2.Close(context.Background())
 
 	// Write live at seq=2
 	_, err = wr.Write(ctx, makeWriteReq("apps/v1/Deployment", "default",

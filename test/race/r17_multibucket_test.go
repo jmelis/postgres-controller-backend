@@ -171,8 +171,14 @@ func TestR17_Partial410(t *testing.T) {
 		require.NoError(t, err)
 	}
 
+	// Backdate updated_at so GREATEST(deletion_timestamp, updated_at) is old enough to compact
+	backdateConn := freshConn(t)
+	_, err := backdateConn.Exec(ctx, `UPDATE kubernetes_resources SET updated_at = deletion_timestamp WHERE name LIKE 'tombstone-b2-%'`)
+	require.NoError(t, err)
+	backdateConn.Close(context.Background())
+
 	// Write 1 live resource to bucket 2 (seq=4).
-	_, err := wr.Write(ctx, makeWriteReq("apps/v1/Deployment", "default",
+	_, err = wr.Write(ctx, makeWriteReq("apps/v1/Deployment", "default",
 		"live-b2", 2, "holder-a", epoch2))
 	require.NoError(t, err)
 

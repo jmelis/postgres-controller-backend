@@ -4,7 +4,7 @@
 
 **Goal:** ingest **observed cluster state** from per-MC DynamoDB **read-desires** tables into PostgreSQL, so that the platform's controllers can watch it through the ordinary List/Watch machinery. The bridge is the **sole Postgres writer** for the observed GVKs — it inherits all fencing, counter, and concurrency guarantees by construction, and owns them alone.
 
-**Change from v3:** v3 assumed the per-MC tables held the HostedCluster/NodePool objects themselves, with contested spec/status ownership (hence `WriteSpec`, version caches, conflict-retry machinery). The actual model is the **kube-applier desire pattern** (cf. ARO-HCP kube-applier): controllers write *ApplyDesires* (manifests to apply on the MC) and *ReadDesires* (resources to observe) into per-MC tables; the MC-side applier executes applies and populates each ReadDesire's `.status.kubeContent` with the **observed object**. The bridge consumes only the **read-desires table**: it extracts observed objects and mirrors them into Postgres. Desired state never round-trips through the bridge, so there is **no ownership split, no dual-write, and no conflicting writer** — deleting `WriteSpec`, the version cache, and the conflict-resolution protocol. v4 also: replaces the N-replica pool with **2 replicas, simple lease failover** (§6); promotes the **no-hang contract** to a first-class requirement (§1.2); and adds **no-op write suppression as a main-library feature** (§4.3) — required because the applier refreshes desire status on a poll cadence, and general enough that every writer benefits.
+**Change from v3:** v3 assumed the per-MC tables held the HostedCluster/NodePool objects themselves, with contested spec/status ownership (hence `WriteSpec`, version caches, conflict-retry machinery). The actual model is the **kube-applier desire pattern** (cf. ARO-HCP kube-applier): controllers write _ApplyDesires_ (manifests to apply on the MC) and _ReadDesires_ (resources to observe) into per-MC tables; the MC-side applier executes applies and populates each ReadDesire's `.status.kubeContent` with the **observed object**. The bridge consumes only the **read-desires table**: it extracts observed objects and mirrors them into Postgres. Desired state never round-trips through the bridge, so there is **no ownership split, no dual-write, and no conflicting writer** — deleting `WriteSpec`, the version cache, and the conflict-resolution protocol. v4 also: replaces the N-replica pool with **2 replicas, simple lease failover** (§6); promotes the **no-hang contract** to a first-class requirement (§1.2); and adds **no-op write suppression as a main-library feature** (§4.3) — required because the applier refreshes desire status on a poll cadence, and general enough that every writer benefits.
 
 ---
 
@@ -49,8 +49,8 @@ The replica that holds MC-k's lease — and only that replica — reads MC-k's s
 
 Same decision DESIGN.md §3.6 makes for the watch:
 
-* **The stream is the doorbell.** It delivers most status updates within ~1 s. Its loss, trimming, lag, or outage costs latency, never correctness.
-* **The reconciler is the poll.** A periodic diff of the MC's read-desires table against Postgres repairs *any* divergence within one reconciler period `P` (15 min). Correctness never depends on the stream behaving.
+- **The stream is the doorbell.** It delivers most status updates within ~1 s. Its loss, trimming, lag, or outage costs latency, never correctness.
+- **The reconciler is the poll.** A periodic diff of the MC's read-desires table against Postgres repairs _any_ divergence within one reconciler period `P` (15 min). Correctness never depends on the stream behaving.
 
 Every "what if the stream …" question has the same answer: bounded staleness, then self-repair (§12).
 
@@ -80,17 +80,17 @@ mapper(item) → []ObservedObject{ GVK        (HostedCluster | HostedNodePool)
 
 Zero when `.status.kubeContent` is empty (desire created, applier not yet synced). Mapper rules:
 
-* Output must be **deterministic and canonical** — no always-changing fields (observation timestamps, ordering jitter). No-op suppression (§4.3) compares mapped output against the Postgres row; a nondeterministic mapper defeats it and floods watchers.
-* Every mapped object must belong to the unit's MC bucket (§3.1); anything else is a **poison record** (§9) — a mis-routed table or broken mapper must page, not write into another MC's bucket.
-* An unparsable item is likewise poison: dead-letter + page. The reconciler hits the same mapper on the same item, so poison is a bug, not noise.
+- Output must be **deterministic and canonical** — no always-changing fields (observation timestamps, ordering jitter). No-op suppression (§4.3) compares mapped output against the Postgres row; a nondeterministic mapper defeats it and floods watchers.
+- Every mapped object must belong to the unit's MC bucket (§3.1); anything else is a **poison record** (§9) — a mis-routed table or broken mapper must page, not write into another MC's bucket.
+- An unparsable item is likewise poison: dead-letter + page. The reconciler hits the same mapper on the same item, so poison is a bug, not noise.
 
 Stream events:
 
-| eventName | Meaning | Bridge action |
-|---|---|---|
-| `INSERT` | new ReadDesire (status usually empty) | map → usually zero objects; no-op |
-| `MODIFY` | applier updated `.status` | map → upsert observed objects (§4.2) |
-| `REMOVE` | controller deleted the ReadDesire | tombstone the observed objects it produced (`Keys` + `OldImage`) |
+| eventName | Meaning                               | Bridge action                                                    |
+| --------- | ------------------------------------- | ---------------------------------------------------------------- |
+| `INSERT`  | new ReadDesire (status usually empty) | map → usually zero objects; no-op                                |
+| `MODIFY`  | applier updated `.status`             | map → upsert observed objects (§4.2)                             |
+| `REMOVE`  | controller deleted the ReadDesire     | tombstone the observed objects it produced (`Keys` + `OldImage`) |
 
 A `REMOVE` means "the platform no longer tracks this" (cluster deprovisioned or observation withdrawn) — the observed object is tombstoned so watchers see the deletion.
 
@@ -116,10 +116,10 @@ Every record in stream-k belongs to MC-k, hence to exactly one bucket. HostedClu
 
 ### 3.2 Two partition schemes, one bucket_id space
 
-| Scheme | GVKs | bucket_id | Count |
-|---|---|---|---|
-| Fixed | Cluster, NodePool + other control-plane GVKs (not bridged) | `hash(key) % 16` | constant |
-| MC | HostedCluster, HostedNodePool (bridged) | `MC_BASE + mc_index` | 50 → ~500 with fleet |
+| Scheme | GVKs                                                       | bucket_id            | Count                |
+| ------ | ---------------------------------------------------------- | -------------------- | -------------------- |
+| Fixed  | Cluster, NodePool + other control-plane GVKs (not bridged) | `hash(key) % 16`     | constant             |
+| MC     | HostedCluster, HostedNodePool (bridged)                    | `MC_BASE + mc_index` | 50 → ~500 with fleet |
 
 The storage layer needs no changes: `gvk_bucket_counters`, `kubernetes_resources`, and `compaction_horizon` are keyed `(bucket_id, gvk)`, and counter rows appear lazily on first write. **The one hard constraint: ranges must be disjoint** — `bucket_leases` is keyed `(bucket_id, domain)`, not per GVK, so a fixed-scheme hash colliding with an MC index would put a platform controller and a bridge replica on the same lease row. Fixed schemes own `0–4095`; `MC_BASE = 4096`.
 
@@ -154,9 +154,9 @@ The observed GVKs have exactly one Postgres writer — the bridge. Each MC-unit 
 
 Per observed object: `ReadBack` the current row (PK lookup; tombstones are rows, so no special list variant is needed), then `Write()` with `ExpectedVersion` = current version (0 if absent). Because the unit is the sole writer and processes its keys sequentially per shard, the read-back is always correct:
 
-* `ErrConflict` **cannot occur** (no other writer exists). If it ever surfaces, it is treated as Fatal — it means the sole-writer assumption broke (a second claimant, i.e. a fencing bug) and must page, not retry.
-* `ErrAlreadyExists` occurs only on **replay** of a create (crash before checkpoint): read back, convert to an update, retry — deterministic success, no contender.
-* A `REMOVE` for an already-absent row (compacted tombstone, or never created) is the converged state: **success, no-op**. Consequence: replayed `REMOVE`s racing compaction are harmless; compaction retention (24 h) needs no coupling to the stream window.
+- `ErrConflict` **cannot occur** (no other writer exists). If it ever surfaces, it is treated as Fatal — it means the sole-writer assumption broke (a second claimant, i.e. a fencing bug) and must page, not retry.
+- `ErrAlreadyExists` occurs only on **replay** of a create (crash before checkpoint): read back, convert to an update, retry — deterministic success, no contender.
+- A `REMOVE` for an already-absent row (compacted tombstone, or never created) is the converged state: **success, no-op**. Consequence: replayed `REMOVE`s racing compaction are harmless; compaction retention (24 h) needs no coupling to the stream window.
 
 No version cache: at ~4 real writes/s per MC, one extra PK read per write is noise, and deleting the cache deletes its staleness bugs.
 
@@ -164,11 +164,11 @@ No version cache: at ~4 real writes/s per MC, one extra PK read per write is noi
 
 **The applier refreshes desire status on a poll cadence (~3 min across all desires).** If it rewrites `.status` even when nothing changed, the stream carries a MODIFY per ReadDesire per cycle — potentially ~1,600 events/s fleet-wide of no-ops. Without suppression, every one would consume a sequence number, bump `object_version`, and wake every watcher of the bucket. Suppression is therefore mandatory for the bridge — and it is generally correct behavior, so it goes in the **main library**, not the bridge:
 
-* Inside the `pgctl_write()` stored procedure, **after the fence and before the counter increment**: PK-read the current row; if `(spec, status, metadata, deletion_timestamp)` are semantically equal to the request (JSONB `=` is key-order-insensitive), return immediately with `changed=false` — no counter, no upsert, no doorbell.
-* Because the check precedes step (b) of DESIGN.md §3.3, a suppressed write **consumes no sequence number** (I1 preserved by construction), emits **no doorbell**, bumps **no `object_version`**, and generates **no watch event** — matching Kubernetes API-server semantics, where an update that changes nothing does not advance resourceVersion.
-* Semantics: if content is equal, the write succeeds as a no-op **regardless of `ExpectedVersion`** — the caller's intent ("make the state X") is already satisfied. This is level-based idempotence; it also makes at-least-once stream delivery literally free: a duplicated record is a suppressed write.
-* One extra PK lookup per write; against the cost of a counter bump + row upsert + watcher wakeups it saves, strictly a win at any no-op ratio above ~0.
-* Applies to `Write()` and `WriteStatus()` uniformly; opt-out flag for callers that want unconditional bumps (none known).
+- Inside the `pgctl_write()` stored procedure, **after the fence and before the counter increment**: PK-read the current row; if `(spec, status, metadata, deletion_timestamp)` are semantically equal to the request (JSONB `=` is key-order-insensitive), return immediately with `changed=false` — no counter, no upsert, no doorbell.
+- Because the check precedes step (b) of DESIGN.md §3.3, a suppressed write **consumes no sequence number** (I1 preserved by construction), emits **no doorbell**, bumps **no `object_version`**, and generates **no watch event** — matching Kubernetes API-server semantics, where an update that changes nothing does not advance resourceVersion.
+- Semantics: if content is equal, the write succeeds as a no-op **regardless of `ExpectedVersion`** — the caller's intent ("make the state X") is already satisfied. This is level-based idempotence; it also makes at-least-once stream delivery literally free: a duplicated record is a suppressed write.
+- One extra PK lookup per write; against the cost of a counter bump + row upsert + watcher wakeups it saves, strictly a win at any no-op ratio above ~0.
+- Applies to `Write()` and `WriteStatus()` uniformly; opt-out flag for callers that want unconditional bumps (none known).
 
 Side effect on the bridge: the reconciler's repair writes and all stream replays dedup automatically — a healthy reconciler pass generates **zero** Postgres writes and zero watch events.
 
@@ -231,9 +231,9 @@ After each batch: process records sequentially through §4.2; after the final re
 
 **Two identical replicas run the same claim loop; the per-MC lease is the assignment mechanism.** No coordinator, no balancer, no cap/slack machinery:
 
-* Both replicas poll `mc_registry` every 60 s (jittered) and attempt `AcquireBoth` on any active MC whose lease is unheld or expired. Acquisition is the existing atomic epoch-bump — exactly one winner per MC; the loser moves on.
-* Steady state: units land on whichever replica claimed them first. The split is arbitrary and irrelevant — either replica can carry the whole fleet (§15.1); an uneven or 100/0 split is *fine*, and both replicas stay warm by construction.
-* **Correctness is independent of the replica count** (I4: the lease admits one writer per bucket no matter who races). Two replicas is purely the availability choice; a third can be added later without design change.
+- Both replicas poll `mc_registry` every 60 s (jittered) and attempt `AcquireBoth` on any active MC whose lease is unheld or expired. Acquisition is the existing atomic epoch-bump — exactly one winner per MC; the loser moves on.
+- Steady state: units land on whichever replica claimed them first. The split is arbitrary and irrelevant — either replica can carry the whole fleet (§15.1); an uneven or 100/0 split is _fine_, and both replicas stay warm by construction.
+- **Correctness is independent of the replica count** (I4: the lease admits one writer per bucket no matter who races). Two replicas is purely the availability choice; a third can be added later without design change.
 
 ### 6.2 Failover
 
@@ -269,10 +269,10 @@ One multi-row renewal for all held units every `ttl/3` (10 s), gated by the no-h
 
 ### 8.1 Shard properties
 
-* Parent-child lineage: a parent shard must be fully processed before its children (per-key order crosses the boundary).
-* Closed shards are finite — process to exhaustion, then release to children. Open shards are long-polled.
-* `ExpiredIteratorException` (15 min idle): re-acquire from the last checkpoint.
-* **`TrimmedDataAccessException`** (checkpoint older than the 24 h trim horizon): records were irrecoverably lost from the stream. Page, restart at `TRIM_HORIZON`, trigger the unit's reconciler (§10.4) — the reconciler is the repair; the page exists because being ~24 h behind deserves a human question.
+- Parent-child lineage: a parent shard must be fully processed before its children (per-key order crosses the boundary).
+- Closed shards are finite — process to exhaustion, then release to children. Open shards are long-polled.
+- `ExpiredIteratorException` (15 min idle): re-acquire from the last checkpoint.
+- **`TrimmedDataAccessException`** (checkpoint older than the 24 h trim horizon): records were irrecoverably lost from the stream. Page, restart at `TRIM_HORIZON`, trigger the unit's reconciler (§10.4) — the reconciler is the repair; the page exists because being ~24 h behind deserves a human question.
 
 ### 8.2 Discovery
 
@@ -292,12 +292,12 @@ Disabling/re-enabling streams creates a **new stream ARN**; old checkpoints are 
 
 The key property: **infrastructure failure produces backpressure, never skips.**
 
-| Class | Examples | Handling |
-|---|---|---|
-| **Retryable** | network error, Postgres down/failover, serialization failure | Retry the *same record* with capped exponential backoff, indefinitely. The shard loop blocks; records buffer in the stream (that is what 24 h retention is for). Never skip, never DLQ, never checkpoint past. |
-| **Resolvable** | `ErrAlreadyExists` on replayed create | Read-back, convert to update, retry — deterministic (§4.2). |
-| **Poison** | mapper cannot parse the item; mapped object outside the unit's MC (§2.1) | Dead-letter + page + skip. Deterministic failures are bugs — the reconciler hits the same mapper on the same item, so a human must act. |
-| **Fatal (unit)** | `ErrFenceViolation`, failed checkpoint fence, lost lease, any `ErrConflict` (§4.2) | Tear down the unit (§6.4); the next claimant resumes from the fenced checkpoint. |
+| Class            | Examples                                                                           | Handling                                                                                                                                                                                                       |
+| ---------------- | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Retryable**    | network error, Postgres down/failover, serialization failure                       | Retry the _same record_ with capped exponential backoff, indefinitely. The shard loop blocks; records buffer in the stream (that is what 24 h retention is for). Never skip, never DLQ, never checkpoint past. |
+| **Resolvable**   | `ErrAlreadyExists` on replayed create                                              | Read-back, convert to update, retry — deterministic (§4.2).                                                                                                                                                    |
+| **Poison**       | mapper cannot parse the item; mapped object outside the unit's MC (§2.1)           | Dead-letter + page + skip. Deterministic failures are bugs — the reconciler hits the same mapper on the same item, so a human must act.                                                                        |
+| **Fatal (unit)** | `ErrFenceViolation`, failed checkpoint fence, lost lease, any `ErrConflict` (§4.2) | Tear down the unit (§6.4); the next claimant resumes from the fenced checkpoint.                                                                                                                               |
 
 ### 9.1 Unit shard loop (pseudocode)
 
@@ -370,35 +370,35 @@ Both paths write states read from the read-desires table and are idempotent towa
 
 ## 12. Failure Modes — every row ends in self-repair
 
-| Failure | Impact | Detection | Recovery |
-|---|---|---|---|
-| Replica crash | its units pause; records buffer in streams | lease expiry | peer claims each unit ≤ TTL + claim cycle (~40 s); replay mostly suppressed (§4.4) |
-| One unit hangs (stuck call, deadlock) | one MC pauses | stale heartbeat (§1.2) | excluded from renewal → lease expires → peer adopts; other units unaffected |
-| Whole replica wedges | its units pause | liveness probe (same heartbeats) | pod restart; peer adopts meanwhile |
-| Postgres down / RDS failover (~2 min) | all units block on retryable errors | write/renewal errors | backpressure — nothing skipped (§9); resume, or leases expire and are re-claimed post-recovery |
-| Postgres outage > lease TTL | all leases expire | `ErrNotHolder` on renewal | units torn down; claim cycle redistributes once Postgres returns |
-| Zombie unit writes or checkpoints | — (prevented) | write fence / checkpoint fence (§5.2) | successor's position never corrupted |
-| Applier rewrites status every poll | high stream volume, no real changes | suppressed-write ratio metric (§14) | no-op suppression absorbs it: zero seq consumption, zero watch events (§4.3) |
-| Stream lags / hangs | one MC's staleness grows | iterator-age alarm | catch-up on recovery; reconciler bounds staleness at `P` |
-| Records trimmed (>24 h behind) | stream-side loss, one MC | `TrimmedDataAccessException` → page | `TRIM_HORIZON` + reconciler pass repairs from the table |
-| Stream disabled/re-enabled (new ARN) | gap during disabled window | registry rotation / missing checkpoint → alarm | reconciler pass covers the gap (§8.4) |
-| Poison record | one desire unprocessed | DLQ + page | human fixes mapper; reconciler then repairs |
-| Registry drift | new MC unserved / dead MC claimed | claim-cycle diff (§14) | claim cycle converges ≤ 60 s + jitter |
+| Failure                               | Impact                                     | Detection                                      | Recovery                                                                                       |
+| ------------------------------------- | ------------------------------------------ | ---------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Replica crash                         | its units pause; records buffer in streams | lease expiry                                   | peer claims each unit ≤ TTL + claim cycle (~40 s); replay mostly suppressed (§4.4)             |
+| One unit hangs (stuck call, deadlock) | one MC pauses                              | stale heartbeat (§1.2)                         | excluded from renewal → lease expires → peer adopts; other units unaffected                    |
+| Whole replica wedges                  | its units pause                            | liveness probe (same heartbeats)               | pod restart; peer adopts meanwhile                                                             |
+| Postgres down / RDS failover (~2 min) | all units block on retryable errors        | write/renewal errors                           | backpressure — nothing skipped (§9); resume, or leases expire and are re-claimed post-recovery |
+| Postgres outage > lease TTL           | all leases expire                          | `ErrNotHolder` on renewal                      | units torn down; claim cycle redistributes once Postgres returns                               |
+| Zombie unit writes or checkpoints     | — (prevented)                              | write fence / checkpoint fence (§5.2)          | successor's position never corrupted                                                           |
+| Applier rewrites status every poll    | high stream volume, no real changes        | suppressed-write ratio metric (§14)            | no-op suppression absorbs it: zero seq consumption, zero watch events (§4.3)                   |
+| Stream lags / hangs                   | one MC's staleness grows                   | iterator-age alarm                             | catch-up on recovery; reconciler bounds staleness at `P`                                       |
+| Records trimmed (>24 h behind)        | stream-side loss, one MC                   | `TrimmedDataAccessException` → page            | `TRIM_HORIZON` + reconciler pass repairs from the table                                        |
+| Stream disabled/re-enabled (new ARN)  | gap during disabled window                 | registry rotation / missing checkpoint → alarm | reconciler pass covers the gap (§8.4)                                                          |
+| Poison record                         | one desire unprocessed                     | DLQ + page                                     | human fixes mapper; reconciler then repairs                                                    |
+| Registry drift                        | new MC unserved / dead MC claimed          | claim-cycle diff (§14)                         | claim cycle converges ≤ 60 s + jitter                                                          |
 
 ---
 
 ## 13. Correctness Analysis
 
-| Invariant | How the bridge preserves it |
-|-----------|------------------------------|
-| **I1 — Gapless issuance** | All writes go through the counter-in-transaction. Suppressed no-ops consume no sequence number by construction (§4.3 check precedes the increment); aborts leave no gap. |
-| **I2 — Commit order = sequence order** | Counter's exclusive row lock, unchanged. |
-| **I3 — No regression** | Sync Multi-AZ + writer tripwire, inherited. `mc_index` non-reuse (§3.3) prevents reviving a retired bucket's history. |
-| **I4 — Single writer** | The bridge holds **both** domains per MC bucket (§4.1); every write and every checkpoint is `FOR SHARE`-fenced (§5.2). Claim = lease, so assignment and fencing cannot disagree. |
-| **I5 — Exactly-once delivery** | Watch path untouched. Replays are suppressed or re-applied states, never protocol violations (§4.4). No-op suppression removes spurious events rather than real ones — a state change always produces exactly one event. |
-| **I6 — RV monotonicity** | Timeline epochs unchanged; bucket growth is additive (§3.4), entering RVs via scoped List merge, never an epoch event. |
-| **I7 — Compaction safety** | Unchanged; replayed `REMOVE` on a compacted row is an idempotent no-op (§4.2). |
-| **I8 — Optimistic concurrency** | Sole writer: `ExpectedVersion` from read-back is always current; any `ErrConflict` is a fencing-bug page, not a retry loop (§4.2). No-op semantics (content-equal ⇒ success regardless of version) is level-based idempotence, not a lost update — there is no update to lose. |
+| Invariant                              | How the bridge preserves it                                                                                                                                                                                                                                                    |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **I1 — Gapless issuance**              | All writes go through the counter-in-transaction. Suppressed no-ops consume no sequence number by construction (§4.3 check precedes the increment); aborts leave no gap.                                                                                                       |
+| **I2 — Commit order = sequence order** | Counter's exclusive row lock, unchanged.                                                                                                                                                                                                                                       |
+| **I3 — No regression**                 | Sync Multi-AZ + writer tripwire, inherited. `mc_index` non-reuse (§3.3) prevents reviving a retired bucket's history.                                                                                                                                                          |
+| **I4 — Single writer**                 | The bridge holds **both** domains per MC bucket (§4.1); every write and every checkpoint is `FOR SHARE`-fenced (§5.2). Claim = lease, so assignment and fencing cannot disagree.                                                                                               |
+| **I5 — Exactly-once delivery**         | Watch path untouched. Replays are suppressed or re-applied states, never protocol violations (§4.4). No-op suppression removes spurious events rather than real ones — a state change always produces exactly one event.                                                       |
+| **I6 — RV monotonicity**               | Timeline epochs unchanged; bucket growth is additive (§3.4), entering RVs via scoped List merge, never an epoch event.                                                                                                                                                         |
+| **I7 — Compaction safety**             | Unchanged; replayed `REMOVE` on a compacted row is an idempotent no-op (§4.2).                                                                                                                                                                                                 |
+| **I8 — Optimistic concurrency**        | Sole writer: `ExpectedVersion` from read-back is always current; any `ErrConflict` is a fencing-bug page, not a retry loop (§4.2). No-op semantics (content-equal ⇒ success regardless of version) is level-based idempotence, not a lost update — there is no update to lose. |
 
 ### 13.1 Bridge invariant
 
@@ -406,18 +406,18 @@ Both paths write states read from the read-desires table and are idempotent towa
 
 ### 13.2 Ordering semantics
 
-Per key: applier write order = stream order (within lineage) = Postgres commit order on the fast path. Replays and repairs can transiently interleave older observed states (§4.4), always converging. Across keys and across MCs: Postgres sequence order is processing order — a valid total order (I2); no invariant requires mirroring DynamoDB's cross-key timing. **End-to-end freshness caveat:** an observed status is as old as the applier's last sync of that ReadDesire (~3 min poll cadence) *plus* bridge latency (~1 s). The bridge cannot make observations fresher than the applier produces them.
+Per key: applier write order = stream order (within lineage) = Postgres commit order on the fast path. Replays and repairs can transiently interleave older observed states (§4.4), always converging. Across keys and across MCs: Postgres sequence order is processing order — a valid total order (I2); no invariant requires mirroring DynamoDB's cross-key timing. **End-to-end freshness caveat:** an observed status is as old as the applier's last sync of that ReadDesire (~3 min poll cadence) _plus_ bridge latency (~1 s). The bridge cannot make observations fresher than the applier produces them.
 
 ---
 
 ## 14. Monitoring (requirements)
 
-* **Iterator age** per (unit, shard) — primary "stream lagging/hung" signal. Alert > 5 min.
-* **Heartbeat age** per unit loop — the renewal gate acts on it; the alert explains it.
-* **Checkpoint lag** per (stream, shard).
-* **Reconciler per unit:** last completed generation age (alert > 2 P); **repairs per pass** (sustained nonzero = the stream path is leaking); deletion-pass tombstones.
-* **Suppressed-write ratio** — high is expected (applier poll refreshes); a sudden *drop* means the mapper went nondeterministic or the applier changed behavior.
-* Units per replica; unclaimed active MCs (alert > 2 claim cycles); lease renewal failures; DLQ depth; any `ErrConflict` (pages — fencing bug, §4.2).
+- **Iterator age** per (unit, shard) — primary "stream lagging/hung" signal. Alert > 5 min.
+- **Heartbeat age** per unit loop — the renewal gate acts on it; the alert explains it.
+- **Checkpoint lag** per (stream, shard).
+- **Reconciler per unit:** last completed generation age (alert > 2 P); **repairs per pass** (sustained nonzero = the stream path is leaking); deletion-pass tombstones.
+- **Suppressed-write ratio** — high is expected (applier poll refreshes); a sudden _drop_ means the mapper went nondeterministic or the applier changed behavior.
+- Units per replica; unclaimed active MCs (alert > 2 claim cycles); lease renewal failures; DLQ depth; any `ErrConflict` (pages — fencing bug, §4.2).
 
 ---
 
@@ -425,10 +425,10 @@ Per key: applier write order = stream order (within lineage) = Postgres commit o
 
 ### 15.1 Load budget
 
-| Tier | MCs | Observed objects | Real change rate | Per-MC bucket | Bucket ceiling |
-|------|-----|------------------|------------------|---------------|----------------|
-| 5k HostedClusters | 50 | ~30k | ~187/s fleet | ~4 writes/s | ~317/s |
-| 50k HostedClusters | 500 | ~300k | ~1,870/s fleet | ~4 writes/s | ~317/s |
+| Tier               | MCs | Observed objects | Real change rate | Per-MC bucket | Bucket ceiling |
+| ------------------ | --- | ---------------- | ---------------- | ------------- | -------------- |
+| 5k HostedClusters  | 50  | ~30k             | ~187/s fleet     | ~4 writes/s   | ~317/s         |
+| 50k HostedClusters | 500 | ~300k            | ~1,870/s fleet   | ~4 writes/s   | ~317/s         |
 
 Per-bucket load is constant as the fleet grows (scaling adds MCs). **Stream-side volume may far exceed write volume** if the applier rewrites status each poll — up to ~1,600 records/s fleet-wide — but suppressed records cost one PK read each and no writes; `GetRecords` at 1,000 records/call absorbs it. Either single replica can carry the whole fleet: ~500 streams × 1–4 shards is a few hundred long-poll goroutines and ≤ ~2,000 records/s of mostly-suppressed processing.
 
@@ -442,7 +442,7 @@ Applier observation cadence (~3 min poll) **dominates**. Bridge adds: stream pro
 
 ### 15.4 Postgres connections per replica
 
-Shared pgx pool (~4–8 conns) for all units' writes and reconcilers · 1 conn for leases/claims/checkpoints. Two replicas ≈ ~20 connections total. The bridge uses `writer.Writer` directly (long-lived conns, explicit retry control); `crbridge` is shaped for reconcilers, not CDC.
+Shared pgx pool (~4–8 conns) for all units' writes and reconcilers · 1 conn for leases/claims/checkpoints. Two replicas ≈ ~20 connections total. The bridge uses `writer.Writer` directly (long-lived conns, explicit retry control); `pgruntime` is shaped for reconcilers, not CDC.
 
 ---
 
@@ -451,9 +451,9 @@ Shared pgx pool (~4–8 conns) for all units' writes and reconcilers · 1 conn f
 1. **No-op write suppression** (§4.3) in `Write()`/`WriteStatus()` — content-equal writes consume no sequence number, no `object_version` bump, no doorbell, no watch event; returns `Changed: false`. General library behavior (opt-out flag), not bridge-specific. Needs tests: suppressed write leaves counter untouched; suppression under the fence; interleaving with a real change still orders correctly.
 2. **`stream_checkpoints` table** (§5.1) + fenced checkpoint helper (§5.2, two-row `FOR SHARE`).
 3. **`mc_registry` table** (§3.3) + reserved bucket_id ranges (`MC_BASE = 4096`, fixed schemes `0–4095`) (§3.2).
-4. **Dynamic bucket sets for fleet-wide watchers** (§3.4). `reader.Watcher` fixes its bucket set at construction; it cannot add a bucket mid-stream. Either (a) registry-driven bucket addition in `Watcher`/`crbridge.ListerWatcher`, or (b) accept a fleet-wide-watcher restart per MC onboarding — viable at low onboarding cadence, but must be a stated decision.
+4. **Dynamic bucket sets for fleet-wide watchers** (§3.4). `reader.Watcher` fixes its bucket set at construction; it cannot add a bucket mid-stream. Either (a) registry-driven bucket addition in `Watcher`/`pgruntime.ListerWatcher`, or (b) accept a fleet-wide-watcher restart per MC onboarding — viable at low onboarding cadence, but must be a stated decision.
 
-Deleted relative to v3: `WriteSpec` (no split ownership), tombstone-inclusive list (no version cache to seed).
+Deleted relative to v3 (bridge requirements): `WriteSpec` and tombstone-inclusive list are no longer bridge requirements (no split ownership, no version cache). Note: `WriteSpec` now exists in the storage layer for the controller-runtime bridge (pgruntime); `reader.List` excludes fully-deleted tombstones but includes dying objects with finalizers. The DynamoDB bridge uses `Write()` exclusively since it holds sole ownership of both domains.
 
 ---
 
@@ -461,15 +461,15 @@ Deleted relative to v3: `WriteSpec` (no split ownership), tombstone-inclusive li
 
 Same discipline as DESIGN.md §5: name the invariant, force the interleaving.
 
-* **RB1 — Zombie checkpoint (I4/I9).** Unit A pauses (hook) inside the fenced checkpoint txn after `FOR SHARE`; a rival claims A's bucket — the grant must block; after A completes, A's next checkpoint must fail the fence. Both orderings.
-* **RB2 — Postgres outage mid-batch (I9).** Toxiproxy severs Postgres mid-batch. Assert: zero dead-letters, zero checkpoint advance, shard blocked; on heal, every record lands exactly once by content.
-* **RB3 — Crash-replay convergence (§4.4).** Kill the replica after N of M records; peer adopts. Assert final state = state after M; replayed content-equal records produce **zero** new sequence numbers (suppression); the transient window contains only states from the original sequence.
-* **RB4 — No-op suppression under the fence (I1/I5).** Write identical content twice; assert the second consumes no sequence number, emits no event, and `object_version` is unchanged. Then interleave a real change between two no-ops (hook) and assert exactly one event, correctly ordered.
-* **RB5 — Reconciler vs. stream interleave (I9).** Deliver a stale buffered stream record after a reconciler repair of the same key. Assert convergence to the table's observed content.
-* **RB6 — Deletion-pass guard (I9).** Create a ReadDesire after the scan passed; run the deletion pass. Assert the consistent `GetItem` re-check drops the tombstone candidate.
-* **RB7 — Hang takeover (liveness).** Wedge one unit's shard goroutine (hook blocks past deadline handling). Assert: excluded from renewal within 2× interval; lease expires; the peer adopts from the checkpoint; no gap, no dual-writer commit; the wedged replica's other units keep processing throughout.
-* **RB8 — Claim race (I4).** Both replicas race `AcquireBoth` on the same expired MC. Assert exactly one wins and the loser's write and checkpoint attempts are fenced. Repeat under rapid expiry cycling.
-* **RB9 — Additive bucket growth (I6).** Onboard an MC while a fleet-wide watcher is mid-stream. Assert the watcher merges the new bucket via scoped List — no epoch bump, no 410, no missed or duplicated events on existing buckets.
+- **RB1 — Zombie checkpoint (I4/I9).** Unit A pauses (hook) inside the fenced checkpoint txn after `FOR SHARE`; a rival claims A's bucket — the grant must block; after A completes, A's next checkpoint must fail the fence. Both orderings.
+- **RB2 — Postgres outage mid-batch (I9).** Toxiproxy severs Postgres mid-batch. Assert: zero dead-letters, zero checkpoint advance, shard blocked; on heal, every record lands exactly once by content.
+- **RB3 — Crash-replay convergence (§4.4).** Kill the replica after N of M records; peer adopts. Assert final state = state after M; replayed content-equal records produce **zero** new sequence numbers (suppression); the transient window contains only states from the original sequence.
+- **RB4 — No-op suppression under the fence (I1/I5).** Write identical content twice; assert the second consumes no sequence number, emits no event, and `object_version` is unchanged. Then interleave a real change between two no-ops (hook) and assert exactly one event, correctly ordered.
+- **RB5 — Reconciler vs. stream interleave (I9).** Deliver a stale buffered stream record after a reconciler repair of the same key. Assert convergence to the table's observed content.
+- **RB6 — Deletion-pass guard (I9).** Create a ReadDesire after the scan passed; run the deletion pass. Assert the consistent `GetItem` re-check drops the tombstone candidate.
+- **RB7 — Hang takeover (liveness).** Wedge one unit's shard goroutine (hook blocks past deadline handling). Assert: excluded from renewal within 2× interval; lease expires; the peer adopts from the checkpoint; no gap, no dual-writer commit; the wedged replica's other units keep processing throughout.
+- **RB8 — Claim race (I4).** Both replicas race `AcquireBoth` on the same expired MC. Assert exactly one wins and the loser's write and checkpoint attempts are fenced. Repeat under rapid expiry cycling.
+- **RB9 — Additive bucket growth (I6).** Onboard an MC while a fleet-wide watcher is mid-stream. Assert the watcher merges the new bucket via scoped List — no epoch bump, no 410, no missed or duplicated events on existing buckets.
 
 ---
 

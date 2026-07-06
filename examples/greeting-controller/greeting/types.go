@@ -1,12 +1,10 @@
-package main
+package greeting
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	k8sscheme "k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	runtimescheme "sigs.k8s.io/controller-runtime/pkg/scheme"
 )
 
@@ -15,16 +13,14 @@ var (
 
 	SchemeBuilder = &runtimescheme.Builder{GroupVersion: GroupVersion}
 
-	scheme = runtime.NewScheme()
+	Scheme = runtime.NewScheme()
 )
 
 func init() {
-	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-
 	SchemeBuilder.Register(&Greeting{}, &GreetingList{})
 	SchemeBuilder.Register(&GreetingCard{}, &GreetingCardList{})
 	SchemeBuilder.Register(&GreetingPolicy{}, &GreetingPolicyList{})
-	utilruntime.Must(SchemeBuilder.AddToScheme(scheme))
+	utilruntime.Must(SchemeBuilder.AddToScheme(Scheme))
 }
 
 // --- Greeting ---
@@ -84,8 +80,8 @@ func (in *GreetingList) DeepCopyInto(out *GreetingList) {
 	}
 }
 
-func (in *Greeting) GetObjectKind() k8sscheme.ObjectKind { return &in.TypeMeta }
-func (in *GreetingList) GetObjectKind() k8sscheme.ObjectKind { return &in.TypeMeta }
+func (in *Greeting) GetObjectKind() schema.ObjectKind     { return &in.TypeMeta }
+func (in *GreetingList) GetObjectKind() schema.ObjectKind { return &in.TypeMeta }
 
 // --- GreetingCard ---
 
@@ -137,8 +133,8 @@ func (in *GreetingCardList) DeepCopyInto(out *GreetingCardList) {
 	}
 }
 
-func (in *GreetingCard) GetObjectKind() k8sscheme.ObjectKind     { return &in.TypeMeta }
-func (in *GreetingCardList) GetObjectKind() k8sscheme.ObjectKind { return &in.TypeMeta }
+func (in *GreetingCard) GetObjectKind() schema.ObjectKind     { return &in.TypeMeta }
+func (in *GreetingCardList) GetObjectKind() schema.ObjectKind { return &in.TypeMeta }
 
 // --- GreetingPolicy ---
 
@@ -189,5 +185,5 @@ func (in *GreetingPolicyList) DeepCopyInto(out *GreetingPolicyList) {
 	}
 }
 
-func (in *GreetingPolicy) GetObjectKind() k8sscheme.ObjectKind     { return &in.TypeMeta }
-func (in *GreetingPolicyList) GetObjectKind() k8sscheme.ObjectKind { return &in.TypeMeta }
+func (in *GreetingPolicy) GetObjectKind() schema.ObjectKind     { return &in.TypeMeta }
+func (in *GreetingPolicyList) GetObjectKind() schema.ObjectKind { return &in.TypeMeta }

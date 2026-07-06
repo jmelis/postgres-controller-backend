@@ -322,6 +322,96 @@ func TestSequentialWritesAreGapless(t *testing.T) {
 	}
 }
 
+func TestCreateRevivesTombstone(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres")
+	}
+
+	db := testinfra.StartPostgres(t)
+	w, epoch := setupLeaseAndWriter(t, db)
+	ctx := context.Background()
+
+	// Create → tombstone → re-create with same name
+	req := makeReq(epoch)
+	result1, err := w.Write(ctx, req)
+	require.NoError(t, err)
+
+	past := time.Now().Add(-10 * time.Minute)
+	req.ExpectedVersion = result1.ObjectVersion
+	req.DeletionTimestamp = &past
+	req.Metadata = json.RawMessage(`{}`)
+	_, err = w.Write(ctx, req)
+	require.NoError(t, err)
+
+	// Re-create: same (gvk, ns, name), ExpectedVersion=0
+	req2 := makeReq(epoch)
+	req2.Spec = json.RawMessage(`{"replicas":5}`)
+	result2, err := w.Write(ctx, req2)
+	require.NoError(t, err)
+
+	assert.NotEqual(t, result1.UID, result2.UID, "revived resource must get a new UID")
+	assert.Equal(t, int64(1), result2.ObjectVersion, "revived resource starts at version 1")
+
+	// Verify deletion_timestamp is cleared
+	verifyConn := db.Connect(t)
+	var delTS *time.Time
+	err = verifyConn.QueryRow(ctx,
+		`SELECT deletion_timestamp FROM kubernetes_resources WHERE gvk = $1 AND namespace = $2 AND name = $3`,
+		req2.GVK, req2.Namespace, req2.Name).Scan(&delTS)
+	require.NoError(t, err)
+	assert.Nil(t, delTS)
+}
+
+func TestCreateBlockedByDyingObject(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres")
+	}
+
+	db := testinfra.StartPostgres(t)
+	w, epoch := setupLeaseAndWriter(t, db)
+	ctx := context.Background()
+
+	// Create with finalizer
+	req := makeReq(epoch)
+	req.Metadata = json.RawMessage(`{"finalizers":["cleanup.example.com"]}`)
+	result1, err := w.Write(ctx, req)
+	require.NoError(t, err)
+
+	// Set deletion_timestamp but keep finalizers (dying, not tombstone)
+	past := time.Now().Add(-10 * time.Minute)
+	req.ExpectedVersion = result1.ObjectVersion
+	req.DeletionTimestamp = &past
+	_, err = w.Write(ctx, req)
+	require.NoError(t, err)
+
+	// Try to create again — must fail because object is dying, not fully deleted
+	req2 := makeReq(epoch)
+	_, err = w.Write(ctx, req2)
+	assert.ErrorIs(t, err, writer.ErrAlreadyExists)
+}
+
+func TestCreateBlockedByLiveObject(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres")
+	}
+
+	db := testinfra.StartPostgres(t)
+	w, epoch := setupLeaseAndWriter(t, db)
+	ctx := context.Background()
+
+	req := makeReq(epoch)
+	_, err := w.Write(ctx, req)
+	require.NoError(t, err)
+
+	// Try to create again with different content — suppression check won't
+	// fire, so the INSERT hits unique_violation, revival sees a live row,
+	// and AlreadyExists is returned.
+	req2 := makeReq(epoch)
+	req2.Spec = json.RawMessage(`{"replicas":99}`)
+	_, err = w.Write(ctx, req2)
+	assert.ErrorIs(t, err, writer.ErrAlreadyExists)
+}
+
 func TestExpiredUnStolenLeaseRejectsWrite(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires postgres")

@@ -1,0 +1,324 @@
+package pgruntime
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-logr/logr"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jmelis/postgres-controller-backend/internal/lease"
+	pgschema "github.com/jmelis/postgres-controller-backend/internal/schema"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/config"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/conversion"
+)
+
+// Options configures a postgres-backed controller-runtime Manager.
+type Options struct {
+	Scheme             *runtime.Scheme
+	DSN                string
+	HolderID           string
+	BucketIDs          []int
+	BucketAssigner     func(ns, name string) int
+	LeaseTTL           time.Duration
+	LeaseRenewInterval time.Duration
+	Logger             logr.Logger
+	MaxPoolConns       int32
+	MinPoolConns       int32
+}
+
+// NewManager creates a controller-runtime Manager backed by PostgreSQL.
+// It connects to the database, runs schema migrations, and acquires leases.
+func NewManager(opts Options) (manager.Manager, error) {
+	if opts.Scheme == nil {
+		return nil, fmt.Errorf("pgruntime: Scheme is required")
+	}
+	if opts.DSN == "" {
+		return nil, fmt.Errorf("pgruntime: DSN is required")
+	}
+	if opts.HolderID == "" {
+		opts.HolderID = "pgruntime"
+	}
+	if len(opts.BucketIDs) == 0 {
+		opts.BucketIDs = []int{0}
+	}
+	if opts.BucketAssigner == nil {
+		opts.BucketAssigner = func(_, _ string) int { return opts.BucketIDs[0] }
+	}
+	if opts.LeaseTTL == 0 {
+		opts.LeaseTTL = 60 * time.Second
+	}
+	if opts.LeaseRenewInterval == 0 {
+		opts.LeaseRenewInterval = 10 * time.Second
+	}
+	if opts.Logger.GetSink() == nil {
+		opts.Logger = logr.Discard()
+	}
+
+	ctx := context.Background()
+
+	pool, err := createPool(ctx, opts)
+	if err != nil {
+		return nil, fmt.Errorf("pgruntime: create connection pool: %w", err)
+	}
+
+	migrationConn, err := pool.Acquire(ctx)
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("pgruntime: acquire conn for migration: %w", err)
+	}
+	if err := pgschema.Migrate(ctx, migrationConn.Conn()); err != nil {
+		migrationConn.Release()
+		pool.Close()
+		return nil, fmt.Errorf("pgruntime: schema migration: %w", err)
+	}
+	migrationConn.Release()
+
+	leasePoolConn, err := pool.Acquire(ctx)
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("pgruntime: acquire conn for leases: %w", err)
+	}
+	leaseConn := leasePoolConn.Hijack()
+
+	leaseMgr := lease.NewBothManager(leaseConn, opts.HolderID)
+	leases := make(map[int]leaseState, len(opts.BucketIDs))
+	for _, bid := range opts.BucketIDs {
+		epochs, err := leaseMgr.AcquireBoth(ctx, bid, opts.LeaseTTL)
+		if err != nil {
+			leaseConn.Close(ctx)
+			pool.Close()
+			return nil, fmt.Errorf("pgruntime: acquire lease for bucket %d: %w", bid, err)
+		}
+		leases[bid] = leaseState{specEpoch: epochs.Spec, statusEpoch: epochs.Status}
+	}
+
+	restMapper := buildRESTMapper(opts.Scheme)
+
+	pgclient := &pgClient{
+		scheme:     opts.Scheme,
+		pool:       pool,
+		assign:     opts.BucketAssigner,
+		holderID:   opts.HolderID,
+		leases:     leases,
+		restMapper: restMapper,
+	}
+
+	pgcache := &pgCache{
+		scheme:    opts.Scheme,
+		pool:      pool,
+		bucketIDs: opts.BucketIDs,
+		restMapper: restMapper,
+		logger:    opts.Logger.WithName("cache"),
+		informers: make(map[schema.GroupVersionKind]*pgInformer),
+	}
+
+	elected := make(chan struct{})
+	close(elected)
+
+	return &pgManager{
+		scheme:     opts.Scheme,
+		client:     pgclient,
+		cache:      pgcache,
+		restMapper: restMapper,
+		logger:     opts.Logger,
+		opts:       opts,
+
+		pool:      pool,
+		leaseConn: leaseConn,
+		leaseMgr:    leaseMgr,
+		elected:     elected,
+	}, nil
+}
+
+type pgManager struct {
+	scheme     *runtime.Scheme
+	client     *pgClient
+	cache      *pgCache
+	restMapper meta.RESTMapper
+	logger     logr.Logger
+	opts       Options
+
+	pool      *pgxpool.Pool
+	leaseConn *pgx.Conn
+	leaseMgr  *lease.BothManager
+	elected     chan struct{}
+
+	mu        sync.Mutex
+	runnables []manager.Runnable
+}
+
+// --- cluster.Cluster ---
+
+func (m *pgManager) GetHTTPClient() *http.Client          { return nil }
+func (m *pgManager) GetConfig() *rest.Config               { return nil }
+func (m *pgManager) GetCache() cache.Cache                 { return m.cache }
+func (m *pgManager) GetScheme() *runtime.Scheme            { return m.scheme }
+func (m *pgManager) GetClient() client.Client              { return m.client }
+func (m *pgManager) GetFieldIndexer() client.FieldIndexer  { return m.cache }
+func (m *pgManager) GetRESTMapper() meta.RESTMapper        { return m.restMapper }
+func (m *pgManager) GetAPIReader() client.Reader            { return m.client }
+func (m *pgManager) GetEventRecorderFor(name string) record.EventRecorder {
+	return &noopEventRecorder{}
+}
+
+// GetEventRecorder is a no-op; postgres backend has no event infrastructure.
+func (m *pgManager) GetEventRecorder(name string) events.EventRecorder {
+	return &noopEventsRecorder{}
+}
+
+// --- manager.Manager ---
+
+func (m *pgManager) Add(runnable manager.Runnable) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.runnables = append(m.runnables, runnable)
+	return nil
+}
+
+func (m *pgManager) Elected() <-chan struct{} { return m.elected }
+
+func (m *pgManager) AddMetricsServerExtraHandler(path string, handler http.Handler) error {
+	return nil
+}
+
+func (m *pgManager) AddHealthzCheck(name string, check healthz.Checker) error {
+	return nil
+}
+
+func (m *pgManager) AddReadyzCheck(name string, check healthz.Checker) error {
+	return nil
+}
+
+func (m *pgManager) Start(ctx context.Context) error {
+	m.logger.Info("starting pgruntime manager")
+
+	go m.renewLeases(ctx)
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := m.cache.Start(ctx); err != nil {
+			m.logger.Error(err, "cache start failed")
+		}
+	}()
+
+	if !m.cache.WaitForCacheSync(ctx) {
+		return fmt.Errorf("pgruntime: cache sync failed")
+	}
+	m.logger.Info("cache synced")
+
+	m.mu.Lock()
+	runnables := make([]manager.Runnable, len(m.runnables))
+	copy(runnables, m.runnables)
+	m.mu.Unlock()
+
+	for _, r := range runnables {
+		wg.Add(1)
+		go func(r manager.Runnable) {
+			defer wg.Done()
+			if err := r.Start(ctx); err != nil {
+				m.logger.Error(err, "runnable exited with error")
+			}
+		}(r)
+	}
+
+	<-ctx.Done()
+	m.logger.Info("shutting down pgruntime manager")
+	m.leaseConn.Close(context.Background())
+	wg.Wait()
+	m.pool.Close()
+	return nil
+}
+
+func (m *pgManager) GetWebhookServer() webhook.Server {
+	panic("pgruntime: webhooks not supported")
+}
+
+func (m *pgManager) GetLogger() logr.Logger { return m.logger }
+
+func (m *pgManager) GetControllerOptions() config.Controller {
+	return config.Controller{}
+}
+
+// GetConverterRegistry is a stub; CRD conversion webhooks are not supported.
+func (m *pgManager) GetConverterRegistry() conversion.Registry {
+	return conversion.NewRegistry()
+}
+
+func (m *pgManager) renewLeases(ctx context.Context) {
+	ticker := time.NewTicker(m.opts.LeaseRenewInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, bid := range m.opts.BucketIDs {
+				if err := m.leaseMgr.RenewBoth(ctx, bid, m.opts.LeaseTTL); err != nil {
+					m.logger.Error(err, "lease renewal failed", "bucket", bid)
+				}
+			}
+		}
+	}
+}
+
+func buildRESTMapper(s *runtime.Scheme) meta.RESTMapper {
+	mapper := meta.NewDefaultRESTMapper(s.PrioritizedVersionsAllGroups())
+	for gvk := range s.AllKnownTypes() {
+		if strings.HasSuffix(gvk.Kind, "List") || gvk.Kind == "" {
+			continue
+		}
+		mapper.Add(gvk, meta.RESTScopeNamespace)
+	}
+	return mapper
+}
+
+type noopEventRecorder struct{}
+
+func (r *noopEventRecorder) Event(object runtime.Object, eventtype, reason, message string) {}
+func (r *noopEventRecorder) Eventf(object runtime.Object, eventtype, reason, messageFmt string, args ...interface{}) {
+}
+func (r *noopEventRecorder) AnnotatedEventf(object runtime.Object, annotations map[string]string, eventtype, reason, messageFmt string, args ...interface{}) {
+}
+
+type noopEventsRecorder struct{}
+
+func (r *noopEventsRecorder) Eventf(regarding runtime.Object, related runtime.Object, eventtype, reason, action, note string, args ...interface{}) {
+}
+
+func createPool(ctx context.Context, opts Options) (*pgxpool.Pool, error) {
+	if opts.MaxPoolConns > 0 || opts.MinPoolConns > 0 {
+		config, err := pgxpool.ParseConfig(opts.DSN)
+		if err != nil {
+			return nil, fmt.Errorf("parse DSN: %w", err)
+		}
+		if opts.MaxPoolConns > 0 {
+			config.MaxConns = opts.MaxPoolConns
+		}
+		if opts.MinPoolConns > 0 {
+			config.MinConns = opts.MinPoolConns
+		}
+		return pgxpool.NewWithConfig(ctx, config)
+	}
+	return pgxpool.New(ctx, opts.DSN)
+}
+
+var _ manager.Manager = (*pgManager)(nil)

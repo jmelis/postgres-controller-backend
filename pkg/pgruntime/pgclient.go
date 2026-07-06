@@ -1,0 +1,566 @@
+package pgruntime
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jmelis/postgres-controller-backend/internal/model"
+	"github.com/jmelis/postgres-controller-backend/internal/reader"
+	"github.com/jmelis/postgres-controller-backend/internal/writer"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	apitypes "k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+type leaseState struct {
+	specEpoch   int64
+	statusEpoch int64
+}
+
+type pgClient struct {
+	scheme     *runtime.Scheme
+	pool       *pgxpool.Pool
+	assign     func(ns, name string) int
+	holderID   string
+	leases     map[int]leaseState
+	restMapper meta.RESTMapper
+}
+
+func (c *pgClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	gvk, err := resolveGVK(c.scheme, obj)
+	if err != nil {
+		return err
+	}
+	gvkStr := gvkToString(gvk)
+
+	poolConn, err := c.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer poolConn.Release()
+	conn := poolConn.Conn()
+
+	var r model.Resource
+	err = conn.QueryRow(ctx, `
+		SELECT gvk, namespace, name, uid, bucket_id, gvk_bucket_seq,
+		       object_version, spec, status, metadata,
+		       deletion_timestamp, created_at, updated_at
+		FROM kubernetes_resources
+		WHERE gvk = $1 AND namespace = $2 AND name = $3`,
+		gvkStr, key.Namespace, key.Name,
+	).Scan(
+		&r.GVK, &r.Namespace, &r.Name, &r.UID, &r.BucketID,
+		&r.GVKBucketSeq, &r.ObjectVersion, &r.Spec, &r.Status,
+		&r.Metadata, &r.DeletionTimestamp, &r.CreatedAt, &r.UpdatedAt,
+	)
+	if err != nil {
+		return mapGetError(err, gvk, key.Name)
+	}
+
+	if isFullyDeleted(r) {
+		return mapGetError(pgx.ErrNoRows, gvk, key.Name)
+	}
+
+	return populateObject(obj, r, gvk)
+}
+
+func (c *pgClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	listOpts := client.ListOptions{}
+	for _, o := range opts {
+		o.ApplyToList(&listOpts)
+	}
+
+	listGVK, err := resolveGVK(c.scheme, list)
+	if err != nil {
+		return err
+	}
+	itemGVK := itemGVKFromListGVK(listGVK)
+	gvkStr := gvkToString(itemGVK)
+
+	poolConn, err := c.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer poolConn.Release()
+	conn := poolConn.Conn()
+
+	result, err := reader.List(ctx, conn, gvkStr, c.bucketIDs())
+	if err != nil {
+		return err
+	}
+
+	var items []client.Object
+	for _, r := range result.Resources {
+		obj, err := resourceToObject(r, c.scheme)
+		if err != nil {
+			return err
+		}
+		if listOpts.Namespace != "" && obj.GetNamespace() != listOpts.Namespace {
+			continue
+		}
+		if listOpts.LabelSelector != nil && !listOpts.LabelSelector.Matches(labelSet(obj.GetLabels())) {
+			continue
+		}
+		items = append(items, obj)
+	}
+
+	if err := setListItems(list, items); err != nil {
+		return err
+	}
+
+	list.SetResourceVersion(result.ResourceVersion.String())
+	return nil
+}
+
+func (c *pgClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	gvk, err := resolveGVK(c.scheme, obj)
+	if err != nil {
+		return err
+	}
+	gvkStr := gvkToString(gvk)
+
+	obj.SetGeneration(1)
+
+	spec, status, err := extractSpecStatus(obj)
+	if err != nil {
+		return err
+	}
+	metadata, err := extractMetadata(obj)
+	if err != nil {
+		return err
+	}
+
+	ns, name := obj.GetNamespace(), obj.GetName()
+	bucketID := c.assign(ns, name)
+	ls := c.leaseForBucket(bucketID)
+
+	poolConn, err := c.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer poolConn.Release()
+	conn := poolConn.Conn()
+
+	w := writer.New(conn, nil)
+	result, err := w.Write(ctx, model.WriteRequest{
+		GVK:             gvkStr,
+		Namespace:       ns,
+		Name:            name,
+		BucketID:        bucketID,
+		Spec:            spec,
+		Status:          status,
+		Metadata:        metadata,
+		ExpectedVersion: 0,
+		LeaseHolder:     c.holderID,
+		LeaseEpoch:      ls.specEpoch,
+	})
+	if err != nil {
+		r, wErr := mapWriteError(ctx, w, err, gvk, name, 0)
+		if wErr != nil {
+			return wErr
+		}
+		if r != nil {
+			return populateObject(obj, *r, gvk)
+		}
+		return nil
+	}
+
+	obj.SetUID(uidFromUUID(result.UID))
+	obj.SetResourceVersion(strconv.FormatInt(result.ObjectVersion, 10))
+	obj.SetCreationTimestamp(metav1.Now())
+	obj.GetObjectKind().SetGroupVersionKind(gvk)
+	return nil
+}
+
+func (c *pgClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	gvk, err := resolveGVK(c.scheme, obj)
+	if err != nil {
+		return err
+	}
+	gvkStr := gvkToString(gvk)
+
+	expectedVersion, err := parseResourceVersion(obj)
+	if err != nil {
+		return fmt.Errorf("parse resource version: %w", err)
+	}
+
+	ns, name := obj.GetNamespace(), obj.GetName()
+	bucketID := c.assign(ns, name)
+	ls := c.leaseForBucket(bucketID)
+
+	poolConn, err := c.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer poolConn.Release()
+	conn := poolConn.Conn()
+
+	current, err := readCurrentResource(ctx, conn, gvkStr, ns, name)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		return apierrors.NewNotFound(groupResource(gvk), name)
+	}
+
+	newSpec, err := extractSpec(obj)
+	if err != nil {
+		return err
+	}
+
+	if !jsonEqual(current.Spec, newSpec) {
+		currentGen := currentGeneration(current.Metadata)
+		obj.SetGeneration(currentGen + 1)
+	}
+
+	metadata, err := extractMetadata(obj)
+	if err != nil {
+		return err
+	}
+
+	w := writer.New(conn, nil)
+	result, err := w.WriteSpec(ctx, model.SpecWriteRequest{
+		GVK:               gvkStr,
+		Namespace:          ns,
+		Name:               name,
+		BucketID:           bucketID,
+		Spec:               newSpec,
+		Metadata:           metadata,
+		DeletionTimestamp:  current.DeletionTimestamp,
+		ExpectedVersion:    expectedVersion,
+		LeaseHolder:        c.holderID,
+		LeaseEpoch:         ls.specEpoch,
+	})
+	if err != nil {
+		r, wErr := mapWriteError(ctx, w, err, gvk, name, 0)
+		if wErr != nil {
+			return wErr
+		}
+		if r != nil {
+			return populateObject(obj, *r, gvk)
+		}
+		return nil
+	}
+
+	obj.SetResourceVersion(strconv.FormatInt(result.ObjectVersion, 10))
+	return nil
+}
+
+func (c *pgClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	gvk, err := resolveGVK(c.scheme, obj)
+	if err != nil {
+		return err
+	}
+	gvkStr := gvkToString(gvk)
+
+	ns, name := obj.GetNamespace(), obj.GetName()
+	bucketID := c.assign(ns, name)
+	ls := c.leaseForBucket(bucketID)
+
+	poolConn, err := c.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer poolConn.Release()
+	conn := poolConn.Conn()
+
+	expectedVersion, err := parseResourceVersion(obj)
+	if err != nil {
+		return fmt.Errorf("parse resource version: %w", err)
+	}
+
+	var spec, status, metadata json.RawMessage
+	var existingDeletionTimestamp *time.Time
+	if expectedVersion == 0 {
+		current, err := readCurrentResource(ctx, conn, gvkStr, ns, name)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return apierrors.NewNotFound(groupResource(gvk), name)
+		}
+		expectedVersion = current.ObjectVersion
+		spec = current.Spec
+		status = current.Status
+		metadata = current.Metadata
+		existingDeletionTimestamp = current.DeletionTimestamp
+	} else {
+		spec, status, err = extractSpecStatus(obj)
+		if err != nil {
+			return err
+		}
+		metadata, err = extractMetadata(obj)
+		if err != nil {
+			return err
+		}
+	}
+
+	deletionTS := existingDeletionTimestamp
+	if deletionTS == nil {
+		now := time.Now()
+		deletionTS = &now
+	}
+
+	w := writer.New(conn, nil)
+	_, err = w.Write(ctx, model.WriteRequest{
+		GVK:               gvkStr,
+		Namespace:          ns,
+		Name:               name,
+		BucketID:           bucketID,
+		Spec:               spec,
+		Status:             status,
+		Metadata:           metadata,
+		DeletionTimestamp:  deletionTS,
+		ExpectedVersion:    expectedVersion,
+		LeaseHolder:        c.holderID,
+		LeaseEpoch:         ls.specEpoch,
+	})
+	if err != nil {
+		_, wErr := mapWriteError(ctx, w, err, gvk, name, 0)
+		return wErr
+	}
+
+	return nil
+}
+
+// Apply is not implemented; server-side apply requires an apiserver.
+func (c *pgClient) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
+	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "apply")
+}
+
+func (c *pgClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "patch")
+}
+
+func (c *pgClient) DeleteAllOf(ctx context.Context, obj client.Object, opts ...client.DeleteAllOfOption) error {
+	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "deleteAllOf")
+}
+
+func (c *pgClient) Status() client.SubResourceWriter {
+	return &pgStatusWriter{c: c}
+}
+
+func (c *pgClient) SubResource(subResource string) client.SubResourceClient {
+	if subResource == "status" {
+		return &pgSubResourceClient{statusWriter: &pgStatusWriter{c: c}}
+	}
+	return &pgSubResourceClient{}
+}
+
+func (c *pgClient) Scheme() *runtime.Scheme {
+	return c.scheme
+}
+
+func (c *pgClient) RESTMapper() meta.RESTMapper {
+	return c.restMapper
+}
+
+func (c *pgClient) GroupVersionKindFor(obj runtime.Object) (schema.GroupVersionKind, error) {
+	return resolveGVK(c.scheme, obj)
+}
+
+func (c *pgClient) IsObjectNamespaced(obj runtime.Object) (bool, error) {
+	gvk, err := resolveGVK(c.scheme, obj)
+	if err != nil {
+		return true, err
+	}
+	mapping, err := c.restMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	if err != nil {
+		return true, nil
+	}
+	return mapping.Scope.Name() == meta.RESTScopeNameNamespace, nil
+}
+
+func (c *pgClient) bucketIDs() []int {
+	ids := make([]int, 0, len(c.leases))
+	for id := range c.leases {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func (c *pgClient) leaseForBucket(bucketID int) leaseState {
+	if ls, ok := c.leases[bucketID]; ok {
+		return ls
+	}
+	return leaseState{}
+}
+
+// pgStatusWriter implements client.SubResourceWriter for status updates.
+type pgStatusWriter struct {
+	c *pgClient
+}
+
+func (sw *pgStatusWriter) Create(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "status create")
+}
+
+func (sw *pgStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	gvk, err := resolveGVK(sw.c.scheme, obj)
+	if err != nil {
+		return err
+	}
+	gvkStr := gvkToString(gvk)
+
+	expectedVersion, err := parseResourceVersion(obj)
+	if err != nil {
+		return fmt.Errorf("parse resource version: %w", err)
+	}
+
+	status, err := extractStatus(obj)
+	if err != nil {
+		return err
+	}
+
+	ns, name := obj.GetNamespace(), obj.GetName()
+	bucketID := sw.c.assign(ns, name)
+	ls := sw.c.leaseForBucket(bucketID)
+
+	poolConn, err := sw.c.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer poolConn.Release()
+	conn := poolConn.Conn()
+
+	w := writer.New(conn, nil)
+	result, err := w.WriteStatus(ctx, model.StatusWriteRequest{
+		GVK:             gvkStr,
+		Namespace:       ns,
+		Name:            name,
+		BucketID:        bucketID,
+		Status:          status,
+		ExpectedVersion: expectedVersion,
+		LeaseHolder:     sw.c.holderID,
+		LeaseEpoch:      ls.statusEpoch,
+	})
+	if err != nil {
+		r, wErr := mapWriteError(ctx, w, err, gvk, name, 0)
+		if wErr != nil {
+			return wErr
+		}
+		if r != nil {
+			return populateObject(obj, *r, gvk)
+		}
+		return nil
+	}
+
+	obj.SetResourceVersion(strconv.FormatInt(result.ObjectVersion, 10))
+	return nil
+}
+
+// Apply is not implemented; server-side apply requires an apiserver.
+func (sw *pgStatusWriter) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "status apply")
+}
+
+func (sw *pgStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "status patch")
+}
+
+// pgSubResourceClient wraps status writer as a SubResourceClient.
+type pgSubResourceClient struct {
+	statusWriter *pgStatusWriter
+}
+
+func (src *pgSubResourceClient) Get(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceGetOption) error {
+	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "subresource get")
+}
+
+func (src *pgSubResourceClient) Create(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+	if src.statusWriter != nil {
+		return src.statusWriter.Create(ctx, obj, subResource, opts...)
+	}
+	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "subresource create")
+}
+
+func (src *pgSubResourceClient) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	if src.statusWriter != nil {
+		return src.statusWriter.Update(ctx, obj, opts...)
+	}
+	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "subresource update")
+}
+
+// Apply is not implemented; server-side apply requires an apiserver.
+func (src *pgSubResourceClient) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+	if src.statusWriter != nil {
+		return src.statusWriter.Apply(ctx, obj, opts...)
+	}
+	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "subresource apply")
+}
+
+func (src *pgSubResourceClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	if src.statusWriter != nil {
+		return src.statusWriter.Patch(ctx, obj, patch, opts...)
+	}
+	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "subresource patch")
+}
+
+func readCurrentResource(ctx context.Context, conn *pgx.Conn, gvk, ns, name string) (*model.Resource, error) {
+	var r model.Resource
+	err := conn.QueryRow(ctx, `
+		SELECT gvk, namespace, name, uid, bucket_id, gvk_bucket_seq,
+		       object_version, spec, status, metadata,
+		       deletion_timestamp, created_at, updated_at
+		FROM kubernetes_resources
+		WHERE gvk = $1 AND namespace = $2 AND name = $3
+		  AND (deletion_timestamp IS NULL
+		       OR (metadata->'finalizers' IS NOT NULL
+		           AND metadata->'finalizers' != '[]'::jsonb))`,
+		gvk, ns, name,
+	).Scan(
+		&r.GVK, &r.Namespace, &r.Name, &r.UID, &r.BucketID,
+		&r.GVKBucketSeq, &r.ObjectVersion, &r.Spec, &r.Status,
+		&r.Metadata, &r.DeletionTimestamp, &r.CreatedAt, &r.UpdatedAt,
+	)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read current resource: %w", err)
+	}
+	return &r, nil
+}
+
+func currentGeneration(metadata json.RawMessage) int64 {
+	if len(metadata) == 0 {
+		return 0
+	}
+	var sm storedMetadata
+	if err := json.Unmarshal(metadata, &sm); err != nil {
+		return 0
+	}
+	return sm.Generation
+}
+
+func uidFromUUID(u [16]byte) apitypes.UID {
+	return apitypes.UID(fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16]))
+}
+
+// labelSet adapts map[string]string to labels.Set for selector matching.
+type labelSet map[string]string
+
+func (ls labelSet) Has(key string) bool {
+	_, ok := ls[key]
+	return ok
+}
+
+func (ls labelSet) Get(key string) string {
+	return ls[key]
+}
+
+func (ls labelSet) Lookup(label string) (value string, exists bool) {
+	value, exists = ls[label]
+	return
+}
+
+var _ client.Client = (*pgClient)(nil)
