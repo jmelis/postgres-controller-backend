@@ -58,9 +58,9 @@ The direct-to-Postgres design is significantly more reliable because:
 
 | Metric | Hyperfleet-API (CLM) | Direct-to-Postgres |
 |--------|---------------------|---------------------|
-| **Write hops** | HTTP request -> JSON parse -> GORM -> SQL -> PG | Single atomic txn: fence + counter + upsert + doorbell |
+| **Write hops** | HTTP request -> JSON parse -> GORM -> SQL -> PG | Single stored procedure call (`pgctl_write()`: fence + suppress + counter + upsert) + external doorbell |
 | **Latency (write)** | HTTP overhead + GORM reflection + connection pool wait. 30s request timeout under pressure; 500s on pool exhaustion | p50=28ms, p99=211ms (single bucket); p50=18ms, p99=45ms (16 buckets). Measured with 50 concurrent writers |
-| **Throughput ceiling** | Not published. Connection pool: 50 max open (default). Transaction-per-write-request middleware | **1,167 writes/s** per bucket; **2,874 writes/s** across 16 buckets (local bench). Zero serialization failures |
+| **Throughput ceiling** | Not published. Connection pool: 50 max open (default). Transaction-per-write-request middleware | **9,622 writes/s** across 64 buckets on RDS db.m6g.2xlarge (Multi-AZ sync commit); near-linear scaling with bucket count. Zero serialization failures |
 | **No-op suppression** | None -- every PATCH/PUT hits the database regardless of whether content changed | Content-equal writes consume no sequence, no version bump, no doorbell, no watch event. Critical for DynamoDB bridge where applier rewrites status every ~3 min |
 | **Connection efficiency** | 50 max connections shared across all HTTP requests (reads + writes). PgBouncer sidecar optional | pgx pool of 4-8 connections + 1 lease connection. ~20 total connections for 2 bridge replicas serving the entire fleet |
 
@@ -86,7 +86,7 @@ The direct-to-Postgres design is significantly more reliable because:
 
 | Metric | Hyperfleet-API (CLM) | Direct-to-Postgres |
 |--------|---------------------|---------------------|
-| **Ingestion** | Not applicable -- adapters report status via REST PUT to the API | DynamoDB stream consumer + 15-min reconciler per MC. ~4 real writes/s per MC against 1,045/s ceiling |
+| **Ingestion** | Not applicable -- adapters report status via REST PUT to the API | DynamoDB stream consumer + 15-min reconciler per MC. ~4 real writes/s per MC against ~317/s single-connection per-bucket ceiling |
 | **No-op handling** | Every status PUT triggers a full write | No-op suppression absorbs applier's ~3-min poll refreshes -- potentially 1,600 no-op events/s fleet-wide reduced to zero DB writes |
 | **Scalability** | Horizontal API replicas, but each write is a full HTTP round-trip | Per-MC buckets grow additively. Either bridge replica can carry the whole fleet. Connection count stays constant (~20) regardless of MC count |
 
@@ -96,7 +96,7 @@ The direct-to-Postgres design is substantially faster:
 
 1. **Latency:** Eliminates 2-3 network hops per operation. Write latency is measured in tens of milliseconds, not hundreds.
 
-2. **Throughput:** 2,874 writes/s measured (and this is on a laptop, not production hardware) vs. an unquantified CLM throughput bounded by HTTP overhead and connection pool limits.
+2. **Throughput:** 9,622 writes/s measured on RDS db.m6g.2xlarge (Multi-AZ sync commit, 64 buckets) vs. an unquantified CLM throughput bounded by HTTP overhead and connection pool limits.
 
 3. **Connection efficiency:** 20 connections for the entire fleet vs. 50 per API replica -- critical at scale.
 

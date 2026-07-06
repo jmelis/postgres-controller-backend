@@ -112,7 +112,7 @@ The customer-facing resources are **Cluster** and **NodePool** (platform API, Po
 bucket_id(k) = MC_BASE + mc_index(k)        -- constant per MC-unit; no hashing
 ```
 
-Every record in stream-k belongs to MC-k, hence to exactly one bucket. HostedCluster and HostedNodePool are co-located per MC by construction. Capacity: ≤100 HostedClusters + ~500 HostedNodePools ≈ **≤ ~600 observed objects per bucket**; real change rate ~4 writes/s per MC against the 1,045/s measured per-bucket ceiling.
+Every record in stream-k belongs to MC-k, hence to exactly one bucket. HostedCluster and HostedNodePool are co-located per MC by construction. Capacity: ≤100 HostedClusters + ~500 HostedNodePools ≈ **≤ ~600 observed objects per bucket**; real change rate ~4 writes/s per MC against the ~317/s measured single-connection per-bucket ceiling on RDS db.m6g.2xlarge (Multi-AZ sync commit).
 
 ### 3.2 Two partition schemes, one bucket_id space
 
@@ -164,7 +164,7 @@ No version cache: at ~4 real writes/s per MC, one extra PK read per write is noi
 
 **The applier refreshes desire status on a poll cadence (~3 min across all desires).** If it rewrites `.status` even when nothing changed, the stream carries a MODIFY per ReadDesire per cycle — potentially ~1,600 events/s fleet-wide of no-ops. Without suppression, every one would consume a sequence number, bump `object_version`, and wake every watcher of the bucket. Suppression is therefore mandatory for the bridge — and it is generally correct behavior, so it goes in the **main library**, not the bridge:
 
-* Inside the write transaction, **after the fence and before the counter increment**: PK-read the current row; if `(spec, status, metadata, deletion_timestamp)` are semantically equal to the request (JSONB `=` is key-order-insensitive), COMMIT having changed nothing and return `WriteResult{Changed: false, ObjectVersion: current}`.
+* Inside the `pgctl_write()` stored procedure, **after the fence and before the counter increment**: PK-read the current row; if `(spec, status, metadata, deletion_timestamp)` are semantically equal to the request (JSONB `=` is key-order-insensitive), return immediately with `changed=false` — no counter, no upsert, no doorbell.
 * Because the check precedes step (b) of DESIGN.md §3.3, a suppressed write **consumes no sequence number** (I1 preserved by construction), emits **no doorbell**, bumps **no `object_version`**, and generates **no watch event** — matching Kubernetes API-server semantics, where an update that changes nothing does not advance resourceVersion.
 * Semantics: if content is equal, the write succeeds as a no-op **regardless of `ExpectedVersion`** — the caller's intent ("make the state X") is already satisfied. This is level-based idempotence; it also makes at-least-once stream delivery literally free: a duplicated record is a suppressed write.
 * One extra PK lookup per write; against the cost of a counter bump + row upsert + watcher wakeups it saves, strictly a win at any no-op ratio above ~0.
@@ -427,8 +427,8 @@ Per key: applier write order = stream order (within lineage) = Postgres commit o
 
 | Tier | MCs | Observed objects | Real change rate | Per-MC bucket | Bucket ceiling |
 |------|-----|------------------|------------------|---------------|----------------|
-| 5k HostedClusters | 50 | ~30k | ~187/s fleet | ~4 writes/s | 1,045/s |
-| 50k HostedClusters | 500 | ~300k | ~1,870/s fleet | ~4 writes/s | 1,045/s |
+| 5k HostedClusters | 50 | ~30k | ~187/s fleet | ~4 writes/s | ~317/s |
+| 50k HostedClusters | 500 | ~300k | ~1,870/s fleet | ~4 writes/s | ~317/s |
 
 Per-bucket load is constant as the fleet grows (scaling adds MCs). **Stream-side volume may far exceed write volume** if the applier rewrites status each poll — up to ~1,600 records/s fleet-wide — but suppressed records cost one PK read each and no writes; `GetRecords` at 1,000 records/call absorbs it. Either single replica can carry the whole fleet: ~500 streams × 1–4 shards is a few hundred long-poll goroutines and ≤ ~2,000 records/s of mostly-suppressed processing.
 

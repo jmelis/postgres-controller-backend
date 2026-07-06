@@ -40,7 +40,7 @@ These are the properties the system promises. Everything else exists to uphold t
       v                                         |
 +---------------------------------------------------------------+
 |                     Custom Client Layer                       |
-|   WRITE: fence(share-lock) -> suppress? -> counter -> upsert -> bell  |
+|   WRITE: pgctl_write(fence → suppress? → counter → upsert) → bell    |
 |   WATCH: 5s timer ┐                                           |
 |         doorbell ─┼─► debounce(100ms, lead+trail) ─► poll     |
 |         (LISTEN) ─┘        dirty-flag coalesce      seq>hwm   |
@@ -138,89 +138,53 @@ CREATE TABLE mc_registry (
 
 `e7|b2:1044,b5:902,b9:4123` — timeline epoch prefix + per-bucket high-water map. Serialization is canonical (buckets sorted ascending) so equal states compare equal. Upholds **I3/I6**: the epoch increments on every promotion, so `(epoch, seq)` is monotonic even if a sequence were somehow rewound. A newly leased bucket has no entry → scoped List for that bucket only, merge `bN:seq`. Stale epoch or sub-horizon seq → `410 Gone` (**I7**).
 
-### 3.3 Atomic Write Path
+### 3.3 Atomic Write Path — Stored Procedure
+
+The write path uses a server-side stored procedure `pgctl_write()` that performs fence check, no-op suppression, counter increment, and upsert in a single server-side call. The doorbell (`pg_notify`) fires **after** the transaction commits, outside the procedure, to avoid the global notification-queue lock that would serialize all concurrent commits.
 
 ```sql
+-- Steps (a)–(c) run inside the stored procedure, in one transaction.
 BEGIN;
-
--- (a) FENCE — upholds I4. FOR SHARE, held to COMMIT (see §3.4 for why).
-SELECT 1 FROM bucket_leases
- WHERE bucket_id = $bucket AND domain = 'spec'
-   AND holder = $replica_id AND epoch = $lease_epoch
-   AND expires_at > now()
- FOR SHARE;                          -- zero rows => abort: fencing violation
-
--- (b) SEQUENCE — upholds I1/I2. Exclusive row lock held to COMMIT serializes
---     issuance and commit order identically.
-INSERT INTO gvk_bucket_counters (bucket_id, gvk, current_seq)
-VALUES ($bucket, $gvk, 1)
-ON CONFLICT (bucket_id, gvk)
-DO UPDATE SET current_seq = gvk_bucket_counters.current_seq + 1
-RETURNING current_seq;               -- => $next_seq
-
--- (c) UPSERT with optimistic concurrency — upholds I8.
-INSERT INTO kubernetes_resources AS r
-    (gvk, namespace, name, bucket_id, gvk_bucket_seq,
-     object_version, spec, status, metadata, deletion_timestamp)
-VALUES ($gvk, $ns, $name, $bucket, $next_seq, 1, $spec, $status, $meta, $del_ts)
-ON CONFLICT (gvk, namespace, name)
-DO UPDATE SET
-    gvk_bucket_seq     = EXCLUDED.gvk_bucket_seq,
-    object_version     = r.object_version + 1,
-    spec               = EXCLUDED.spec,
-    status             = EXCLUDED.status,
-    metadata           = EXCLUDED.metadata,
-    deletion_timestamp = EXCLUDED.deletion_timestamp,
-    updated_at         = now()
-WHERE r.object_version = $expected_version;   -- zero rows => 409 Conflict
-
--- (d) DOORBELL — latency only; correctness never depends on it (I5 rests on
---     the poll). Transactional: fires only on COMMIT. Empty payload — the
---     watcher polls all pending changes regardless.
-SELECT pg_notify('resource_changes_b' || $bucket, '');
-
+SELECT * FROM pgctl_write(
+    $domain,            -- 'spec' or 'status'
+    $gvk, $ns, $name, $bucket,
+    $replica_id, $lease_epoch,
+    $expected_version,
+    $force_write,       -- TRUE bypasses no-op suppression
+    $spec, $status, $metadata, $deletion_ts
+);
+-- Returns: (uid, object_version, seq, changed)
+-- changed=FALSE means no-op suppression fired — no counter, no upsert.
 COMMIT;
+
+-- (d) DOORBELL — fires only when changed=TRUE.
+-- Outside the transaction to avoid the global notification-queue lock.
+-- Lost doorbells are harmless — watchers have baseline polling as fallback.
+SELECT pg_notify('resource_changes_b' || $bucket, '');
 ```
 
-Client rules: a 409 from (c) must ROLLBACK (never retry inside the same txn — the counter increment must abort with it, preserving I1). Any ambiguous commit outcome (connection dropped mid-COMMIT) is resolved by reading back the row and `current_seq` before retrying — the write is idempotent to verify because `object_version` and seq identify it.
+Inside `pgctl_write()`, the steps are:
 
-### 3.3b Atomic Status Write Path (Spec/Status Split)
+**(a) FENCE** — upholds I4. `FOR SHARE` on the `bucket_leases` row for the requested domain, held to COMMIT (see §3.4 for why). Zero rows ⇒ `RAISE EXCEPTION` with error code `P0001` (fence violation).
 
-In Kubernetes, spec (desired state) and status (observed state) are written by different controllers — e.g., the API server writes spec while a controller writes status. The system supports this with a `WriteStatus` path that mirrors §3.3 except:
+**(b) SUPPRESSION CHECK** — upholds I1/I5. PK-read the existing row; if content is identical (see §3.3c), return `(uid, version, 0, false)` immediately — no counter increment, no upsert. The `FOR SHARE` lock is still held for the duration of the transaction even on suppression (§3.4/RB4g).
+
+**(c) SEQUENCE + UPSERT** — upholds I1/I2/I8. The counter `INSERT ... ON CONFLICT DO UPDATE SET current_seq = current_seq + 1` takes an exclusive row lock, serializing commit order with sequence order. The upsert checks `object_version = $expected_version`; zero rows ⇒ `RAISE EXCEPTION` with `P0002` (409 Conflict). A version conflict rolls back the entire stored procedure call, including the counter increment — no gap (I1).
+
+Client rules: errors raised inside `pgctl_write()` abort the transaction automatically (no partial state). Any ambiguous commit outcome (connection dropped mid-COMMIT) is resolved by reading back the row and `current_seq` before retrying — the write is idempotent to verify because `object_version` and seq identify it.
+
+**Why a stored procedure:** collapsing four round-trips (fence, suppress, counter, upsert) into one server-side call eliminates three network round-trips per write. Combined with moving `pg_notify` outside the transaction (which eliminates the global notification-queue lock that serialized all concurrent commits), this improved per-bucket throughput by ~41% and enabled near-linear multi-bucket scaling.
+
+### 3.3b Status Write Path (Spec/Status Split)
+
+In Kubernetes, spec (desired state) and status (observed state) are written by different controllers — e.g., the API server writes spec while a controller writes status. The system supports this with a `WriteStatus` path that uses the **same `pgctl_write()` stored procedure** (§3.3) with `domain='status'`. The differences are:
 
 1. **Fence against the `'status'` row in `bucket_leases`** (not the `'spec'` row). This gives status writers their own fencing domain — a status writer holds a status lease, a spec writer holds a spec lease, and neither interferes with the other.
 2. **UPDATE only touches `status`** — `spec`, `metadata`, and `deletion_timestamp` are unchanged. There is no create path; the object must already exist (`ExpectedVersion > 0`).
 3. **Same shared counter and `object_version`.** Both `Write()` and `WriteStatus()` increment the same `gvk_bucket_counters` row and bump the same `object_version` column on `kubernetes_resources`. This ensures watchers see a single gapless, ordered event stream covering both spec and status changes.
+4. **No-op suppression compares only `status`** (not all four content fields). See §3.3c.
 
-```sql
-BEGIN;
--- (a) FENCE — against the status row in bucket_leases (independent from spec lease)
-SELECT 1 FROM bucket_leases
- WHERE bucket_id = $bucket AND domain = 'status'
-   AND holder = $replica_id AND epoch = $lease_epoch
-   AND expires_at > now()
- FOR SHARE;
-
--- (b) SEQUENCE — same shared counter as Write()
-INSERT INTO gvk_bucket_counters (bucket_id, gvk, current_seq)
-VALUES ($bucket, $gvk, 1)
-ON CONFLICT (bucket_id, gvk)
-DO UPDATE SET current_seq = gvk_bucket_counters.current_seq + 1
-RETURNING current_seq;               -- => $next_seq
-
--- (c) UPDATE status only — spec, metadata, deletion_timestamp unchanged
-UPDATE kubernetes_resources
-SET gvk_bucket_seq = $next_seq,
-    object_version = object_version + 1,
-    status = $status,
-    updated_at = now()
-WHERE gvk = $gvk AND namespace = $ns AND name = $name
-  AND object_version = $expected_version;  -- zero rows => 409 Conflict
-
--- (d) DOORBELL — same channel as spec writes, empty payload
-SELECT pg_notify('resource_changes_b' || $bucket, '');
-COMMIT;
-```
+The call pattern is identical to §3.3 — `pgctl_write($domain='status', ...)` in a transaction, doorbell after commit if `changed=TRUE`.
 
 The fencing guarantees (I4) apply independently per domain: `FOR SHARE` on the `(bucket_id, 'status')` row blocks a status lease grant while a status write is in-flight (R11), just as `FOR SHARE` on the `(bucket_id, 'spec')` row blocks a spec lease grant (R1). A spec writer and a status writer can operate concurrently on the same bucket — the counter's exclusive row lock serializes sequence issuance (I1/I2), but the fence locks are on different rows and do not conflict (R12).
 
@@ -230,21 +194,13 @@ Most controllers own both spec and status for their resources. `BothManager` pro
 
 Content-equal writes consume no sequence number, emit no doorbell, and bump no `object_version`. This matches Kubernetes API-server semantics where an update that changes nothing does not advance resourceVersion. The feature is default-on; callers set `ForceWrite: true` to bypass it.
 
-**Mechanism:** after the fence check (step a) and before the counter increment (step b), the writer reads the existing row by primary key within the same transaction:
+**Mechanism:** inside `pgctl_write()`, after the fence check and before the counter increment, the stored procedure reads the existing row by primary key. If the row exists and all compared fields are equal to the incoming values, the procedure returns `(uid, version, 0, false)` immediately — no counter increment, no upsert. The caller sees `changed=FALSE` and skips the doorbell. The `FOR SHARE` lock on the lease row is still held for the duration of the transaction even on suppression (§3.4/RB4g).
 
-```sql
-SELECT spec, status, metadata, deletion_timestamp, object_version, uid
-FROM kubernetes_resources
-WHERE gvk = $gvk AND namespace = $ns AND name = $name;
-```
+**Field comparison rules (inside `pgctl_write()`):**
+- `domain='spec'` compares all four content fields: `spec`, `status`, `metadata`, `deletion_timestamp`. JSONB equality (`=`) is key-order-insensitive.
+- `domain='status'` compares only `status`.
 
-If the row exists and all compared fields are equal to the incoming values, the transaction commits immediately (releasing the `FOR SHARE` lock) with no counter increment, no upsert, and no doorbell. The result is `WriteResult{Changed: false, ObjectVersion: existing, UID: existing, Seq: 0}`.
-
-**Field comparison rules:**
-- `Write()` compares all four content fields: `spec`, `status`, `metadata`, `deletion_timestamp`. JSONB equality (`=`) is key-order-insensitive; timestamp comparison uses `time.Equal()` to handle timezone normalization.
-- `WriteStatus()` compares only `status`.
-
-**Create-path behavior (ExpectedVersion == 0):** if the row already exists and content matches, the write is treated as a replayed create — returns `Changed: false` with the existing row's version and UID. If content differs, returns `ErrAlreadyExists` as before.
+**Create-path behavior (ExpectedVersion == 0):** if the row already exists and content matches, the write is treated as a replayed create — returns `changed=false` with the existing row's version and UID. If content differs, returns `ErrAlreadyExists` as before.
 
 **`WriteResult.Changed`** indicates whether the write produced a new state. Callers can use this to skip downstream side-effects (e.g., the DynamoDB bridge skips doorbell emission on `Changed: false`).
 
@@ -255,9 +211,9 @@ If the row exists and all compared fields are equal to the incoming values, the 
 - **I5 (exactly-once delivery):** no event emitted for no state change — correct Kubernetes semantics.
 - **I8 (optimistic concurrency):** content-equal ⇒ intent satisfied regardless of version.
 
-**Performance:** one additional PK read per write. Under load tests with unique content per write (suppression finds "no match" and proceeds normally), no measurable regression — 1,167 writes/s single-bucket ceiling vs. 1,045 baseline.
+**Performance:** one additional PK read per write inside the stored procedure. Under load tests with unique content per write (suppression finds "no match" and proceeds normally), no measurable regression.
 
-**Test hook:** `AfterSuppressionCheck(ctx, tx, suppressed bool)` in the `TxHooks` interface enables deterministic interleaving tests (RB4g).
+**Test hook:** `AfterSuppressionCheck(ctx, tx, suppressed bool)` in the `TxHooks` interface enables deterministic interleaving tests (RB4g). The multi-statement write path (used only when hooks are non-nil) preserves hook injection points for race tests.
 
 ### 3.4 Lease Fencing — closing the expiry race (hardening added in v4)
 

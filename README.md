@@ -22,6 +22,7 @@ This design exploits constraints that a fleet controller satisfies but a general
 
 The system uses PostgreSQL 16 as the authoritative store for Kubernetes resources, with:
 
+- **Server-side stored procedure (`pgctl_write()`)** that performs fence check, no-op suppression, counter increment, and upsert in a single server-side call, with `pg_notify` doorbell fired after commit to avoid the global notification-queue lock
 - **Per-(GVK, bucket) gapless sequence counters** for commit-ordered event streams
 - **Independent spec/status fencing** — single `bucket_leases` table with `domain` column (`'spec'`/`'status'`), each row fenced independently with `FOR SHARE` lock for single-writer semantics per sub-resource
 - **No-op write suppression** — content-equal writes consume no sequence number, emit no doorbell, bump no `object_version`. Default on; `ForceWrite` opt-out. Matches Kubernetes API-server semantics where an update that changes nothing does not advance resourceVersion
@@ -89,24 +90,30 @@ Lease management matches the ownership pattern (see Assumption 4):
 
 ## Performance
 
-Load test results on a local podman Postgres 16 container (macOS ARM64, 8 CPU, 3.8 GB RAM).
+### Write throughput — RDS ceiling hunt
 
-### Write throughput (Phase 1)
+Results on AWS RDS Multi-AZ (synchronous commit), using the stored procedure write path (`pgctl_write()`) with doorbell outside transaction. One writer per bucket, 120s duration, 15s warm-up.
 
-**Per-bucket ceiling** (50 workers, 1 bucket): **1,060 writes/s**, p50=27ms, p99=248ms
+**db.m6g.2xlarge (8 vCPU):**
 
-**16-bucket scaling** (48 workers total): **2,874 writes/s**, p50=18ms, p99=45ms
+| Buckets | RPS | p50 | p99 |
+|---------|-----|-----|-----|
+| 1 | 317 | 3.1ms | 3.7ms |
+| 16 | 3,803 | 4.1ms | 5.6ms |
+| 64 | **9,622** | 6.1ms | 13.2ms |
 
-All runs: zero serialization failures, zero fencing false-positives, zero invariant violations.
+**db.m6g.8xlarge (32 vCPU):** 11,728 w/s @ 64 buckets — only +22% over 2xlarge; the bottleneck is WAL sync (Multi-AZ synchronous replication round-trip), not CPU.
+
+All runs: zero serialization failures, zero verifier violations. Near-linear scaling with bucket count (~150 w/s per bucket). Fleet capacity at burst (0.0748 w/s per cluster): ~128k clusters on 2xlarge, ~157k on 8xlarge.
 
 Against DESIGN.md §4 sizing tiers:
 
-| Tier | Steady RPS | Burst RPS | Buckets needed (local) |
-|------|-----------|-----------|------------------------|
+| Tier | Steady RPS | Burst RPS | Buckets needed (RDS 2xlarge) |
+|------|-----------|-----------|------------------------------|
 | 5,000 clusters | 187 | 374 | 1 |
-| 50,000 clusters | 1,870 | 3,740 | 4–8 |
+| 50,000 clusters | 1,870 | 3,740 | ~4 |
 
-Bucket count caps the maximum controller replicas. The recommended default is **16 buckets**, expandable via epoch-bump migration (same mechanism as failover — all watchers 410 + relist).
+Bucket count caps the maximum controller replicas. The recommended default is **64 buckets**, expandable via epoch-bump migration (same mechanism as failover — all watchers 410 + relist).
 
 ### Poll cost & delivery latency (Phase 5)
 

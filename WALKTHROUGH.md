@@ -118,36 +118,40 @@ The serialization is canonical (buckets sorted) so equal states compare equal.
 
 ## 4. The write path
 
-Five steps, one transaction (`internal/writer/writer.go`).
+A stored procedure plus one post-commit notification (`internal/writer/writer.go`,
+`internal/schema/migrations/001_initial.sql`).
 
 ```mermaid
 sequenceDiagram
     participant C as Controller (writer)
     participant DB as Postgres
     Note over C,DB: BEGIN (READ COMMITTED)
-    C->>DB: (a) SELECT 1 FROM bucket_leases … FOR SHARE
-    alt no matching lease row
-        DB-->>C: 0 rows → ROLLBACK → ErrFenceViolation
+    C->>DB: SELECT * FROM pgctl_write(domain, gvk, ns, name, bucket, holder, epoch, expected_version, force_write, spec, status, metadata, deletion_ts)
+    Note over DB: Inside pgctl_write(): (a) fence → (b) suppress? → (c) counter → (d) upsert
+    alt fence violation
+        DB-->>C: RAISE P0001 → ROLLBACK → ErrFenceViolation
     end
-    C->>DB: (b) SELECT spec,status,… WHERE pk  (no-op check)
-    alt incoming content == stored content
-        C->>DB: COMMIT (nothing written)
-        DB-->>C: Changed=false, Seq=0
+    alt incoming content == stored content (suppressed)
+        DB-->>C: (uid, version, 0, changed=false) → COMMIT
     end
-    C->>DB: (c) INSERT counter … ON CONFLICT DO UPDATE seq=seq+1 RETURNING seq
-    C->>DB: (d) UPSERT kubernetes_resources (seq, object_version+1, spec…)
     alt object_version mismatch
-        DB-->>C: 0 rows → ROLLBACK → 409 Conflict
+        DB-->>C: RAISE P0002 → ROLLBACK → 409 Conflict
     end
-    C->>DB: (e) pg_notify('resource_changes_bN','')  (doorbell)
-    C->>DB: COMMIT
-    DB-->>C: Seq, ObjectVersion, Changed=true
+    DB-->>C: (uid, version, seq, changed=true) → COMMIT
+    Note over C,DB: Transaction committed — doorbell fires outside
+    C->>DB: SELECT pg_notify('resource_changes_bN','')
 ```
 
 The transaction runs at `READ COMMITTED`, Postgres's default isolation level —
 ordering here comes from **row locks**, not from snapshots. (Isolation levels are
 explained in the aside in Section 5, where the contrast with the read paths
 becomes visible.)
+
+The stored procedure (`pgctl_write()`) consolidates four formerly-separate
+SQL statements into one server-side call, eliminating three network round-trips
+per write. The doorbell fires **after** the commit, in a separate statement —
+this avoids a global lock on Postgres's notification queue that otherwise
+serializes all concurrent commits (see Section 4e).
 
 ### (a) The fence — "am I still allowed to write?"
 
@@ -235,8 +239,17 @@ invariant I8, no lost updates.
 `pg_notify` on the bucket's channel, empty payload. This is *only* a latency
 optimization: it tells watchers "wake up and poll now" instead of waiting for
 their timer. Correctness never depends on it; if the notification is lost, the
-timer still fires. Because it is inside the transaction, it reaches anyone only
-if the COMMIT succeeds.
+timer still fires.
+
+The doorbell fires **after** the transaction commits, in a separate statement —
+not inside the stored procedure. Why? `pg_notify` inside a transaction acquires
+a global exclusive lock on Postgres's internal notification queue at pre-commit
+time. With many buckets writing concurrently, every commit serializes on that
+one lock — throughput collapses to a single-threaded ceiling regardless of bucket
+count. Moving `pg_notify` outside the transaction means the lock is held only for
+the brief standalone statement, not for the entire commit. The worst case of a
+lost doorbell (the writer crashes between COMMIT and `pg_notify`) is harmless:
+the watcher's baseline timer fires within 5 s.
 
 ---
 
@@ -451,9 +464,11 @@ Top to bottom:
 > compactor work: **a single statement is always atomic by itself** (Postgres
 > wraps a lone statement in an implicit transaction), so the CTE gets
 > delete-and-advance-horizon atomicity for free — exactly the I7 guarantee. The
-> write path, by contrast, is five separate statements that must be atomic
-> *together*, so it needs an explicit transaction. Rule of thumb: a CTE organizes
-> (and atomically binds) one statement; a transaction atomically binds several.
+> write path uses a stored procedure (`pgctl_write()`) that performs multiple
+> operations server-side, wrapped in a transaction for atomicity. Rule of thumb:
+> a CTE organizes (and atomically binds) one statement; a transaction atomically
+> binds several; a stored procedure pushes multi-step logic to the server to save
+> round-trips.
 >
 > **`EXCLUDED`** is a pseudo-table available only inside
 > `INSERT ... ON CONFLICT DO UPDATE`: it holds **the row you *tried* to insert
