@@ -197,7 +197,6 @@ The [`examples/`](examples/) directory contains the same controller implemented 
 - [DESIGN.md](DESIGN.md) — full design: invariant catalog (I1–I8), race catalog (R1–R18), sizing, certification plan
 - [WALKTHROUGH.md](WALKTHROUGH.md) — narrative explanation of why each mechanism exists and how the pieces fit together
 - [ARCHITECTURE_COMPARISON.md](ARCHITECTURE_COMPARISON.md) — this direct-to-Postgres design vs. an intermediated REST-API architecture (reliability, consistency, operational surface)
-- [DYNAMO_BRIDGE_DESIGN.md](DYNAMO_BRIDGE_DESIGN.md) — proposed bridge ingesting observed cluster state from per-MC DynamoDB tables into Postgres
 - [METRICS.md](METRICS.md) — Prometheus metrics reference (all `pgctl_*` metrics, labels, integration guide)
 - [loadtest/README.md](loadtest/README.md) — RDS perfscale suite: ceiling hunt, Phase 0–7 certification, Terraform infrastructure, scaling analysis
 - [examples/README.md](examples/README.md) — etcd → postgres migration guide with side-by-side controller implementations
