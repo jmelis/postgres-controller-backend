@@ -1,8 +1,10 @@
 # postgres-controller-backend
 
-Kubernetes-style List/Watch storage for controllers on plain PostgreSQL — no etcd, no consensus, one commodity managed database.
+Run your controller-runtime controllers against plain PostgreSQL instead of kube-apiserver + etcd — same reconcile loops, one commodity managed database.
 
-`etcd` — the standard backing store for Kubernetes controllers — can become a bottleneck at scale, and colocating application state in the cluster's own etcd complicates the DR story. This system delivers comparable write throughput (~10k w/s) on a single modest Postgres instance (db.m6g.2xlarge, ~$500/mo), with fewer moving parts, an independent backup/restore lifecycle, and no write-race conditions by design.
+This works because the library re-implements the Kubernetes List/Watch contract — gap-free, commit-ordered event streams with `resourceVersion` semantics — on ordinary Postgres tables. Informers, reconcile loops, and optimistic concurrency behave as they always have; underneath, writers (controllers, or an API server fronting the database) and watchers talk to Postgres directly, with no etcd protocol, no kube-apiserver, and no consensus layer in the path.
+
+The motivation is operational. At fleet scale, etcd becomes the component you engineer around, and colocating application state in the cluster's own etcd ties your data's disaster-recovery story to the cluster's. One managed Postgres instance replaces it with a database your team already knows how to run — independent backup/restore, standard failover — and gives up nothing on throughput: ~10,000 writes/s on modest hardware (db.m6g.2xlarge, ~$500/mo), with correctness enforced by row locks rather than convention.
 
 **This is not a general-purpose etcd replacement.** It targets deployments where you own every writer and each object has a single spec owner and a single status owner. Check [Is this for you?](#is-this-for-you) to see if your use case matches the assumptions. If not, use [kine](https://github.com/k3s-io/kine).
 
@@ -164,29 +166,8 @@ Bucket count caps the maximum controller replicas. The recommended default is **
 | --------------------------------- | ------ | ------ |
 | Idle poll cycle                   | 4.1 ms | 9.5 ms |
 | Doorbell write-to-delivery        | 25 ms  | 62 ms  |
-| Baseline-only (notify-loss drill) | 527 ms | 996 ms |
 
 All 1,000 events delivered under notify-loss (no doorbell), verifier silent. The baseline-only latency is bounded by the 1s polling interval used in the drill — in production the default 5s baseline is the worst case, but doorbells keep typical delivery under 100ms.
-
-## Read Model: Direct Reads vs. Cached Reads
-
-`Client.Get()` reads directly from PostgreSQL on every call — no in-memory cache. This differs from standard controller-runtime, where `Get()` inside a `Reconcile` reads from an informer cache populated by the List/Watch stream.
-
-**Why direct reads are the default:** A fleet controller has low read rates (reconcilers read a handful of objects per cycle, not thousands). Direct reads are simpler, always return committed state, and avoid a class of staleness bugs. The `ListerWatcher` already feeds the watch stream for event-driven reconciliation; `Get()` is a point-read for the current object, not a scan.
-
-**When to consider a cached model:** If reconcilers perform many `Get()` calls per cycle, or if multiple informers share the same `ListerWatcher`, wiring it into controller-runtime's standard cache reduces DB load and read latency. The `ListerWatcher` already implements the List/Watch contract, so the integration is mechanical — the hard part (gapless, ordered, exactly-once event stream) is already done.
-
-**Trade-offs:**
-
-|              | Direct reads (current)                | Cached reads                                                  |
-| ------------ | ------------------------------------- | ------------------------------------------------------------- |
-| Read latency | ~1–5ms (Postgres round-trip)          | ~0ms (memory)                                                 |
-| Freshness    | Always committed state                | Up to one poll interval stale (5s worst case, ~100ms typical) |
-| DB load      | One query per `Get()`                 | Zero read queries from reconcilers                            |
-| Memory       | None beyond the connection            | Full working set in memory per controller                     |
-| Complexity   | Simpler — no cache coherence concerns | Requires trusting the watch stream entirely                   |
-
-For conflict resolution and ambiguous-commit read-back, the direct `Get()` (or `ReadBack`) is always needed regardless of the read model — those paths require the live database value.
 
 ## Examples
 
