@@ -262,4 +262,52 @@ func createPool(ctx context.Context, opts Options) (*pgxpool.Pool, error) {
 	return pgxpool.New(ctx, opts.DSN)
 }
 
+// NewClient creates a standalone client.Client backed by PostgreSQL, without
+// the manager/cache/watch infrastructure. Intended for stateless HTTP services
+// that need CRUD access to the same kubernetes_resources table.
+// The returned function closes the connection pool and must be called on shutdown.
+func NewClient(opts Options) (client.Client, func(), error) {
+	if opts.Scheme == nil {
+		return nil, nil, fmt.Errorf("pgruntime: Scheme is required")
+	}
+	if opts.DSN == "" {
+		return nil, nil, fmt.Errorf("pgruntime: DSN is required")
+	}
+	if len(opts.BucketIDs) == 0 {
+		opts.BucketIDs = []int{0}
+	}
+	if opts.BucketAssigner == nil {
+		opts.BucketAssigner = func(_, _ string) int { return opts.BucketIDs[0] }
+	}
+
+	ctx := context.Background()
+
+	pool, err := createPool(ctx, opts)
+	if err != nil {
+		return nil, nil, fmt.Errorf("pgruntime: create connection pool: %w", err)
+	}
+
+	migrationConn, err := pool.Acquire(ctx)
+	if err != nil {
+		pool.Close()
+		return nil, nil, fmt.Errorf("pgruntime: acquire conn for migration: %w", err)
+	}
+	if err := pgschema.Migrate(ctx, migrationConn.Conn()); err != nil {
+		migrationConn.Release()
+		pool.Close()
+		return nil, nil, fmt.Errorf("pgruntime: schema migration: %w", err)
+	}
+	migrationConn.Release()
+
+	c := &pgClient{
+		scheme:     opts.Scheme,
+		pool:       pool,
+		assign:     opts.BucketAssigner,
+		bucketIDs:  opts.BucketIDs,
+		restMapper: buildRESTMapper(opts.Scheme),
+	}
+
+	return c, pool.Close, nil
+}
+
 var _ manager.Manager = (*pgManager)(nil)
