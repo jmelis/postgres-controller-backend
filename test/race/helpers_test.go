@@ -5,10 +5,8 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
 	"github.com/jmelis/postgres-controller-backend/test/testinfra"
@@ -35,41 +33,15 @@ func truncateAll(t *testing.T) {
 	conn.Close(context.Background())
 }
 
-func setupLease(t *testing.T, bucketID int, holder string, ttl time.Duration) int64 {
-	t.Helper()
-	conn := freshConn(t)
-	defer conn.Close(context.Background())
-	mgr := lease.NewSpecManager(conn, holder)
-	epoch, err := mgr.Acquire(context.Background(), bucketID, ttl)
-	if err != nil {
-		t.Fatalf("setup lease: %v", err)
-	}
-	return epoch
-}
-
-func setupStatusLease(t *testing.T, bucketID int, holder string, ttl time.Duration) int64 {
-	t.Helper()
-	conn := freshConn(t)
-	defer conn.Close(context.Background())
-	mgr := lease.NewStatusManager(conn, holder)
-	epoch, err := mgr.Acquire(context.Background(), bucketID, ttl)
-	if err != nil {
-		t.Fatalf("setup status lease: %v", err)
-	}
-	return epoch
-}
-
-func makeWriteReq(gvk, ns, name string, bucketID int, holder string, epoch int64) model.WriteRequest {
+func makeWriteReq(gvk, ns, name string, bucketID int) model.WriteRequest {
 	return model.WriteRequest{
-		GVK:         gvk,
-		Namespace:   ns,
-		Name:        name,
-		BucketID:    bucketID,
-		Spec:        json.RawMessage(`{"replicas":1}`),
-		Status:      json.RawMessage(`{}`),
-		Metadata:    json.RawMessage(`{}`),
-		LeaseHolder: holder,
-		LeaseEpoch:  epoch,
+		GVK:       gvk,
+		Namespace: ns,
+		Name:      name,
+		BucketID:  bucketID,
+		Spec:      json.RawMessage(`{"replicas":1}`),
+		Status:    json.RawMessage(`{}`),
+		Metadata:  json.RawMessage(`{}`),
 	}
 }
 
@@ -91,7 +63,6 @@ func newBlockingHook() *blockingHook {
 	}
 }
 
-func (h *blockingHook) AfterFence(_ context.Context, _ pgx.Tx) error                    { return nil }
 func (h *blockingHook) AfterSuppressionCheck(_ context.Context, _ pgx.Tx, _ bool) error { return nil }
 func (h *blockingHook) AfterCounter(_ context.Context, _ pgx.Tx, _ int64) error         { return nil }
 

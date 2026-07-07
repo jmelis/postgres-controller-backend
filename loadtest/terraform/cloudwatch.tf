@@ -246,7 +246,7 @@ resource "aws_cloudwatch_dashboard" "loadtest" {
           }
         },
       ],
-      # --- Row 8: Delivery latency + lease ---
+      # --- Row 8: Delivery latency ---
       [
         {
           type   = "metric"
@@ -259,20 +259,6 @@ resource "aws_cloudwatch_dashboard" "loadtest" {
             region = var.region
             metrics = [
               [{ expression = "SEARCH('{pgctl-loadtest} MetricName=\"pgctl_verifier_canary_delivery_seconds\"', 'p99', 60)", id = "canary", label = "" }]
-            ]
-          }
-        },
-        {
-          type   = "metric"
-          x      = 12
-          y      = 42
-          width  = 12
-          height = 6
-          properties = {
-            title  = "Lease Acquisitions"
-            region = var.region
-            metrics = [
-              [{ expression = "SEARCH('{pgctl-loadtest} MetricName=\"pgctl_lease_acquisitions_total\"', 'Sum', 60)", id = "lease", label = "" }]
             ]
           }
         },

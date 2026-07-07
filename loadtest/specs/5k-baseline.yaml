@@ -8,7 +8,6 @@ rds:
 
 cluster:
   buckets: 16
-  lease_ttl: 120s
   baseline_poll_interval: 5s
   debounce_floor: 100ms
 
@@ -54,7 +53,6 @@ phases:
   phase3_avalanche:
     enabled: false
     kill_fraction: 0.5
-    zombie_writers: 1
 
   phase5_poll:
     enabled: true

@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/reader"
 	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
@@ -50,20 +49,8 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 		idleDuration   = 10 * time.Second
 		writeCount     = 100
 		gvk            = "apps/v1/Deployment"
-		holder         = "phase5-holder"
 		baselineForAll = 500 * time.Millisecond
 	)
-
-	// Acquire leases for all buckets
-	bucketEpochs := make(map[int]int64)
-	for b := 1; b <= numBuckets; b++ {
-		lc := manualConn(t)
-		mgr := lease.NewSpecManager(lc, holder)
-		ep, err := mgr.Acquire(ctx, b, 120*time.Second)
-		require.NoError(t, err)
-		lc.Close(context.Background())
-		bucketEpochs[b] = ep
-	}
 
 	// Seed 2000 resources across buckets
 	seedConn := manualConn(t)
@@ -72,12 +59,11 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 		bucketID := (i % numBuckets) + 1
 		req := model.WriteRequest{
 			GVK: gvk, Namespace: "phase5-seed",
-			Name:        fmt.Sprintf("seed-%d", i),
-			BucketID:    bucketID,
-			Spec:        json.RawMessage(`{"seed":true}`),
-			Status:      json.RawMessage(`{}`),
-			Metadata:    json.RawMessage(`{}`),
-			LeaseHolder: holder, LeaseEpoch: bucketEpochs[bucketID],
+			Name:     fmt.Sprintf("seed-%d", i),
+			BucketID: bucketID,
+			Spec:     json.RawMessage(`{"seed":true}`),
+			Status:   json.RawMessage(`{}`),
+			Metadata: json.RawMessage(`{}`),
 		}
 		_, err := seedWriter.Write(ctx, req)
 		require.NoError(t, err)
@@ -189,7 +175,6 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 		GVK: gvk, BucketIDs: bucketIDs(numBuckets),
 		PollInterval:   200 * time.Millisecond,
 		CanaryInterval: 500 * time.Millisecond,
-		CanaryHolder:   holder, CanaryEpoch: bucketEpochs[1],
 	})
 	verCtx, verCancel := context.WithCancel(ctx)
 	verDone := make(chan error, 1)
@@ -273,11 +258,10 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 		name := fmt.Sprintf("phase5-db-%d", i)
 		req := model.WriteRequest{
 			GVK: gvk, Namespace: "phase5-db", Name: name,
-			BucketID:    bucketID,
-			Spec:        json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
-			Status:      json.RawMessage(`{}`),
-			Metadata:    json.RawMessage(`{}`),
-			LeaseHolder: holder, LeaseEpoch: bucketEpochs[bucketID],
+			BucketID: bucketID,
+			Spec:     json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
+			Status:   json.RawMessage(`{}`),
+			Metadata: json.RawMessage(`{}`),
 		}
 		writeTimesMu.Lock()
 		writeTimes[name] = time.Now()
@@ -406,11 +390,10 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 		name := fmt.Sprintf("phase5-loss-%d", i)
 		req := model.WriteRequest{
 			GVK: gvk, Namespace: "phase5-loss", Name: name,
-			BucketID:    bucketID,
-			Spec:        json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
-			Status:      json.RawMessage(`{}`),
-			Metadata:    json.RawMessage(`{}`),
-			LeaseHolder: holder, LeaseEpoch: bucketEpochs[bucketID],
+			BucketID: bucketID,
+			Spec:     json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
+			Status:   json.RawMessage(`{}`),
+			Metadata: json.RawMessage(`{}`),
 		}
 		lossWriteTimesMu.Lock()
 		lossWriteTimes[name] = time.Now()

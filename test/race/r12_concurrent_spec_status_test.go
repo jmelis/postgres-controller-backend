@@ -15,7 +15,6 @@ import (
 )
 
 // R12 — Concurrent spec and status writes (I1/I2 for mixed write paths).
-// holder-A owns the spec lease, holder-B owns the status lease.
 // Both write to the same resource. Each write bumps the shared counter and
 // object_version. A watcher polling after each write sees the new state at the
 // correct sequence number — the shared counter produces a gapless sequence
@@ -24,16 +23,12 @@ func TestR12_ConcurrentSpecStatus(t *testing.T) {
 	truncateAll(t)
 	ctx := context.Background()
 
-	specEpoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-	statusEpoch := setupStatusLease(t, 1, "holder-b", 60_000_000_000)
-
 	// Create resource via spec writer (seq=1, object_version=1)
 	specW := newWriter(t, nil)
 	createReq := model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "mixed-writer",
 		BucketID: 1, Spec: json.RawMessage(`{"replicas":1}`),
 		Status: json.RawMessage(`{"ready":false}`), Metadata: json.RawMessage(`{}`),
-		LeaseHolder: "holder-a", LeaseEpoch: specEpoch,
 	}
 	r1, err := specW.Write(ctx, createReq)
 	require.NoError(t, err)
@@ -45,7 +40,6 @@ func TestR12_ConcurrentSpecStatus(t *testing.T) {
 	statusReq := model.StatusWriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "mixed-writer",
 		BucketID: 1, Status: json.RawMessage(`{"ready":true,"conditions":["init"]}`),
-		LeaseHolder: "holder-b", LeaseEpoch: statusEpoch,
 		ExpectedVersion: r1.ObjectVersion,
 	}
 	r2, err := statusW.WriteStatus(ctx, statusReq)
@@ -59,7 +53,6 @@ func TestR12_ConcurrentSpecStatus(t *testing.T) {
 		BucketID: 1, Spec: json.RawMessage(`{"replicas":3}`),
 		Status: json.RawMessage(`{"ready":true,"conditions":["init"]}`),
 		Metadata: json.RawMessage(`{}`),
-		LeaseHolder: "holder-a", LeaseEpoch: specEpoch,
 		ExpectedVersion: r2.ObjectVersion,
 	}
 	r3, err := specW.Write(ctx, specReq2)
@@ -71,7 +64,6 @@ func TestR12_ConcurrentSpecStatus(t *testing.T) {
 	statusReq2 := model.StatusWriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "mixed-writer",
 		BucketID: 1, Status: json.RawMessage(`{"ready":true,"conditions":["init","progressing"]}`),
-		LeaseHolder: "holder-b", LeaseEpoch: statusEpoch,
 		ExpectedVersion: r3.ObjectVersion,
 	}
 	r4, err := statusW.WriteStatus(ctx, statusReq2)
@@ -124,59 +116,4 @@ func TestR12_ConcurrentSpecStatus(t *testing.T) {
 	assert.JSONEq(t, `{"replicas":3}`, string(spec), "spec must reflect holder-A's last write")
 	assert.JSONEq(t, `{"ready":true,"conditions":["init","progressing"]}`, string(status),
 		"status must reflect holder-B's last write")
-}
-
-// TestR12_SpecStatusIndependentFencing verifies that spec and status fencing
-// are fully independent: holder-A can write spec while holder-B writes status,
-// and neither blocks the other's lease table.
-func TestR12_SpecStatusIndependentFencing(t *testing.T) {
-	truncateAll(t)
-	ctx := context.Background()
-
-	specEpoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-	statusEpoch := setupStatusLease(t, 1, "holder-b", 60_000_000_000)
-
-	// Create resource
-	specW := newWriter(t, nil)
-	createReq := model.WriteRequest{
-		GVK: "apps/v1/Deployment", Namespace: "default", Name: "independent-fence",
-		BucketID: 1, Spec: json.RawMessage(`{"replicas":1}`),
-		Status: json.RawMessage(`{}`), Metadata: json.RawMessage(`{}`),
-		LeaseHolder: "holder-a", LeaseEpoch: specEpoch,
-	}
-	r1, err := specW.Write(ctx, createReq)
-	require.NoError(t, err)
-
-	// holder-b cannot do Write (spec fence — wrong table)
-	statusW := writer.New(freshConn(t), nil)
-	_, err = statusW.Write(ctx, model.WriteRequest{
-		GVK: "apps/v1/Deployment", Namespace: "default", Name: "independent-fence",
-		BucketID: 1, Spec: json.RawMessage(`{"replicas":2}`),
-		Status: json.RawMessage(`{}`), Metadata: json.RawMessage(`{}`),
-		LeaseHolder: "holder-b", LeaseEpoch: statusEpoch,
-		ExpectedVersion: r1.ObjectVersion,
-	})
-	assert.ErrorIs(t, err, writer.ErrFenceViolation,
-		"holder-b must be fenced on spec write (no spec lease)")
-
-	// holder-a cannot do WriteStatus (status fence — wrong table)
-	specW2 := writer.New(freshConn(t), nil)
-	_, err = specW2.WriteStatus(ctx, model.StatusWriteRequest{
-		GVK: "apps/v1/Deployment", Namespace: "default", Name: "independent-fence",
-		BucketID: 1, Status: json.RawMessage(`{"ready":true}`),
-		LeaseHolder: "holder-a", LeaseEpoch: specEpoch,
-		ExpectedVersion: r1.ObjectVersion,
-	})
-	assert.ErrorIs(t, err, writer.ErrFenceViolation,
-		"holder-a must be fenced on status write (no status lease)")
-
-	// holder-b can WriteStatus (has status lease)
-	statusResult, err := statusW.WriteStatus(ctx, model.StatusWriteRequest{
-		GVK: "apps/v1/Deployment", Namespace: "default", Name: "independent-fence",
-		BucketID: 1, Status: json.RawMessage(`{"ready":true}`),
-		LeaseHolder: "holder-b", LeaseEpoch: statusEpoch,
-		ExpectedVersion: r1.ObjectVersion,
-	})
-	require.NoError(t, err)
-	assert.Equal(t, int64(2), statusResult.Seq)
 }

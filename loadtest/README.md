@@ -6,29 +6,27 @@ This harness tests the **Go library packages** that implement Postgres-backed Ku
 
 ### Packages under test
 
-| Package               | What it does                                                                                                                                                                                                                                                                                                                                    | How the harness uses it                                                                                                                          |
-| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `internal/writer`     | Fenced atomic writes via `pgctl_write()` stored procedure: lease check (FOR SHARE) &rarr; no-op suppression &rarr; counter increment &rarr; UPSERT, all in one server-side call. `pg_notify` doorbell fires after commit, outside the transaction. Enforces single-writer semantics (I4), gapless sequences (I1), commit ordering (I2), and optimistic concurrency (I8). | Every phase creates `writer.New(conn, nil).WithMetrics(m)` instances and calls `Write()` at varying rates, concurrency, and bucket distributions. |
-| `internal/reader`     | Poll-primary watcher with optional doorbell (LISTEN/NOTIFY). Delivers gap-free event streams per (GVK, bucket) regardless of doorbell health. Single-goroutine scheduler with debounce.                                                                                                                                                         | Phase 5 creates `reader.NewWatcher(...)` instances to measure idle poll cost, doorbell delivery latency, and baseline-only fallback.              |
-| `internal/lease`      | Per-bucket lease acquisition, renewal, and release. The epoch-based fencing mechanism that prevents stale writers from committing.                                                                                                                                                                                                               | All phases acquire leases via `lease.NewSpecManager(conn, holder).WithMetrics(m)`. Phase 3 specifically tests lease handover and zombie fencing.  |
-| `internal/verifier`   | Continuous invariant checker — subscribes to the poll stream and verifies monotonic high-water marks (I3/I6), gap-vs-compaction-horizon checks (I7), and canary write-to-delivery latency.                                                                                                                                                       | Runs alongside every write phase. Any violation fails the test. Same code used in production.                                                    |
-| `internal/compaction` | Tombstone compaction: deletes fully-deleted tombstones (deletion_timestamp set, no active finalizers) and advances the compaction horizon atomically in a single CTE (I7). Dying objects with finalizers are preserved.                                                                                                                          | Background goroutine runs `compaction.Compact()` every 5 minutes during long tests to keep table size bounded.                                   |
-| `internal/schema`     | DDL migration — creates all tables and indexes.                                                                                                                                                                                                                                                                                                  | Runs once at startup before seeding.                                                                                                             |
-| `internal/metrics`    | Prometheus metrics for all of the above: write duration/count, poll duration, delivery latency, lease operations, verifier violations.                                                                                                                                                                                                           | All library instances are wired with `.WithMetrics(...)`. Metrics are scraped by CloudWatch Agent and pushed to a CloudWatch dashboard alongside native RDS metrics. |
+| Package               | What it does                                                                                                                                                                                                                                                                                         | How the harness uses it                                                                                                                                              |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `internal/writer`     | Atomic writes via `pgctl_write()` stored procedure: no-op suppression &rarr; counter increment &rarr; UPSERT, all in one server-side call. `pg_notify` doorbell fires after commit, outside the transaction. Enforces gapless sequences (I1), commit ordering (I2), and optimistic concurrency (I7). | Every phase creates `writer.New(conn, nil).WithMetrics(m)` instances and calls `Write()` at varying rates, concurrency, and bucket distributions.                    |
+| `internal/reader`     | Poll-primary watcher with optional doorbell (LISTEN/NOTIFY). Delivers gap-free event streams per (GVK, bucket) regardless of doorbell health. Single-goroutine scheduler with debounce.                                                                                                              | Phase 5 creates `reader.NewWatcher(...)` instances to measure idle poll cost, doorbell delivery latency, and baseline-only fallback.                                 |
+| `internal/verifier`   | Continuous invariant checker — subscribes to the poll stream and verifies monotonic high-water marks (I3/I5), gap-vs-compaction-horizon checks (I6), and canary write-to-delivery latency.                                                                                                           | Runs alongside every write phase. Any violation fails the test. Same code used in production.                                                                        |
+| `internal/compaction` | Tombstone compaction: deletes fully-deleted tombstones (deletion_timestamp set, no active finalizers) and advances the compaction horizon atomically in a single CTE (I6). Dying objects with finalizers are preserved.                                                                              | Background goroutine runs `compaction.Compact()` every 5 minutes during long tests to keep table size bounded.                                                       |
+| `internal/schema`     | DDL migration — creates all tables and indexes.                                                                                                                                                                                                                                                      | Runs once at startup before seeding.                                                                                                                                 |
+| `internal/metrics`    | Prometheus metrics for all of the above: write duration/count, poll duration, delivery latency, verifier violations.                                                                                                                                                                                 | All library instances are wired with `.WithMetrics(...)`. Metrics are scraped by CloudWatch Agent and pushed to a CloudWatch dashboard alongside native RDS metrics. |
 
 ### Invariants validated
 
 The harness validates the correctness invariants from [DESIGN.md §2](../DESIGN.md):
 
-| Invariant                              | What it guarantees                                                                                                             | How the harness tests it                                                                                                                                                       |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **I1 — Gapless issuance**              | Committed sequence numbers are exactly 1, 2, 3, ... with no holes per (GVK, bucket).                                           | The verifier runs during every write phase and checks the stream. Concurrent writers in Phase 1 stress the counter's INSERT ON CONFLICT path.                                  |
-| **I2 — Commit order = sequence order** | If seq(A) < seq(B), then A committed before B became visible.                                                                  | The verifier confirms monotonic high-water marks; watchers in Phase 5 verify delivery order.                                                                                   |
-| **I3 — No regression**                 | `current_seq` never decreases, even across failover.                                                                           | The verifier's HWM check catches any regression. Phase 6 (manual) tests this across RDS failover.                                                                              |
-| **I4 — Single writer**                 | A replica holding a stale lease epoch cannot commit.                                                                           | Phase 3 starts zombie writers with stale epochs — every zombie write must fail with `ErrFenceViolation`. The verifier confirms the stream has no interleaved stale-epoch data. |
-| **I5 — Exactly-once delivery**         | Watchers receive every state change exactly once (coalescing permitted), with no duplicates or losses, regardless of doorbell. | Phase 5's notify-loss drill disables the LISTEN connection; watchers must still deliver every event via poll-only fallback within the baseline interval.                       |
-| **I7 — Compaction safety**             | A watcher can never silently skip a compacted event.                                                                           | The compaction goroutine runs during long phases; the verifier checks that gaps are only below the compaction horizon.                                                         |
-| **I8 — Optimistic concurrency**        | An update with a stale `object_version` is rejected (409).                                                                     | The writer library handles this internally; the harness measures resulting error rates.                                                                                        |
+| Invariant                              | What it guarantees                                                                                                             | How the harness tests it                                                                                                                                 |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **I1 — Gapless issuance**              | Committed sequence numbers are exactly 1, 2, 3, ... with no holes per (GVK, bucket).                                           | The verifier runs during every write phase and checks the stream. Concurrent writers in Phase 1 stress the counter's INSERT ON CONFLICT path.            |
+| **I2 — Commit order = sequence order** | If seq(A) < seq(B), then A committed before B became visible.                                                                  | The verifier confirms monotonic high-water marks; watchers in Phase 5 verify delivery order.                                                             |
+| **I3 — No regression**                 | `current_seq` never decreases, even across failover.                                                                           | The verifier's HWM check catches any regression. Phase 6 (manual) tests this across RDS failover.                                                        |
+| **I4 — Exactly-once delivery**         | Watchers receive every state change exactly once (coalescing permitted), with no duplicates or losses, regardless of doorbell. | Phase 5's notify-loss drill disables the LISTEN connection; watchers must still deliver every event via poll-only fallback within the baseline interval. |
+| **I6 — Compaction safety**             | A watcher can never silently skip a compacted event.                                                                           | The compaction goroutine runs during long phases; the verifier checks that gaps are only below the compaction horizon.                                   |
+| **I7 — Optimistic concurrency**        | An update with a stale `object_version` is rejected (409).                                                                     | The writer library handles this internally; the harness measures resulting error rates.                                                                  |
 
 ### Why local Postgres isn't enough
 
@@ -49,15 +47,15 @@ Each phase targets a specific failure mode or performance boundary from [DESIGN.
 
 Saturates buckets with N concurrent writers to find the maximum writes/s before serialization failures or latency degradation. This is the fundamental capacity number that all sizing math depends on.
 
-**Library code exercised:** `writer.Write()` under maximum concurrency, `lease.Acquire()` + `lease.Renew()`, `verifier.Run()`.
+**Library code exercised:** `writer.Write()` under maximum concurrency, `verifier.Run()`.
 
-**Pass criteria:** meets target RPS, p99 below threshold, zero serialization failures, zero fence violations, verifier silent.
+**Pass criteria:** meets target RPS, p99 below threshold, zero serialization failures, verifier silent.
 
 ### Phase 2 — Steady state
 
 Sustains a target RPS for an extended period (hours to a week). Validates that autovacuum keeps up, IOPS stays within provisioned limits, and the write path remains stable. Periodic bursts test headroom.
 
-**Library code exercised:** `writer.Write()` at sustained rate with burst periods, `lease.Renew()` over the full duration, `verifier.Run()` continuously, `compaction.Compact()` periodically.
+**Library code exercised:** `writer.Write()` at sustained rate with burst periods, `verifier.Run()` continuously, `compaction.Compact()` periodically.
 
 **Pass criteria:** sustained RPS within 5% of target, p50 below threshold, verifier silent.
 
@@ -71,11 +69,11 @@ Zipfian distribution: one bucket gets 80% of writes while the rest are cold. Pro
 
 ### Phase 3 — Avalanche / kill writers
 
-Kills a fraction of writers mid-stream, then starts zombie writers holding stale lease epochs. The zombies must be fenced. New writers acquire leases and take over. The verifier confirms the event stream remains gapless across handover.
+Kills a fraction of writers mid-stream. New writers start and race on the same buckets. The verifier confirms the event stream remains gapless across the disruption.
 
-**Library code exercised:** `lease.Acquire()` (contested, after previous holder's TTL expires), `writer.Write()` with stale epoch (must return `ErrFenceViolation`), `verifier.Run()` across the handover boundary.
+**Library code exercised:** `writer.Write()` under crash/restart churn, `verifier.Run()` across the disruption boundary.
 
-**Pass criteria:** all zombie writes fenced, verifier detects no gaps or violations across the handover.
+**Pass criteria:** verifier detects no gaps or violations.
 
 ### Phase 5 — Poll and delivery latency
 
@@ -209,7 +207,7 @@ go build -o lt ./loadtest/cmd/loadtest/
 
 ### Write path
 
-The writer uses a PL/pgSQL stored procedure (`pgctl_write`) that performs the fence check, suppression check, counter increment, and resource upsert in a single server-side call. `pg_notify` fires outside the transaction as a fire-and-forget doorbell. The full write is 2 network round-trips: BEGIN + function call, COMMIT.
+The writer uses a PL/pgSQL stored procedure (`pgctl_write`) that performs the suppression check, counter increment, and resource upsert in a single server-side call. `pg_notify` fires outside the transaction as a fire-and-forget doorbell. The full write is 2 network round-trips: BEGIN + function call, COMMIT.
 
 COMMIT dominates write latency (~61% of total time) — this is the Multi-AZ synchronous replication wait. The WAL sync round-trip is the throughput bottleneck, not CPU.
 
@@ -218,13 +216,13 @@ COMMIT dominates write latency (~61% of total time) — this is the Multi-AZ syn
 Measured with the `ceiling-hunt` spec: 1 worker per bucket, 120s duration, 15s warm-up.
 
 | Buckets | large (2 vCPU) | xlarge (4 vCPU) | 2xlarge (8 vCPU) | 8xlarge (32 vCPU) |
-|---------|---------------|-----------------|------------------|-------------------|
-| 64      | 2,852 w/s     | 5,770 w/s       | 9,622 w/s        | 11,728 w/s        |
-| 32      | 2,745         | 5,224           | 6,663            | 6,815             |
-| 16      | 2,376         | 3,271           | 3,803            | 3,719             |
-| 8       | 1,709         | 1,790           | 2,049            | 1,918             |
-| 4       | 931           | 931             | 1,068            | 974               |
-| 1       | 339           | 292             | 317              | 306               |
+| ------- | -------------- | --------------- | ---------------- | ----------------- |
+| 64      | 2,852 w/s      | 5,770 w/s       | 9,622 w/s        | 11,728 w/s        |
+| 32      | 2,745          | 5,224           | 6,663            | 6,815             |
+| 16      | 2,376          | 3,271           | 3,803            | 3,719             |
+| 8       | 1,709          | 1,790           | 2,049            | 1,918             |
+| 4       | 931            | 931             | 1,068            | 974               |
+| 1       | 339            | 292             | 317              | 306               |
 
 p99 latency at 64 buckets: large 68.5ms, xlarge 23.4ms, 2xlarge 13.2ms, 8xlarge 7.7ms.
 
@@ -272,7 +270,7 @@ The 2xlarge is the sweet spot — the 50k-cluster tier requires 3,740 burst w/s,
 
 ### Remaining optimization lever: async commit
 
-`synchronous_commit = off` would remove the WAL sync bottleneck entirely. The tradeoff is durability: a crash-and-restart-in-place can lose the WAL tail, rewinding committed state without an epoch bump. Level-triggered controllers re-converge, but non-idempotent side effects keyed on acknowledged writes would be silently wrong. `remote_write` is a middle ground (standby durability without local fsync). See [DESIGN.md §3.8](../DESIGN.md) for the full analysis.
+`synchronous_commit = off` would remove the WAL sync bottleneck entirely. The tradeoff is durability: a crash-and-restart-in-place can lose the WAL tail, rewinding committed state without an epoch bump. Level-triggered controllers re-converge, but non-idempotent side effects keyed on acknowledged writes would be silently wrong. `remote_write` is a middle ground (standby durability without local fsync). See [DESIGN.md §3.7](../DESIGN.md) for the full analysis.
 
 ## Directory structure
 

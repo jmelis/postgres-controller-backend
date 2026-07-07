@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/verifier"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
@@ -21,20 +20,15 @@ import (
 
 const phase3Name = "phase3_avalanche"
 
-// RunPhase3 runs the kill-replicas + zombie-writers test.
+// RunPhase3 runs the kill-replicas test.
 //  1. Starts N writers (one per bucket), each writing continuously.
 //  2. After a warmup period, kills kill_fraction of them.
-//  3. Optionally starts zombie_writers that hold stale epochs and attempt writes
-//     (must be fenced — all zombie writes should fail with ErrFenceViolation).
-//  4. Surviving + new writers take over via lease acquisition.
-//  5. Verifier checks gapless stream across handover.
+//  3. New writers take over the killed buckets.
+//  4. Verifier checks gapless stream across handover.
 func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, error) {
 	pCfg := cfg.Phases.Phase3Avalanche
 	numBuckets := cfg.Cluster.Buckets
-	holder := "phase3-holder"
-	ttl := cfg.Cluster.LeaseTTL
 	killFraction := pCfg.KillFraction
-	zombieCount := pCfg.ZombieWriters
 
 	gvk := "apps/v1/Deployment"
 	if len(cfg.Seed.GVKs) > 0 {
@@ -43,22 +37,9 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 
 	const warmupDuration = 10 * time.Second
 	const postKillDuration = 20 * time.Second
-	const zombieDuration = 15 * time.Second
 
-	log.Printf("phase3: starting avalanche test — %d buckets, kill_fraction=%.1f, zombies=%d",
-		numBuckets, killFraction, zombieCount)
-
-	// Acquire initial leases.
-	leaseConn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("phase3: lease conn: %w", err)
-	}
-	defer leaseConn.Close(context.Background())
-
-	bucketEpochs, err := acquireAllLeases(ctx, leaseConn, numBuckets, holder, ttl)
-	if err != nil {
-		return nil, fmt.Errorf("phase3: %w", err)
-	}
+	log.Printf("phase3: starting avalanche test — %d buckets, kill_fraction=%.1f",
+		numBuckets, killFraction)
 
 	// Start verifier.
 	var ver *verifier.Verifier
@@ -86,12 +67,11 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	var mu sync.Mutex
 	var allLatencies []time.Duration
 	var totalWrites atomic.Int64
-	var totalSerFail, totalFenceFail, totalOtherErr atomic.Int64
-	var zombieFenced atomic.Int64
+	var totalSerFail, totalOtherErr atomic.Int64
 
 	// writerLoop is a single writer that writes to its assigned bucket until
 	// its context is cancelled.
-	writerLoop := func(ctx context.Context, bucketID int, holderID string, epoch int64, wg *sync.WaitGroup) {
+	writerLoop := func(ctx context.Context, bucketID int, writerID string, wg *sync.WaitGroup) {
 		defer wg.Done()
 
 		conn, err := pgx.Connect(ctx, dsn)
@@ -111,17 +91,15 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 			default:
 			}
 
-			name := fmt.Sprintf("p3-%s-b%d-r%d", holderID, bucketID, writeNum)
+			name := fmt.Sprintf("p3-%s-b%d-r%d", writerID, bucketID, writeNum)
 			req := model.WriteRequest{
-				GVK:         gvk,
-				Namespace:   "phase3",
-				Name:        name,
-				BucketID:    bucketID,
-				Spec:        json.RawMessage(fmt.Sprintf(`{"h":"%s","n":%d}`, holderID, writeNum)),
-				Status:      json.RawMessage(`{}`),
-				Metadata:    json.RawMessage(`{}`),
-				LeaseHolder: holderID,
-				LeaseEpoch:  epoch,
+				GVK:       gvk,
+				Namespace: "phase3",
+				Name:      name,
+				BucketID:  bucketID,
+				Spec:      json.RawMessage(fmt.Sprintf(`{"w":"%s","n":%d}`, writerID, writeNum)),
+				Status:    json.RawMessage(`{}`),
+				Metadata:  json.RawMessage(`{}`),
 			}
 
 			t0 := time.Now()
@@ -131,8 +109,6 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 			if writeErr != nil {
 				if isSerializationFailure(writeErr) {
 					totalSerFail.Add(1)
-				} else if isFenceViolation(writeErr) {
-					totalFenceFail.Add(1)
 				} else {
 					totalOtherErr.Add(1)
 				}
@@ -162,7 +138,7 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 		wCtx, wCancel := context.WithCancel(warmupCtx)
 		writerCancels[b-1] = wCancel
 		warmupWg.Add(1)
-		go writerLoop(wCtx, b, holder, bucketEpochs[b], &warmupWg)
+		go writerLoop(wCtx, b, "phase3-holder", &warmupWg)
 	}
 
 	time.Sleep(warmupDuration)
@@ -189,114 +165,22 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	}
 
 	log.Printf("phase3: killing writers for buckets %v", killedBuckets)
-	staleEpochs := make(map[int]int64)
 	for _, b := range killedBuckets {
-		staleEpochs[b] = bucketEpochs[b]
 		writerCancels[b-1]()
 	}
 
-	// Wait for lease TTL to expire for killed writers.
-	log.Printf("phase3: waiting for leases to expire (%v)", ttl)
-	time.Sleep(ttl + 2*time.Second)
-
-	// Phase C: optionally start zombie writers with stale epochs.
-	var zombieWg sync.WaitGroup
-	var zombieCtx context.Context
-	var zombieCancel context.CancelFunc
-
-	if zombieCount > 0 && len(killedBuckets) > 0 {
-		zombieCtx, zombieCancel = context.WithCancel(ctx)
-		defer zombieCancel()
-		log.Printf("phase3: starting %d zombie writers with stale epochs", zombieCount)
-
-		for z := 0; z < zombieCount; z++ {
-			bucketID := killedBuckets[z%len(killedBuckets)]
-			zombieHolder := fmt.Sprintf("zombie-%d", z)
-			staleEpoch := staleEpochs[bucketID]
-
-			zombieWg.Add(1)
-			go func(bID int, h string, ep int64) {
-				defer zombieWg.Done()
-
-				conn, err := pgx.Connect(zombieCtx, dsn)
-				if err != nil {
-					return
-				}
-				defer conn.Close(context.Background())
-
-				wr := writer.New(conn, nil).WithMetrics(libWriterMetrics)
-				for n := 0; ; n++ {
-					select {
-					case <-zombieCtx.Done():
-						return
-					default:
-					}
-
-					name := fmt.Sprintf("p3-zombie-%s-b%d-r%d", h, bID, n)
-					req := model.WriteRequest{
-						GVK:         gvk,
-						Namespace:   "phase3",
-						Name:        name,
-						BucketID:    bID,
-						Spec:        json.RawMessage(`{"zombie":true}`),
-						Status:      json.RawMessage(`{}`),
-						Metadata:    json.RawMessage(`{}`),
-						LeaseHolder: h,
-						LeaseEpoch:  ep, // stale — should be fenced
-					}
-
-					_, writeErr := wr.Write(zombieCtx, req)
-					if writeErr != nil {
-						if isFenceViolation(writeErr) {
-							zombieFenced.Add(1)
-						}
-						// All zombie writes should fail; if they succeed, that's a problem.
-					}
-					time.Sleep(50 * time.Millisecond)
-				}
-			}(bucketID, zombieHolder, staleEpoch)
-		}
-	}
-
-	// Phase D: new writers acquire leases and take over killed buckets.
-	newHolder := "phase3-survivor"
-	newLeaseConn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		warmupCancel()
-		return nil, fmt.Errorf("phase3: new lease conn: %w", err)
-	}
-	defer newLeaseConn.Close(context.Background())
-
-	newMgr := lease.NewSpecManager(newLeaseConn, newHolder).WithMetrics(libLeaseMetrics)
-	newEpochs := make(map[int]int64)
-	for _, b := range killedBuckets {
-		epoch, err := newMgr.Acquire(ctx, b, ttl)
-		if err != nil {
-			log.Printf("phase3: WARNING — could not acquire lease for bucket %d: %v", b, err)
-			continue
-		}
-		newEpochs[b] = epoch
-	}
-	log.Printf("phase3: new writers acquired leases for %d/%d killed buckets", len(newEpochs), len(killedBuckets))
-
-	// Start new writers for recovered buckets.
+	// Phase C: new writers take over killed buckets.
 	var newWriterWg sync.WaitGroup
 	newCtx, newCancel := context.WithCancel(ctx)
-	for b, ep := range newEpochs {
+	for _, b := range killedBuckets {
 		newWriterWg.Add(1)
-		go writerLoop(newCtx, b, newHolder, ep, &newWriterWg)
+		go writerLoop(newCtx, b, "phase3-survivor", &newWriterWg)
 	}
+	log.Printf("phase3: new writers started for %d killed buckets", len(killedBuckets))
 
 	// Let the system run for postKillDuration.
 	log.Printf("phase3: running post-kill for %v", postKillDuration)
 	time.Sleep(postKillDuration)
-
-	// Stop zombies.
-	if zombieCancel != nil {
-		log.Printf("phase3: stopping zombies (fenced %d writes)", zombieFenced.Load())
-		zombieCancel()
-		zombieWg.Wait()
-	}
 
 	// Stop all writers.
 	warmupCancel()
@@ -337,33 +221,20 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	}
 
 	serFail := totalSerFail.Load()
-	fenceFail := totalFenceFail.Load()
 	otherErr := totalOtherErr.Load()
-	fenced := zombieFenced.Load()
 
 	if serFail > 0 {
 		errorsTotal.WithLabelValues(phase3Name, "serialization").Add(float64(serFail))
 	}
-	if fenceFail > 0 {
-		errorsTotal.WithLabelValues(phase3Name, "fence_violation").Add(float64(fenceFail))
-	}
 
-	log.Printf("phase3: completed — %d writes (%.1f w/s), zombie_fenced=%d, violations=%d",
-		total, rps, fenced, len(violations))
+	log.Printf("phase3: completed — %d writes (%.1f w/s), violations=%d",
+		total, rps, len(violations))
 	log.Printf("phase3: killed=%v, surviving=%v", killedBuckets, survivingBuckets)
 
 	passed := true
-	// Zombie writes must all have been fenced (if any zombies ran).
-	if zombieCount > 0 && fenced == 0 {
-		log.Printf("phase3: WARNING — zombies ran but zero fence violations detected")
-		// This is acceptable if zombie writes never reached the DB
-		// (e.g., connection failed). We only fail if they succeeded.
-	}
 	if len(violations) > 0 {
 		passed = false
 	}
-
-	releaseAllLeases(ctx, leaseConn, numBuckets, holder)
 
 	return &PhaseResult{
 		Name:        phase3Name,
@@ -375,10 +246,8 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 		P99:         p99,
 		P999:        p999,
 		Errors: map[string]int64{
-			"serialization":  serFail,
-			"fence_violation": fenceFail,
-			"zombie_fenced":  fenced,
-			"other":          otherErr,
+			"serialization": serFail,
+			"other":         otherErr,
 		},
 		VerifierViolations: violations,
 	}, nil

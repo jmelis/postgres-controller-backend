@@ -22,8 +22,6 @@ func TestR3_Toxi_DoorbellLoss_ResetPeer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	// pollConn goes DIRECT (bypasses proxy — always healthy)
 	pollConn, err := pdb.DirectConn(ctx)
 	require.NoError(t, err)
@@ -50,7 +48,7 @@ func TestR3_Toxi_DoorbellLoss_ResetPeer(t *testing.T) {
 	wr := directWriter(t, nil)
 	for i := 0; i < 3; i++ {
 		req := makeWriteReq("apps/v1/Deployment", "default",
-			fmt.Sprintf("toxi-r3-%d", i), 1, "holder-a", epoch)
+			fmt.Sprintf("toxi-r3-%d", i), 1)
 		_, err := wr.Write(ctx, req)
 		require.NoError(t, err)
 	}
@@ -82,7 +80,7 @@ func TestR3_Toxi_DoorbellLoss_ResetPeer(t *testing.T) {
 	wr2 := directWriter(t, nil)
 	for i := 3; i < 8; i++ {
 		req := makeWriteReq("apps/v1/Deployment", "default",
-			fmt.Sprintf("toxi-r3-%d", i), 1, "holder-a", epoch)
+			fmt.Sprintf("toxi-r3-%d", i), 1)
 		_, err := wr2.Write(ctx, req)
 		require.NoError(t, err)
 	}
@@ -126,8 +124,6 @@ func TestR3_Toxi_DoorbellReconnect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	// pollConn goes DIRECT (always healthy)
 	pollConn, err := pdb.DirectConn(ctx)
 	require.NoError(t, err)
@@ -155,7 +151,7 @@ func TestR3_Toxi_DoorbellReconnect(t *testing.T) {
 
 	// Write first resource — doorbell should be working, expect fast delivery
 	wr := directWriter(t, nil)
-	req := makeWriteReq("apps/v1/Deployment", "default", "reconnect-0", 1, "holder-a", epoch)
+	req := makeWriteReq("apps/v1/Deployment", "default", "reconnect-0", 1)
 	_, err = wr.Write(ctx, req)
 	require.NoError(t, err)
 
@@ -172,7 +168,7 @@ func TestR3_Toxi_DoorbellReconnect(t *testing.T) {
 	require.NoError(t, err)
 
 	wrKill := directWriter(t, nil)
-	reqKill := makeWriteReq("apps/v1/Deployment", "default", "reconnect-kill", 1, "holder-a", epoch)
+	reqKill := makeWriteReq("apps/v1/Deployment", "default", "reconnect-kill", 1)
 	_, err = wrKill.Write(ctx, reqKill)
 	require.NoError(t, err)
 	time.Sleep(500 * time.Millisecond)
@@ -205,7 +201,7 @@ func TestR3_Toxi_DoorbellReconnect(t *testing.T) {
 
 	// Write another resource — doorbell should be restored
 	wr2 := directWriter(t, nil)
-	req2 := makeWriteReq("apps/v1/Deployment", "default", "reconnect-1", 1, "holder-a", epoch)
+	req2 := makeWriteReq("apps/v1/Deployment", "default", "reconnect-1", 1)
 	_, err = wr2.Write(ctx, req2)
 	require.NoError(t, err)
 

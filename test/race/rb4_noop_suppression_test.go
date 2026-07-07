@@ -6,12 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/reader"
 	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
-	"github.com/jmelis/postgres-controller-backend/internal/writer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -23,10 +20,9 @@ func TestRB4a_IdenticalWriteSuppressed(t *testing.T) {
 	truncateAll(t)
 	ctx := context.Background()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
 	w := newWriter(t, nil)
 
-	req := makeWriteReq("apps/v1/Deployment", "default", "noop-test", 1, "holder-a", epoch)
+	req := makeWriteReq("apps/v1/Deployment", "default", "noop-test", 1)
 	r1, err := w.Write(ctx, req)
 	require.NoError(t, err)
 	assert.True(t, r1.Changed, "first write must be changed")
@@ -66,11 +62,10 @@ func TestRB4b_RealChangeAfterNoOp(t *testing.T) {
 	truncateAll(t)
 	ctx := context.Background()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
 	w := newWriter(t, nil)
 
 	// Write initial content.
-	req := makeWriteReq("apps/v1/Deployment", "default", "noop-seq", 1, "holder-a", epoch)
+	req := makeWriteReq("apps/v1/Deployment", "default", "noop-seq", 1)
 	r1, err := w.Write(ctx, req)
 	require.NoError(t, err)
 	assert.True(t, r1.Changed)
@@ -96,11 +91,10 @@ func TestRB4c_WatcherSeesNoEventForSuppressed(t *testing.T) {
 	truncateAll(t)
 	ctx := context.Background()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
 	w := newWriter(t, nil)
 
 	// Create initial object.
-	req := makeWriteReq("apps/v1/Deployment", "default", "noop-watch", 1, "holder-a", epoch)
+	req := makeWriteReq("apps/v1/Deployment", "default", "noop-watch", 1)
 	r1, err := w.Write(ctx, req)
 	require.NoError(t, err)
 
@@ -158,10 +152,9 @@ func TestRB4d_ReplayedCreateSuppressed(t *testing.T) {
 	truncateAll(t)
 	ctx := context.Background()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
 	w := newWriter(t, nil)
 
-	req := makeWriteReq("apps/v1/Deployment", "default", "replay-create", 1, "holder-a", epoch)
+	req := makeWriteReq("apps/v1/Deployment", "default", "replay-create", 1)
 	r1, err := w.Write(ctx, req)
 	require.NoError(t, err)
 	assert.True(t, r1.Changed)
@@ -189,12 +182,10 @@ func TestRB4e_WriteStatusSuppressed(t *testing.T) {
 	truncateAll(t)
 	ctx := context.Background()
 
-	specEpoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-	statusEpoch := setupStatusLease(t, 1, "status-holder", 60_000_000_000)
 	w := newWriter(t, nil)
 
 	// Create the object first via spec write.
-	createReq := makeWriteReq("apps/v1/Deployment", "default", "status-noop", 1, "holder-a", specEpoch)
+	createReq := makeWriteReq("apps/v1/Deployment", "default", "status-noop", 1)
 	r1, err := w.Write(ctx, createReq)
 	require.NoError(t, err)
 	assert.True(t, r1.Changed)
@@ -207,8 +198,6 @@ func TestRB4e_WriteStatusSuppressed(t *testing.T) {
 		BucketID:        1,
 		Status:          json.RawMessage(`{"ready":true}`),
 		ExpectedVersion: r1.ObjectVersion,
-		LeaseHolder:     "status-holder",
-		LeaseEpoch:      statusEpoch,
 	}
 	r2, err := w.WriteStatus(ctx, statusReq)
 	require.NoError(t, err)
@@ -227,10 +216,9 @@ func TestRB4f_ForceWriteBypassesSuppression(t *testing.T) {
 	truncateAll(t)
 	ctx := context.Background()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
 	w := newWriter(t, nil)
 
-	req := makeWriteReq("apps/v1/Deployment", "default", "force-test", 1, "holder-a", epoch)
+	req := makeWriteReq("apps/v1/Deployment", "default", "force-test", 1)
 	r1, err := w.Write(ctx, req)
 	require.NoError(t, err)
 
@@ -244,93 +232,3 @@ func TestRB4f_ForceWriteBypassesSuppression(t *testing.T) {
 	assert.Equal(t, r1.ObjectVersion+1, r2.ObjectVersion)
 }
 
-// RB4g — No-op suppression under the fence: interleave a grant between
-// suppression check and commit. The suppressed write holds FOR SHARE,
-// so the grant must block until the suppressed txn commits.
-func TestRB4g_SuppressionUnderFence(t *testing.T) {
-	truncateAll(t)
-	ctx := context.Background()
-
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
-	// Hook that blocks after suppression check.
-	hook := &afterSuppressionBlockingHook{
-		ready:   make(chan struct{}),
-		proceed: make(chan struct{}),
-	}
-	writerA := writer.New(freshConn(t), hook)
-
-	grantConn := freshConn(t)
-	coordinator := lease.NewSpecManager(grantConn, "coordinator")
-
-	// First write to create the object.
-	plainWriter := newWriter(t, nil)
-	req := makeWriteReq("apps/v1/Deployment", "default", "fence-suppress", 1, "holder-a", epoch)
-	r1, err := plainWriter.Write(ctx, req)
-	require.NoError(t, err)
-
-	// Suppressed write in goroutine — will pause after suppression check.
-	type result struct {
-		res model.WriteResult
-		err error
-	}
-	aCh := make(chan result, 1)
-	go func() {
-		req2 := makeWriteReq("apps/v1/Deployment", "default", "fence-suppress", 1, "holder-a", epoch)
-		req2.ExpectedVersion = r1.ObjectVersion
-		r, err := writerA.Write(ctx, req2)
-		aCh <- result{r, err}
-	}()
-
-	// Wait for A to reach the hook (holds FOR SHARE).
-	select {
-	case <-hook.ready:
-	case <-time.After(10 * time.Second):
-		t.Fatal("timeout waiting for suppression hook")
-	}
-
-	// Grant must block because A holds FOR SHARE.
-	bCh := make(chan error, 1)
-	go func() {
-		_, err := coordinator.Grant(ctx, 1, "holder-b", 60*time.Second)
-		bCh <- err
-	}()
-
-	select {
-	case err := <-bCh:
-		t.Fatalf("Grant completed while FOR SHARE held — I4 violated (err=%v)", err)
-	case <-time.After(500 * time.Millisecond):
-		// Expected: blocked.
-	}
-
-	// Unblock A.
-	close(hook.proceed)
-
-	aResult := <-aCh
-	require.NoError(t, aResult.err)
-	assert.False(t, aResult.res.Changed, "write must still be suppressed")
-
-	// Grant completes.
-	require.NoError(t, <-bCh)
-}
-
-// afterSuppressionBlockingHook blocks at AfterSuppressionCheck.
-type afterSuppressionBlockingHook struct {
-	ready   chan struct{}
-	proceed chan struct{}
-}
-
-func (h *afterSuppressionBlockingHook) AfterFence(_ context.Context, _ pgx.Tx) error { return nil }
-func (h *afterSuppressionBlockingHook) AfterSuppressionCheck(ctx context.Context, _ pgx.Tx, _ bool) error {
-	close(h.ready)
-	select {
-	case <-h.proceed:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-func (h *afterSuppressionBlockingHook) AfterCounter(_ context.Context, _ pgx.Tx, _ int64) error {
-	return nil
-}
-func (h *afterSuppressionBlockingHook) BeforeCommit(_ context.Context, _ pgx.Tx) error { return nil }

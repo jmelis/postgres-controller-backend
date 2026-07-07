@@ -31,14 +31,13 @@ func TestR15_CompactionMidPoll(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
 	wr := newWriter(t, nil)
 
 	// Write 3 tombstones with old deletion_timestamp (eligible for compaction)
 	for i := 0; i < 3; i++ {
 		past := time.Now().Add(-48 * time.Hour)
 		req := makeWriteReq("apps/v1/Deployment", "default",
-			fmt.Sprintf("r15-victim-%d", i), 1, "holder-a", epoch)
+			fmt.Sprintf("r15-victim-%d", i), 1)
 		req.DeletionTimestamp = &past
 		_, err := wr.Write(ctx, req)
 		if err != nil {
@@ -48,7 +47,7 @@ func TestR15_CompactionMidPoll(t *testing.T) {
 
 	// Write 1 live resource at seq=4
 	_, err := wr.Write(ctx, makeWriteReq("apps/v1/Deployment", "default",
-		"r15-survivor", 1, "holder-a", epoch))
+		"r15-survivor", 1))
 	if err != nil {
 		t.Fatalf("setup survivor: %v", err)
 	}

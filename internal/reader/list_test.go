@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/reader"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
@@ -38,11 +37,6 @@ func TestListReturnsLiveResources(t *testing.T) {
 	db := testinfra.StartPostgres(t)
 	ctx := context.Background()
 
-	leaseConn := db.Connect(t)
-	mgr := lease.NewSpecManager(leaseConn, "replica-1")
-	epoch, err := mgr.Acquire(ctx, 1, 30*time.Second)
-	require.NoError(t, err)
-
 	writerConn := db.Connect(t)
 	w := writer.New(writerConn, nil)
 
@@ -51,7 +45,7 @@ func TestListReturnsLiveResources(t *testing.T) {
 			GVK: "apps/v1/Deployment", Namespace: "default",
 			Name: fmt.Sprintf("deploy-%d", i), BucketID: 1,
 			Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
-			Metadata: json.RawMessage(`{}`), LeaseHolder: "replica-1", LeaseEpoch: epoch,
+			Metadata: json.RawMessage(`{}`),
 		}
 		_, err := w.Write(ctx, req)
 		require.NoError(t, err)
@@ -76,19 +70,14 @@ func TestListExcludesTombstones(t *testing.T) {
 	db := testinfra.StartPostgres(t)
 	ctx := context.Background()
 
-	leaseConn := db.Connect(t)
-	mgr := lease.NewSpecManager(leaseConn, "replica-1")
-	epoch, err := mgr.Acquire(ctx, 1, 30*time.Second)
-	require.NoError(t, err)
-
 	writerConn := db.Connect(t)
 	w := writer.New(writerConn, nil)
 
 	// Create a live resource
-	_, err = w.Write(ctx, model.WriteRequest{
+	_, err := w.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "live",
 		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
-		Metadata: json.RawMessage(`{}`), LeaseHolder: "replica-1", LeaseEpoch: epoch,
+		Metadata: json.RawMessage(`{}`),
 	})
 	require.NoError(t, err)
 
@@ -98,7 +87,6 @@ func TestListExcludesTombstones(t *testing.T) {
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "deleted",
 		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`), DeletionTimestamp: &now,
-		LeaseHolder: "replica-1", LeaseEpoch: epoch,
 	})
 	require.NoError(t, err)
 
@@ -117,19 +105,14 @@ func TestListIncludesDyingWithFinalizers(t *testing.T) {
 	db := testinfra.StartPostgres(t)
 	ctx := context.Background()
 
-	leaseConn := db.Connect(t)
-	mgr := lease.NewSpecManager(leaseConn, "replica-1")
-	epoch, err := mgr.Acquire(ctx, 1, 30*time.Second)
-	require.NoError(t, err)
-
 	writerConn := db.Connect(t)
 	w := writer.New(writerConn, nil)
 
 	// Create a live resource
-	_, err = w.Write(ctx, model.WriteRequest{
+	_, err := w.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "live",
 		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
-		Metadata: json.RawMessage(`{}`), LeaseHolder: "replica-1", LeaseEpoch: epoch,
+		Metadata: json.RawMessage(`{}`),
 	})
 	require.NoError(t, err)
 
@@ -140,7 +123,6 @@ func TestListIncludesDyingWithFinalizers(t *testing.T) {
 		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata:          json.RawMessage(`{"finalizers":["cleanup.example.com"]}`),
 		DeletionTimestamp: &now,
-		LeaseHolder:       "replica-1", LeaseEpoch: epoch,
 	})
 	require.NoError(t, err)
 
@@ -150,7 +132,6 @@ func TestListIncludesDyingWithFinalizers(t *testing.T) {
 		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata:          json.RawMessage(`{}`),
 		DeletionTimestamp: &now,
-		LeaseHolder:       "replica-1", LeaseEpoch: epoch,
 	})
 	require.NoError(t, err)
 
@@ -171,27 +152,20 @@ func TestListMultipleBuckets(t *testing.T) {
 	db := testinfra.StartPostgres(t)
 	ctx := context.Background()
 
-	leaseConn := db.Connect(t)
-	mgr := lease.NewSpecManager(leaseConn, "replica-1")
-	epoch1, err := mgr.Acquire(ctx, 1, 30*time.Second)
-	require.NoError(t, err)
-	epoch2, err := mgr.Acquire(ctx, 2, 30*time.Second)
-	require.NoError(t, err)
-
 	writerConn := db.Connect(t)
 	w := writer.New(writerConn, nil)
 
-	_, err = w.Write(ctx, model.WriteRequest{
+	_, err := w.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "ns1", Name: "a",
 		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
-		Metadata: json.RawMessage(`{}`), LeaseHolder: "replica-1", LeaseEpoch: epoch1,
+		Metadata: json.RawMessage(`{}`),
 	})
 	require.NoError(t, err)
 
 	_, err = w.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "ns2", Name: "b",
 		BucketID: 2, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
-		Metadata: json.RawMessage(`{}`), LeaseHolder: "replica-1", LeaseEpoch: epoch2,
+		Metadata: json.RawMessage(`{}`),
 	})
 	require.NoError(t, err)
 

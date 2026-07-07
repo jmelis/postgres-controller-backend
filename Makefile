@@ -13,7 +13,7 @@ test-unit:
 	go test -race -v ./internal/resourceversion/
 
 test-integration:
-	go test -race -v -timeout=180s ./internal/schema/ ./internal/lease/ ./internal/writer/ ./internal/reader/ ./internal/compaction/ ./internal/verifier/
+	go test -race -v -timeout=180s ./internal/schema/ ./internal/writer/ ./internal/reader/ ./internal/compaction/ ./internal/verifier/
 
 test-race:
 	go test -race -v -count=1 -timeout=120s ./test/race/

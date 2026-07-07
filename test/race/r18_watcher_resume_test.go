@@ -21,8 +21,6 @@ func TestR18_WatcherResume(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	// ── Watcher A ──────────────────────────────────────────────────────────
 	pollConnA := connectManualShared(t)
 	listenConnA := connectManualShared(t)
@@ -42,7 +40,7 @@ func TestR18_WatcherResume(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		wr := newWriter(t, nil)
 		req := makeWriteReq("apps/v1/Deployment", "default",
-			fmt.Sprintf("resume-%d", i), 1, "holder-a", epoch)
+			fmt.Sprintf("resume-%d", i), 1)
 		_, err := wr.Write(ctx, req)
 		require.NoError(t, err)
 	}
@@ -79,7 +77,7 @@ func TestR18_WatcherResume(t *testing.T) {
 	for i := 5; i < 10; i++ {
 		wr := newWriter(t, nil)
 		req := makeWriteReq("apps/v1/Deployment", "default",
-			fmt.Sprintf("resume-%d", i), 1, "holder-a", epoch)
+			fmt.Sprintf("resume-%d", i), 1)
 		_, err := wr.Write(ctx, req)
 		require.NoError(t, err)
 	}

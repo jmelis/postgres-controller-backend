@@ -4,9 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
-	"time"
 
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
 	"github.com/jmelis/postgres-controller-backend/test/testinfra"
@@ -24,11 +22,6 @@ func TestCreateConflict_ReturnsAlreadyExists(t *testing.T) {
 	db := testinfra.StartPostgres(t)
 	ctx := context.Background()
 
-	leaseConn := db.Connect(t)
-	mgr := lease.NewSpecManager(leaseConn, "test-replica")
-	epoch, err := mgr.Acquire(ctx, 1, 30*time.Second)
-	require.NoError(t, err)
-
 	writerConn := db.Connect(t)
 	w := writer.New(writerConn, nil)
 
@@ -36,7 +29,6 @@ func TestCreateConflict_ReturnsAlreadyExists(t *testing.T) {
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "dup-create",
 		BucketID: 1, Spec: json.RawMessage(`{"replicas":1}`),
 		Status: json.RawMessage(`{}`), Metadata: json.RawMessage(`{}`),
-		LeaseHolder: "test-replica", LeaseEpoch: epoch,
 	}
 
 	// First create succeeds
@@ -62,7 +54,6 @@ func TestCreateConflict_ReturnsAlreadyExists(t *testing.T) {
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "dup-create-other",
 		BucketID: 1, Spec: json.RawMessage(`{"replicas":1}`),
 		Status: json.RawMessage(`{}`), Metadata: json.RawMessage(`{}`),
-		LeaseHolder: "test-replica", LeaseEpoch: epoch,
 	}
 	result, err := w.Write(ctx, req2)
 	require.NoError(t, err)

@@ -23,8 +23,6 @@ func TestR5_AmbiguousCommit(t *testing.T) {
 	truncateAll(t)
 	ctx := context.Background()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	// Create a connection through a FaultConn that we can cut mid-COMMIT
 	var fault *faultConn
 	var cutSignal atomic.Bool
@@ -53,7 +51,7 @@ func TestR5_AmbiguousCommit(t *testing.T) {
 	hook := &commitCutHook{cutSignal: &cutSignal}
 	w := writer.New(faultyConn, hook)
 
-	req := makeWriteReq("apps/v1/Deployment", "default", "ambiguous", 1, "holder-a", epoch)
+	req := makeWriteReq("apps/v1/Deployment", "default", "ambiguous", 1)
 	result, writeErr := w.Write(ctx, req)
 
 	// The write might succeed (if COMMIT response made it through before the cut)
@@ -124,7 +122,6 @@ type commitCutHook struct {
 	cutSignal *atomic.Bool
 }
 
-func (h *commitCutHook) AfterFence(_ context.Context, _ pgx.Tx) error                    { return nil }
 func (h *commitCutHook) AfterSuppressionCheck(_ context.Context, _ pgx.Tx, _ bool) error { return nil }
 func (h *commitCutHook) AfterCounter(_ context.Context, _ pgx.Tx, _ int64) error         { return nil }
 

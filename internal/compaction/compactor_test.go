@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/jmelis/postgres-controller-backend/internal/compaction"
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
 	"github.com/jmelis/postgres-controller-backend/test/testinfra"
@@ -22,19 +21,14 @@ func TestCompactDeletesExpiredTombstones(t *testing.T) {
 	db := testinfra.StartPostgres(t)
 	ctx := context.Background()
 
-	leaseConn := db.Connect(t)
-	mgr := lease.NewSpecManager(leaseConn, "replica-1")
-	epoch, err := mgr.Acquire(ctx, 1, 60*time.Second)
-	require.NoError(t, err)
-
 	writerConn := db.Connect(t)
 	w := writer.New(writerConn, nil)
 
 	// Create a live resource
-	_, err = w.Write(ctx, model.WriteRequest{
+	_, err := w.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "live",
 		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
-		Metadata: json.RawMessage(`{}`), LeaseHolder: "replica-1", LeaseEpoch: epoch,
+		Metadata: json.RawMessage(`{}`),
 	})
 	require.NoError(t, err)
 
@@ -44,7 +38,6 @@ func TestCompactDeletesExpiredTombstones(t *testing.T) {
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "old-tombstone",
 		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`), DeletionTimestamp: &past,
-		LeaseHolder: "replica-1", LeaseEpoch: epoch,
 	})
 	require.NoError(t, err)
 
@@ -84,21 +77,15 @@ func TestCompactSkipsFreshTombstones(t *testing.T) {
 	db := testinfra.StartPostgres(t)
 	ctx := context.Background()
 
-	leaseConn := db.Connect(t)
-	mgr := lease.NewSpecManager(leaseConn, "replica-1")
-	epoch, err := mgr.Acquire(ctx, 1, 60*time.Second)
-	require.NoError(t, err)
-
 	writerConn := db.Connect(t)
 	w := writer.New(writerConn, nil)
 
 	// Create a fresh tombstone (just now)
 	now := time.Now()
-	_, err = w.Write(ctx, model.WriteRequest{
+	_, err := w.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "fresh-tombstone",
 		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`), DeletionTimestamp: &now,
-		LeaseHolder: "replica-1", LeaseEpoch: epoch,
 	})
 	require.NoError(t, err)
 

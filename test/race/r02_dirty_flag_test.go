@@ -24,8 +24,6 @@ func TestR2_DirtyFlagSwallow(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	pollConn := connectManualShared(t)
 	listenConn := connectManualShared(t)
 
@@ -55,7 +53,7 @@ func TestR2_DirtyFlagSwallow(t *testing.T) {
 
 	// Write a resource — doorbell fires, should trigger at least one poll
 	wr := newWriter(t, nil)
-	req := makeWriteReq("apps/v1/Deployment", "default", "dirty-flag-test", 1, "holder-a", epoch)
+	req := makeWriteReq("apps/v1/Deployment", "default", "dirty-flag-test", 1)
 	_, err := wr.Write(ctx, req)
 	require.NoError(t, err)
 
@@ -94,8 +92,6 @@ func TestR2_DirtyFlagSwallow_Stress(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	pollConn := connectManualShared(t)
 
 	var pollCount atomic.Int32
@@ -128,7 +124,7 @@ func TestR2_DirtyFlagSwallow_Stress(t *testing.T) {
 			defer wg.Done()
 			wr := newWriter(t, nil)
 			req := makeWriteReq("apps/v1/Deployment", "default",
-				fmt.Sprintf("stress-%d", idx), 1, "holder-a", epoch)
+				fmt.Sprintf("stress-%d", idx), 1)
 			wr.Write(ctx, req)
 		}(i)
 	}

@@ -100,10 +100,9 @@ func newManager(t *testing.T) ctrl.Manager {
 	conn.Close(context.Background())
 
 	mgr, err := pgruntime.NewManager(pgruntime.Options{
-		Scheme:   testScheme,
-		DSN:      sharedDB.ConnStr,
-		HolderID: "test-" + t.Name(),
-		Logger:   logr.Discard(),
+		Scheme: testScheme,
+		DSN:    sharedDB.ConnStr,
+		Logger: logr.Discard(),
 	})
 	require.NoError(t, err)
 	return mgr

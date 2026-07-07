@@ -6,16 +6,6 @@ CREATE TABLE IF NOT EXISTS gvk_bucket_counters (
     PRIMARY KEY (bucket_id, gvk)
 ) WITH (fillfactor = 50);
 
--- Lease fencing: authoritative writer epoch per (bucket, domain)
-CREATE TABLE IF NOT EXISTS bucket_leases (
-    bucket_id  INT    NOT NULL,
-    domain     TEXT   NOT NULL CHECK (domain IN ('spec', 'status')),
-    holder     TEXT   NOT NULL,
-    epoch      BIGINT NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (bucket_id, domain)
-);
-
 -- Resources: one row per object. Three lifecycle states:
 --   live (deletion_timestamp IS NULL),
 --   dying (deletion_timestamp set, has finalizers),
@@ -62,22 +52,20 @@ CREATE TABLE IF NOT EXISTS compaction_horizon (
     compacted_seq BIGINT NOT NULL,
     PRIMARY KEY (bucket_id, gvk)
 );
--- Fenced write stored procedure.
--- Performs fence check, optional no-op suppression, counter increment,
--- and upsert in a single server-side call. Does NOT issue pg_notify —
--- the caller fires the doorbell after commit to avoid the global
--- notification-queue lock that serializes all commits.
+-- Write stored procedure.
+-- Performs optional no-op suppression, counter increment, and upsert in a
+-- single server-side call. Does NOT issue pg_notify — the caller fires
+-- the doorbell after commit to avoid the global notification-queue lock
+-- that serializes all commits.
 -- Returns per-step timings (microseconds) so the caller can emit them
 -- as Prometheus histograms without additional round-trips.
 DROP FUNCTION IF EXISTS pgctl_write;
 CREATE OR REPLACE FUNCTION pgctl_write(
-    p_domain          TEXT,
+    p_status_only      BOOLEAN,
     p_gvk             TEXT,
     p_namespace        TEXT,
     p_name             TEXT,
     p_bucket_id        INT,
-    p_holder           TEXT,
-    p_epoch            BIGINT,
     p_expected_version BIGINT,
     p_force_write      BOOLEAN,
     p_spec             JSONB,
@@ -85,7 +73,7 @@ CREATE OR REPLACE FUNCTION pgctl_write(
     p_metadata         JSONB,
     p_deletion_ts      TIMESTAMPTZ DEFAULT NULL
 ) RETURNS TABLE(out_uid UUID, out_version BIGINT, out_seq BIGINT, out_changed BOOLEAN,
-                out_fence_us BIGINT, out_suppress_us BIGINT, out_counter_us BIGINT, out_upsert_us BIGINT)
+                out_suppress_us BIGINT, out_counter_us BIGINT, out_upsert_us BIGINT)
 LANGUAGE plpgsql AS $$
 DECLARE
     v_seq         BIGINT;
@@ -93,27 +81,11 @@ DECLARE
     v_version     BIGINT;
     v_existing    RECORD;
     v_t0          TIMESTAMPTZ;
-    v_fence_us    BIGINT := 0;
     v_suppress_us BIGINT := 0;
     v_counter_us  BIGINT := 0;
     v_upsert_us   BIGINT := 0;
 BEGIN
-    -- 1. Fence check
-    v_t0 := clock_timestamp();
-    PERFORM 1 FROM bucket_leases
-    WHERE bucket_id = p_bucket_id
-      AND domain    = p_domain
-      AND holder    = p_holder
-      AND epoch     = p_epoch
-      AND expires_at > now()
-    FOR SHARE;
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'fence violation' USING ERRCODE = 'P0001';
-    END IF;
-    v_fence_us := extract(microseconds from clock_timestamp() - v_t0)::BIGINT;
-
-    -- 2. Suppression check (skip if force_write)
+    -- 1. Suppression check (skip if force_write)
     v_t0 := clock_timestamp();
     IF NOT p_force_write THEN
         SELECT kr.uid, kr.object_version, kr.spec, kr.status, kr.metadata, kr.deletion_timestamp
@@ -122,11 +94,11 @@ BEGIN
          WHERE kr.gvk = p_gvk AND kr.namespace = p_namespace AND kr.name = p_name;
 
         IF FOUND THEN
-            IF p_domain = 'status' THEN
+            IF p_status_only THEN
                 IF v_existing.status = p_status THEN
                     v_suppress_us := extract(microseconds from clock_timestamp() - v_t0)::BIGINT;
                     RETURN QUERY SELECT v_existing.uid, v_existing.object_version, 0::BIGINT, false,
-                        v_fence_us, v_suppress_us, v_counter_us, v_upsert_us;
+                        v_suppress_us, v_counter_us, v_upsert_us;
                     RETURN;
                 END IF;
             ELSE
@@ -136,7 +108,7 @@ BEGIN
                    AND v_existing.deletion_timestamp IS NOT DISTINCT FROM p_deletion_ts THEN
                     v_suppress_us := extract(microseconds from clock_timestamp() - v_t0)::BIGINT;
                     RETURN QUERY SELECT v_existing.uid, v_existing.object_version, 0::BIGINT, false,
-                        v_fence_us, v_suppress_us, v_counter_us, v_upsert_us;
+                        v_suppress_us, v_counter_us, v_upsert_us;
                     RETURN;
                 END IF;
             END IF;
@@ -144,7 +116,7 @@ BEGIN
     END IF;
     v_suppress_us := extract(microseconds from clock_timestamp() - v_t0)::BIGINT;
 
-    -- 3. Counter increment
+    -- 2. Counter increment
     v_t0 := clock_timestamp();
     INSERT INTO gvk_bucket_counters (bucket_id, gvk, current_seq)
     VALUES (p_bucket_id, p_gvk, 1)
@@ -153,9 +125,9 @@ BEGIN
     RETURNING current_seq INTO v_seq;
     v_counter_us := extract(microseconds from clock_timestamp() - v_t0)::BIGINT;
 
-    -- 4. Upsert
+    -- 3. Upsert
     v_t0 := clock_timestamp();
-    IF p_domain = 'status' THEN
+    IF p_status_only THEN
         IF p_expected_version = 0 THEN
             RAISE EXCEPTION 'WriteStatus requires ExpectedVersion > 0' USING ERRCODE = 'P0004';
         END IF;
@@ -225,6 +197,6 @@ BEGIN
     v_upsert_us := extract(microseconds from clock_timestamp() - v_t0)::BIGINT;
 
     RETURN QUERY SELECT v_uid, v_version, v_seq, true,
-        v_fence_us, v_suppress_us, v_counter_us, v_upsert_us;
+        v_suppress_us, v_counter_us, v_upsert_us;
 END;
 $$;

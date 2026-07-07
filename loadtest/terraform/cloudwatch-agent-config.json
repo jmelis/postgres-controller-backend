@@ -15,7 +15,6 @@
                 "^pgctl_writer_",
                 "^pgctl_watcher_",
                 "^pgctl_verifier_",
-                "^pgctl_lease_",
                 "^loadtest_"
               ]
             }

@@ -4,11 +4,11 @@ This directory contains two implementations of the same controller — one using
 controller-runtime against etcd, and one using `pgruntime` against PostgreSQL.
 Both manage three CRDs that exercise the three common controller patterns:
 
-| CR | Pattern | Description |
-|---|---|---|
-| `Greeting` | Own spec + status | User sets `spec.name`, controller computes `status.message` |
-| `GreetingCard` | Own spec (child) | Controller creates as a child of Greeting |
-| `GreetingPolicy` | Watch (external) | `spec.prefix` affects message; changes trigger re-reconciliation |
+| CR               | Pattern           | Description                                                      |
+| ---------------- | ----------------- | ---------------------------------------------------------------- |
+| `Greeting`       | Own spec + status | User sets `spec.name`, controller computes `status.message`      |
+| `GreetingCard`   | Own spec (child)  | Controller creates as a child of Greeting                        |
+| `GreetingPolicy` | Watch (external)  | `spec.prefix` affects message; changes trigger re-reconciliation |
 
 ## What changes, what stays the same
 
@@ -65,16 +65,17 @@ type TypedObject[S any, T any] struct {
 
 ### 2. CRUD: `client.Client` → `pgruntime.TypedClient[S, T]`
 
-| Operation | controller-runtime | pgruntime |
-|---|---|---|
-| Get | `r.Get(ctx, key, &obj)` | `client.Get(ctx, ns, name)` |
-| Create | `r.Create(ctx, &obj)` | `client.Create(ctx, ns, name, spec)` |
-| Update spec | `r.Update(ctx, &obj)` | `client.Update(ctx, obj)` |
+| Operation     | controller-runtime             | pgruntime                                  |
+| ------------- | ------------------------------ | ------------------------------------------ |
+| Get           | `r.Get(ctx, key, &obj)`        | `client.Get(ctx, ns, name)`                |
+| Create        | `r.Create(ctx, &obj)`          | `client.Create(ctx, ns, name, spec)`       |
+| Update spec   | `r.Update(ctx, &obj)`          | `client.Update(ctx, obj)`                  |
 | Update status | `r.Status().Update(ctx, &obj)` | `client.Status().Update(ctx, obj, status)` |
-| Delete | `r.Delete(ctx, &obj)` | `client.Delete(ctx, obj)` |
-| List | `r.List(ctx, &list, opts...)` | `client.List(ctx)` |
+| Delete        | `r.Delete(ctx, &obj)`          | `client.Delete(ctx, obj)`                  |
+| List          | `r.List(ctx, &list, opts...)`  | `client.List(ctx)`                         |
 
 Key differences:
+
 - `pgruntime.TypedClient` is **per-GVK** (one client per kind). controller-runtime
   uses a single `client.Client` for all types.
 - Create takes the typed spec directly — status defaults to the zero value.
@@ -89,15 +90,11 @@ JSON (e.g., HTTP APIs). Access it via `typedClient.Untyped()`.
 
 ### 3. Error handling: `errors.IsNotFound()` → sentinel errors
 
-| Condition | controller-runtime | pgruntime |
-|---|---|---|
-| Not found | `errors.IsNotFound(err)` | `err == pgruntime.ErrNotFound` |
+| Condition      | controller-runtime            | pgruntime                           |
+| -------------- | ----------------------------- | ----------------------------------- |
+| Not found      | `errors.IsNotFound(err)`      | `err == pgruntime.ErrNotFound`      |
 | Already exists | `errors.IsAlreadyExists(err)` | `err == pgruntime.ErrAlreadyExists` |
-| Conflict | `errors.IsConflict(err)` | `err == pgruntime.ErrConflict` |
-| Fenced | N/A | `err == pgruntime.ErrFenced` |
-
-`ErrFenced` is new — it means the lease epoch doesn't match, typically because
-another replica took over. Treat it as a signal to stop processing.
+| Conflict       | `errors.IsConflict(err)`      | `err == pgruntime.ErrConflict`      |
 
 ### 4. Watches: `SetupWithManager` → `NewControllerFor`
 
@@ -121,6 +118,7 @@ pgruntime.NewControllerFor[GreetingSpec, GreetingStatus](mgr, gvkGreeting, recon
 
 The `Manager` handles all the list-watch-relist loops, work queue, and
 reconcile dispatch internally. You only write:
+
 - A `Reconcile(ctx, *TypedObject[S, T]) (Result, error)` method
 - A `MapFunc` for cross-type watches (e.g., policy change → requeue greetings)
 
@@ -150,7 +148,7 @@ mgr, _ := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{Scheme: scheme})
 mgr.Start(ctrl.SetupSignalHandler())
 ```
 
-**postgres** — connect, migrate, acquire leases, then use the Manager:
+**postgres** — connect, migrate, then use the Manager:
 
 ```go
 // 1. Connect to postgres (with retry loop)
@@ -159,31 +157,22 @@ conn, _ := pgx.Connect(ctx, dsn)
 // 2. Migrate schema
 schema.Migrate(ctx, conn)
 
-// 3. Acquire leases
-leaseMgr := lease.NewBothManager(leaseConn, holderID)
-epochs, _ := leaseMgr.AcquireBoth(ctx, bucketID, leaseTTL)
-
-// 4. Create typed clients
+// 3. Create typed clients
 greetingClient := pgruntime.NewTypedClient[GreetingSpec, GreetingStatus](
-    pgruntime.NewClient(connFactory, gvk, assigner, holderID, epochs.Spec),
+    pgruntime.NewClient(connFactory, gvk, assigner),
     pgruntime.NewListerWatcher(connFactory, gvk, buckets),
 )
 
-// 5. Create Manager, register controller, start
+// 4. Create Manager, register controller, start
 mgr := pgruntime.NewManager(pgruntime.ManagerConfig{...})
 pgruntime.NewControllerFor[GreetingSpec, GreetingStatus](mgr, gvk, reconciler).
     Watches(gvkGreetingPolicy, reconciler.policyToGreetings).
     Complete()
 mgr.Start(ctx)
-
-// 6. Start lease renewal ticker (every ~10s)
 ```
 
 New concepts with no etcd equivalent:
-- **Lease acquisition** — you call `AcquireBoth` on startup to get an epoch
-  for write fencing. Don't release leases on shutdown (let the TTL expire).
-- **Lease renewal** — a background ticker calls `RenewBoth` to keep the lease
-  alive. If it lapses, writes are fenced.
+
 - **Schema migration** — `schema.Migrate()` creates the postgres tables.
   Idempotent, safe to call on every startup.
 - **Connection factory** — `pgruntime.TypedClient` and `ListerWatcher` take a
@@ -232,23 +221,24 @@ consumers who would otherwise use kubectl.
 
 ## Line count comparison
 
-| | etcd-controller | postgres-controller |
-|---|---|---|
-| types / deepcopy / scheme | 193 | 32 (plain structs) |
-| controller + reconcile | 108 | 93 |
-| main / bootstrap | 32 | 168 |
-| validator | 0 (apiserver does it) | 129 |
-| HTTP API | 0 (apiserver does it) | 242 |
-| **Total** | **333** | **664** |
+|                           | etcd-controller       | postgres-controller |
+| ------------------------- | --------------------- | ------------------- |
+| types / deepcopy / scheme | 193                   | 32 (plain structs)  |
+| controller + reconcile    | 108                   | 93                  |
+| main / bootstrap          | 32                    | 168                 |
+| validator                 | 0 (apiserver does it) | 129                 |
+| HTTP API                  | 0 (apiserver does it) | 242                 |
+| **Total**                 | **333**               | **664**             |
 
 The reconcile function is now roughly the same size as the etcd version. The
 remaining delta is:
-- Bootstrap / lease management (~136 lines)
+
+- Bootstrap (~136 lines)
 - CRD validation (~129 lines)
 - HTTP API for external access (~242 lines, optional)
 
 Without the optional HTTP API, the delta is ~422 lines — and most of that is
-validation and lease management, not controller logic.
+validation and bootstrap, not controller logic.
 
 ## Migration checklist
 
@@ -262,15 +252,15 @@ validation and lease management, not controller logic.
    `TypedObject` — no `json.Unmarshal` needed.
 
 3. **Replace error checks** — `errors.IsNotFound(err)` → `err == pgruntime.ErrNotFound`,
-   etc. Add handling for `ErrFenced`.
+   etc.
 
 4. **Replace `SetupWithManager` with `NewControllerFor`** — implement the
    `Reconciler[S, T]` interface, use `Watches()` for cross-type triggers,
    call `Complete()` to register with the Manager. The Manager handles
    list-watch-relist loops and the work queue internally.
 
-5. **Add bootstrap code** — connect to postgres, migrate schema, acquire leases,
-   create typed clients, create a `Manager`, start lease renewal ticker.
+5. **Add bootstrap code** — connect to postgres, migrate schema, create typed
+   clients, create a `Manager`.
 
 6. **Add CRD validation** — embed CRD YAMLs, build a `Validator`, call
    `ValidateSpec`/`ValidateStatus` before every write in the HTTP API layer.

@@ -32,8 +32,6 @@ func TestCoalescingFalsePositive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	wrConn := freshConn(t)
 	wr := writer.New(wrConn, nil)
 
@@ -42,7 +40,6 @@ func TestCoalescingFalsePositive(t *testing.T) {
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "coalesce-test",
 		BucketID: 1, Spec: json.RawMessage(`{"v":1}`),
 		Status: json.RawMessage(`{}`), Metadata: json.RawMessage(`{}`),
-		LeaseHolder: "holder-a", LeaseEpoch: epoch,
 	}
 	result, err := wr.Write(ctx, req)
 	require.NoError(t, err)

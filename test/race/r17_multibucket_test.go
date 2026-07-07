@@ -22,12 +22,6 @@ func TestR17_InterleavedDelivery(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Setup leases on 3 buckets.
-	epoch1 := setupLease(t, 1, "holder-a", 60_000_000_000)
-	epoch2 := setupLease(t, 2, "holder-a", 60_000_000_000)
-	epoch3 := setupLease(t, 3, "holder-a", 60_000_000_000)
-	epochs := map[int]int64{1: epoch1, 2: epoch2, 3: epoch3}
-
 	pollConn := connectManualShared(t)
 	listenConn := connectManualShared(t)
 
@@ -59,7 +53,7 @@ func TestR17_InterleavedDelivery(t *testing.T) {
 		for _, b := range buckets {
 			wr := newWriter(t, nil)
 			req := makeWriteReq("apps/v1/Deployment", "default",
-				fmt.Sprintf("mb-b%d-%d", b, i), b, "holder-a", epochs[b])
+				fmt.Sprintf("mb-b%d-%d", b, i), b)
 			_, err := wr.Write(ctx, req)
 			require.NoError(t, err)
 		}
@@ -105,11 +99,6 @@ func TestR17_DoorbellPerChannel(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	epoch1 := setupLease(t, 1, "holder-a", 60_000_000_000)
-	_ = setupLease(t, 2, "holder-a", 60_000_000_000)
-	epoch3 := setupLease(t, 3, "holder-a", 60_000_000_000)
-	_ = epoch1 // lease must exist but we only write to bucket 3
-
 	pollConn := connectManualShared(t)
 	listenConn := connectManualShared(t)
 
@@ -138,7 +127,7 @@ func TestR17_DoorbellPerChannel(t *testing.T) {
 	// Write ONE resource to bucket 3 only.
 	wr := newWriter(t, nil)
 	req := makeWriteReq("apps/v1/Deployment", "default",
-		"doorbell-b3", 3, "holder-a", epoch3)
+		"doorbell-b3", 3)
 	_, err := wr.Write(ctx, req)
 	require.NoError(t, err)
 
@@ -158,14 +147,12 @@ func TestR17_Partial410(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	epoch2 := setupLease(t, 2, "holder-a", 60_000_000_000)
-
 	// Write 3 tombstones to bucket 2.
 	wr := newWriter(t, nil)
 	for i := 0; i < 3; i++ {
 		past := time.Now().Add(-48 * time.Hour)
 		req := makeWriteReq("apps/v1/Deployment", "default",
-			fmt.Sprintf("tombstone-b2-%d", i), 2, "holder-a", epoch2)
+			fmt.Sprintf("tombstone-b2-%d", i), 2)
 		req.DeletionTimestamp = &past
 		_, err := wr.Write(ctx, req)
 		require.NoError(t, err)
@@ -179,7 +166,7 @@ func TestR17_Partial410(t *testing.T) {
 
 	// Write 1 live resource to bucket 2 (seq=4).
 	_, err = wr.Write(ctx, makeWriteReq("apps/v1/Deployment", "default",
-		"live-b2", 2, "holder-a", epoch2))
+		"live-b2", 2))
 	require.NoError(t, err)
 
 	// Compact bucket 2 — removes tombstones, advances horizon.
@@ -187,10 +174,6 @@ func TestR17_Partial410(t *testing.T) {
 	result, err := compaction.Compact(ctx, compactConn, compaction.Config{Retention: 1 * time.Hour})
 	require.NoError(t, err)
 	assert.Equal(t, int64(3), result.Deleted)
-
-	// Setup leases on buckets 1 and 3 too.
-	setupLease(t, 1, "holder-a", 60_000_000_000)
-	setupLease(t, 3, "holder-a", 60_000_000_000)
 
 	// Start watcher on {1,2,3} with StartRV for bucket 2 at 0 (below horizon).
 	pollConn := connectManualShared(t)

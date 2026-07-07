@@ -18,11 +18,10 @@ func TestR10_ConflictRollbacksCounter(t *testing.T) {
 	truncateAll(t)
 	ctx := context.Background()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
 	w := newWriter(t, nil)
 
 	// Create the initial resource
-	createReq := makeWriteReq("apps/v1/Deployment", "default", "nginx", 1, "holder-a", epoch)
+	createReq := makeWriteReq("apps/v1/Deployment", "default", "nginx", 1)
 	result, err := w.Write(ctx, createReq)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), result.Seq)
@@ -46,8 +45,6 @@ func TestR10_ConflictRollbacksCounter(t *testing.T) {
 		Status:          json.RawMessage(`{}`),
 		Metadata:        json.RawMessage(`{}`),
 		ExpectedVersion: 999, // stale
-		LeaseHolder:     "holder-a",
-		LeaseEpoch:      epoch,
 	}
 	_, err = w.Write(ctx, updateReq)
 	assert.ErrorIs(t, err, writer.ErrConflict)

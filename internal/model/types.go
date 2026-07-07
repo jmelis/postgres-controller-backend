@@ -33,9 +33,7 @@ type WriteRequest struct {
 	Metadata          json.RawMessage
 	DeletionTimestamp *time.Time
 	ExpectedVersion   int64 // 0 for create, >0 for update
-	LeaseHolder       string
-	LeaseEpoch        int64
-	ForceWrite        bool // skip no-op suppression; default false = suppress content-equal writes
+	ForceWrite        bool  // skip no-op suppression; default false = suppress content-equal writes
 }
 
 type StatusWriteRequest struct {
@@ -45,12 +43,10 @@ type StatusWriteRequest struct {
 	BucketID        int
 	Status          json.RawMessage
 	ExpectedVersion int64
-	LeaseHolder     string
-	LeaseEpoch      int64
 	ForceWrite      bool // skip no-op suppression; default false = suppress content-equal writes
 }
 
-type SpecWriteRequest struct {
+type ObjectWriteRequest struct {
 	GVK               string
 	Namespace         string
 	Name              string
@@ -59,8 +55,6 @@ type SpecWriteRequest struct {
 	Metadata          json.RawMessage
 	DeletionTimestamp *time.Time
 	ExpectedVersion   int64
-	LeaseHolder       string
-	LeaseEpoch        int64
 	ForceWrite        bool
 }
 

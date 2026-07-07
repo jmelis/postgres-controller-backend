@@ -3,12 +3,11 @@ metadata:
   description: "Maximum RPS discovery — bucket count sweep on db.m6g.xlarge Multi-AZ"
 
 rds:
-  instance_class: "db.m6g.xlarge"
-  engine_version: "16.4"
+  instance_class: "db.m6g.2xlarge"
+  engine_version: "16.14"
 
 cluster:
   buckets: 16
-  lease_ttl: 120s
   baseline_poll_interval: 5s
   debounce_floor: 100ms
 

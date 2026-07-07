@@ -37,10 +37,6 @@ type Config struct {
 	// CanaryInterval controls how often the canary writer fires. Zero disables canary.
 	CanaryInterval time.Duration
 
-	// CanaryHolder and CanaryEpoch for the canary write's lease.
-	CanaryHolder string
-	CanaryEpoch  int64
-
 	// PollInterval for the verification watcher.
 	PollInterval time.Duration
 
@@ -134,7 +130,7 @@ func (v *Verifier) Run(ctx context.Context) error {
 
 	var canaryTicker *time.Ticker
 	var canaryC <-chan time.Time
-	if v.canaryConn != nil && v.cfg.CanaryHolder != "" {
+	if v.canaryConn != nil {
 		canaryTicker = time.NewTicker(v.cfg.CanaryInterval)
 		canaryC = canaryTicker.C
 		defer canaryTicker.Stop()
@@ -264,11 +260,9 @@ func (v *Verifier) writeCanary(ctx context.Context) {
 		Namespace:   "_verifier",
 		Name:        name,
 		BucketID:    v.cfg.BucketIDs[0],
-		Spec:        json.RawMessage(`{"canary":true}`),
-		Status:      json.RawMessage(`{}`),
-		Metadata:    json.RawMessage(`{}`),
-		LeaseHolder: v.cfg.CanaryHolder,
-		LeaseEpoch:  v.cfg.CanaryEpoch,
+		Spec:     json.RawMessage(`{"canary":true}`),
+		Status:   json.RawMessage(`{}`),
+		Metadata: json.RawMessage(`{}`),
 	}
 
 	_, err := w.Write(ctx, req)
