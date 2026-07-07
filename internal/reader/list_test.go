@@ -25,7 +25,6 @@ func TestListEmpty(t *testing.T) {
 	result, err := reader.List(context.Background(), conn, "apps/v1/Deployment", []int{1, 2})
 	require.NoError(t, err)
 	assert.Empty(t, result.Resources)
-	assert.Equal(t, int64(1), result.ResourceVersion.Epoch)
 	assert.Equal(t, int64(0), result.ResourceVersion.Buckets[1])
 	assert.Equal(t, int64(0), result.ResourceVersion.Buckets[2])
 }

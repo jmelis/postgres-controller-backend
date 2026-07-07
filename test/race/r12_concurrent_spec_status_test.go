@@ -79,12 +79,10 @@ func TestR12_ConcurrentSpecStatus(t *testing.T) {
 
 	// Watcher starting from seq=3 sees the resource at seq=4 (I2: monotonic hwm)
 	pollConn := freshConn(t)
-	var currentEpoch int64
-	require.NoError(t, pollConn.QueryRow(ctx, `SELECT timeline_id FROM cluster_epoch`).Scan(&currentEpoch))
 	w := reader.NewWatcher(pollConn, nil, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
 		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Epoch: currentEpoch, Buckets: map[int]int64{1: 3}},
+		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 3}},
 		BaselineInterval: 100 * time.Millisecond,
 	}, nil)
 

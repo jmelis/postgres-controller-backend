@@ -28,7 +28,7 @@ func TestR18_WatcherResume(t *testing.T) {
 	watcherA := reader.NewWatcher(pollConnA, listenConnA, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
 		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Epoch: 1, Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
 		BaselineInterval: 300 * time.Millisecond,
 	}, nil)
 
@@ -90,7 +90,6 @@ func TestR18_WatcherResume(t *testing.T) {
 		GVK:       "apps/v1/Deployment",
 		BucketIDs: []int{1},
 		StartRV: resourceversion.RV{
-			Epoch:   1,
 			Buckets: hwmA, // resume from A's high-water marks
 		},
 		BaselineInterval: 300 * time.Millisecond,

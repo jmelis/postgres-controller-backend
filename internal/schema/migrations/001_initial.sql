@@ -37,14 +37,6 @@ CREATE INDEX IF NOT EXISTS idx_resources_list
 CREATE INDEX IF NOT EXISTS idx_resources_watch
     ON kubernetes_resources (gvk, bucket_id, gvk_bucket_seq);
 
--- Failover epoch
-CREATE TABLE IF NOT EXISTS cluster_epoch (
-    singleton   BOOL PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-    timeline_id BIGINT NOT NULL
-);
-
-INSERT INTO cluster_epoch (timeline_id) VALUES (1) ON CONFLICT DO NOTHING;
-
 -- Compaction horizon per (bucket, GVK)
 CREATE TABLE IF NOT EXISTS compaction_horizon (
     bucket_id     INT    NOT NULL,

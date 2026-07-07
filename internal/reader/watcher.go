@@ -360,7 +360,7 @@ func (w *Watcher) listenAll(ctx context.Context, conn *pgx.Conn) error {
 }
 
 // poll runs one poll cycle inside a REPEATABLE READ read-only transaction.
-// Epoch check, per-bucket horizon checks, and row queries all share the same
+// Per-bucket horizon checks and row queries share the same
 // snapshot — mid-poll compaction is invisible (B3 fix).
 // Returns the number of events delivered.
 func (w *Watcher) poll(ctx context.Context) (int, error) {
@@ -376,16 +376,6 @@ func (w *Watcher) poll(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("poll begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
-
-	// Epoch check (I5/R9 defense)
-	var currentEpoch int64
-	if err := tx.QueryRow(ctx, `SELECT timeline_id FROM cluster_epoch`).Scan(&currentEpoch); err != nil {
-		return 0, fmt.Errorf("poll epoch check: %w", err)
-	}
-	if w.cfg.StartRV.Epoch != 0 && currentEpoch != w.cfg.StartRV.Epoch {
-		return 0, fmt.Errorf("epoch mismatch (have=%d, db=%d): %w",
-			w.cfg.StartRV.Epoch, currentEpoch, ErrGone)
-	}
 
 	var allEvents []Event
 

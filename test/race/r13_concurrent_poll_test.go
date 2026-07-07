@@ -36,7 +36,7 @@ func TestR13_ConcurrentPollRace(t *testing.T) {
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
 		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Epoch: 1, Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
 		BaselineInterval: 200 * time.Millisecond,
 		DebounceFloor:    50 * time.Millisecond,
 	}, hooks)

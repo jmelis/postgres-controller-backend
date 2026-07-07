@@ -31,7 +31,7 @@ func TestR16_DebounceSuppression(t *testing.T) {
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
 		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Epoch: 1, Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
 		BaselineInterval: 10 * time.Second, // long baseline so doorbells drive polling
 		DebounceFloor:    200 * time.Millisecond,
 	}, hooks)
@@ -103,7 +103,7 @@ func TestR16_TrailingEdgeTiming(t *testing.T) {
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
 		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Epoch: 1, Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
 		BaselineInterval: 10 * time.Second,
 		DebounceFloor:    debounceFloor,
 	}, hooks)
@@ -214,7 +214,7 @@ func TestR16_DebounceSuppression_NoEventLoss(t *testing.T) {
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
 		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Epoch: 1, Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
 		BaselineInterval: 10 * time.Second,
 		DebounceFloor:    200 * time.Millisecond,
 	}, nil)

@@ -54,7 +54,7 @@ func TestR7_CompactionVsSlowWatcher(t *testing.T) {
 	pollConn := connectManualShared(t)
 	w := reader.NewWatcher(pollConn, nil, reader.WatcherConfig{
 		GVK: "apps/v1/Deployment", BucketIDs: []int{1},
-		StartRV:          resourceversion.RV{Epoch: 1, Buckets: map[int]int64{1: 1}},
+		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 1}},
 		BaselineInterval: 300 * time.Millisecond,
 	}, nil)
 
@@ -109,7 +109,7 @@ func TestR7_CompactionBoundary_Exact(t *testing.T) {
 	pollConn := connectManualShared(t)
 	w := reader.NewWatcher(pollConn, nil, reader.WatcherConfig{
 		GVK: "apps/v1/Deployment", BucketIDs: []int{1},
-		StartRV:          resourceversion.RV{Epoch: 1, Buckets: map[int]int64{1: 1}},
+		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 1}},
 		BaselineInterval: 300 * time.Millisecond,
 	}, nil)
 

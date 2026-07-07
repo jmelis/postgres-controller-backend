@@ -120,7 +120,7 @@ func (v *Verifier) Run(ctx context.Context) error {
 	watcher := reader.NewWatcher(v.pollConn, v.cfg.ListenConn, reader.WatcherConfig{
 		GVK:               v.cfg.GVK,
 		BucketIDs:         v.cfg.BucketIDs,
-		StartRV:           resourceversion.RV{Epoch: 1, Buckets: v.hwm},
+		StartRV:           resourceversion.RV{Buckets: v.hwm},
 		BaselineInterval:  v.cfg.PollInterval,
 		ListenConnFactory: v.cfg.ListenConnFactory,
 	}, nil)
