@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// RB4a — Identical content write consumes no sequence number (I1/I5).
+// RB4a — Identical content write consumes no sequence number (I1/I4).
 // Write an object, then write identical content. Assert: second write returns
 // Changed=false, ObjectVersion unchanged, counter unchanged.
 func TestRB4a_IdenticalWriteSuppressed(t *testing.T) {
@@ -55,7 +55,7 @@ func TestRB4a_IdenticalWriteSuppressed(t *testing.T) {
 	conn.Close(ctx)
 }
 
-// RB4b — Real change after a no-op is correctly sequenced (I1/I2).
+// RB4b — Real change after a no-op is correctly sequenced (I1).
 // Write A, write A again (no-op), then write B. Assert: B gets next seq,
 // watcher sees exactly one event.
 func TestRB4b_RealChangeAfterNoOp(t *testing.T) {
@@ -86,7 +86,7 @@ func TestRB4b_RealChangeAfterNoOp(t *testing.T) {
 	assert.Equal(t, r1.ObjectVersion+1, r3.ObjectVersion, "version must increment exactly once")
 }
 
-// RB4c — Watcher sees no event for a suppressed write (I5).
+// RB4c — Watcher sees no event for a suppressed write (I4).
 func TestRB4c_WatcherSeesNoEventForSuppressed(t *testing.T) {
 	truncateAll(t)
 	ctx := context.Background()
@@ -177,7 +177,7 @@ func TestRB4d_ReplayedCreateSuppressed(t *testing.T) {
 	conn.Close(ctx)
 }
 
-// RB4e — WriteStatus suppression (I1/I5).
+// RB4e — WriteStatus suppression (I1/I4).
 func TestRB4e_WriteStatusSuppressed(t *testing.T) {
 	truncateAll(t)
 	ctx := context.Background()

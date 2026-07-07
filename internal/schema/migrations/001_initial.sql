@@ -1,4 +1,4 @@
--- Gapless monotonic sequence per (bucket, GVK)
+-- Commit-ordered sequence per (bucket, GVK)
 CREATE TABLE IF NOT EXISTS gvk_bucket_counters (
     bucket_id   INT    NOT NULL,
     gvk         TEXT   NOT NULL,

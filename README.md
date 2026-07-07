@@ -2,7 +2,7 @@
 
 Run your controller-runtime controllers against plain PostgreSQL instead of kube-apiserver + etcd — same reconcile loops, one commodity managed database.
 
-This works because the library re-implements the Kubernetes List/Watch contract — gap-free, commit-ordered event streams with `resourceVersion` semantics — on ordinary Postgres tables. Informers, reconcile loops, and optimistic concurrency behave as they always have; underneath, writers (controllers, or an API server fronting the database) and watchers talk to Postgres directly, with no etcd protocol, no kube-apiserver, and no consensus layer in the path.
+This works because the library re-implements the Kubernetes List/Watch contract — commit-ordered event streams with `resourceVersion` semantics — on ordinary Postgres tables. Informers, reconcile loops, and optimistic concurrency behave as they always have; underneath, writers (controllers, or an API server fronting the database) and watchers talk to Postgres directly, with no etcd protocol, no kube-apiserver, and no consensus layer in the path.
 
 The motivation is operational. At fleet scale, etcd becomes the component you engineer around, and colocating application state in the cluster's own etcd ties your data's disaster-recovery story to the cluster's. One managed Postgres instance replaces it with a database your team already knows how to run — independent backup/restore, standard failover — and gives up nothing on throughput: ~10,000 writes/s on modest hardware (db.m6g.2xlarge, ~$500/mo), with correctness enforced by row locks rather than convention.
 
@@ -13,7 +13,7 @@ The motivation is operational. At fleet scale, etcd becomes the component you en
 Four ideas carry the whole design:
 
 - **Buckets.** Resources are partitioned client-side: a caller-supplied function maps each object (namespace, name) to one of N buckets. The database stores whatever bucket ID it's given and never re-shards. The bucket is the unit of write concurrency and event ordering.
-- **Gapless sequences.** Each (GVK, bucket) pair has its own counter, created on first use — no global sequence bottleneck. Within a bucket, committed sequence numbers are exactly 1, 2, 3, … and sequence order equals commit order, so watchers get a gap-free, commit-ordered event stream.
+- **Commit-ordered sequences.** Each (GVK, bucket) pair has its own counter, created on first use — no global sequence bottleneck. Within a bucket, sequence order equals commit order — if seq N is visible, every seq before it is also visible — so watchers get a commit-ordered event stream.
 - **Poll-primary watch.** Watchers _pull_ events from the table; the LISTEN/NOTIFY doorbell is a latency-only optimization. Total notification loss costs latency (bounded by the baseline poll, 5s default), never events.
 - **Timeline epochs.** The resourceVersion is a timeline epoch plus a per-bucket high-water-mark vector. Failover bumps the epoch; watchers with stale positions get `410 Gone` and relist instead of silently missing events.
 
@@ -51,7 +51,7 @@ mgr.Start(ctx)
 PostgreSQL 16 is the authoritative store, with:
 
 - **Server-side stored procedure (`pgctl_write()`)** — no-op suppression, counter increment, and upsert in a single server-side call, with the `pg_notify` doorbell fired after commit to avoid the global notification-queue lock
-- **Per-(GVK, bucket) gapless sequence counters** for commit-ordered event streams, each created on first use
+- **Per-(GVK, bucket) commit-ordered sequence counters** for commit-ordered event streams, each created on first use
 - **No-op write suppression** — content-equal writes consume no sequence number, emit no doorbell, and bump no `object_version`, matching Kubernetes API-server semantics where an update that changes nothing does not advance resourceVersion. Default on; `ForceWrite` opts out; `WriteResult.Changed` lets callers skip downstream side-effects
 - **Single-goroutine poll-primary watch** with LISTEN/NOTIFY doorbell as a latency-only optimization; all polling in one goroutine with snapshot-isolated (`REPEATABLE READ`) poll cycles; automatic LISTEN reconnection via `ListenConnFactory` with exponential backoff
 - **Tombstone compaction** via a single CTE (atomic delete + horizon advancement) with finalizer guard — only fully-deleted objects (no active finalizers) are compacted; dying objects with finalizers survive past retention
@@ -99,20 +99,20 @@ flowchart LR
 
 ## Correctness
 
-Every mechanism is justified by one of 7 named invariants (I1–I7, DESIGN.md §2) — gapless issuance, commit order = sequence order, no regression across failover, exactly-once watch delivery, resourceVersion monotonicity, compaction safety, optimistic concurrency.
+Every mechanism is justified by one of 6 named invariants (I1–I6, DESIGN.md §2) — commit-ordered sequences, no regression across failover, exactly-once watch delivery, resourceVersion monotonicity, compaction safety, optimistic concurrency.
 
 Every invariant has a corresponding race or failure scenario and a **deterministic test that forces the interleaving** — 21 tests in total (R2–R5, R7–R10, R12–R18, RB4a–f; full catalog in DESIGN.md §5):
 
 | Theme                 | Tests                      | What they prove                                                                                                                                                   |
 | --------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Sequence integrity    | R4, R5, R10, R12           | Concurrent first writes, ambiguous commits, 409 rollbacks, and concurrent spec/status writes never create gaps or duplicates                                      |
+| Sequence integrity    | R4, R5, R10, R12           | Concurrent first writes, ambiguous commits, 409 rollbacks, and concurrent spec/status writes never create duplicates or ordering violations                                      |
 | Watch delivery        | R2, R3, R13, R16, R17, R18 | No event is swallowed by debouncing, doorbell loss, rapid-doorbell coalescing, multi-bucket interleaving, or cancel/resume from the high-water mark               |
 | Compaction & failover | R7, R9, R14, R15           | Watchers behind a compaction horizon or on a stale timeline epoch get `410 Gone` (never a silent skip); mid-poll compaction is invisible under snapshot isolation |
 | No-op suppression     | RB4a–f                     | Suppressed writes consume no sequence and emit no event; real changes after a no-op sequence correctly                                                            |
 
 R3 and R5 additionally have Toxiproxy variants that inject network-level faults (TCP RST), including a test that verifies the doorbell fast path recovers after a connection kill.
 
-Beyond tests, the [`internal/verifier`](internal/verifier/) package runs the same checks continuously in production (DESIGN.md §6): it subscribes via the ordinary poll path and verifies monotonic high-water marks (I3/I5) and that all gaps are explained by the compaction horizon (I6), with O(buckets) state. An optional canary writer measures write-to-delivery latency (p99 via bounded ring buffer, exported as `pgctl_verifier_canary_delivery_seconds`). The same code is the acceptance oracle for load tests.
+Beyond tests, the [`internal/verifier`](internal/verifier/) package runs the same checks continuously in production (DESIGN.md §6): it subscribes via the ordinary poll path and verifies monotonic high-water marks (I2/I4) and that all gaps are explained by the compaction horizon (I5), with O(buckets) state. An optional canary writer measures write-to-delivery latency (p99 via bounded ring buffer, exported as `pgctl_verifier_canary_delivery_seconds`). The same code is the acceptance oracle for load tests.
 
 ## Spec/Status Split
 
@@ -129,7 +129,7 @@ AWS RDS Multi-AZ (synchronous commit), stored procedure write path, 64 buckets:
 | db.m6g.2xlarge | 8    | 9,622    | 6.1ms  | 13.2ms |
 | db.m6g.8xlarge | 32   | 11,728   | 5.0ms  | 7.7ms  |
 
-All correctness invariants (I1–I7) verified under load: zero serialization failures, zero sequence gaps, zero verifier violations across all runs.
+All correctness invariants (I1–I6) verified under load: zero serialization failures, zero verifier violations across all runs.
 
 Full perfscale suite: [`loadtest/README.md`](loadtest/README.md).
 
@@ -163,7 +163,7 @@ The [`examples/`](examples/) directory contains the same controller implemented 
 
 ## Documentation
 
-- [DESIGN.md](DESIGN.md) — full design: invariant catalog (I1–I7), race catalog (R2–R5, R7–R10, R12–R18), sizing, certification plan
+- [DESIGN.md](DESIGN.md) — full design: invariant catalog (I1–I6), race catalog (R2–R5, R7–R10, R12–R18), sizing, certification plan
 - [WALKTHROUGH.md](WALKTHROUGH.md) — narrative explanation of why each mechanism exists and how the pieces fit together
 - [ARCHITECTURE_COMPARISON.md](ARCHITECTURE_COMPARISON.md) — this direct-to-Postgres design vs. an intermediated REST-API architecture (reliability, consistency, operational surface)
 - [METRICS.md](METRICS.md) — Prometheus metrics reference (all `pgctl_*` metrics, labels, integration guide)

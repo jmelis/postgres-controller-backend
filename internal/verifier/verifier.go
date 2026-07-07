@@ -18,7 +18,7 @@ import (
 
 // Violation represents a detected invariant violation.
 type Violation struct {
-	Invariant string // I3, I5, I6, I7
+	Invariant string // I2, I4, I5, I6
 	Bucket    int
 	GVK       string
 	Detail    string
@@ -60,9 +60,9 @@ const canaryRingSize = 1000
 
 // Verifier is the continuous invariant verification consumer.
 // It subscribes via the ordinary poll path and checks:
-//   - I3/I6: monotonic hwm (seq must be strictly greater than previous hwm)
-//   - I5: no duplicate delivery (duplicate => seq <= hwm, caught by I3 check)
-//   - I7: hwm-below-horizon implies 410 was received
+//   - I2/I5: monotonic hwm (seq must be strictly greater than previous hwm)
+//   - I4: no duplicate delivery (duplicate => seq <= hwm, caught by I2 check)
+//   - I6: hwm-below-horizon implies 410 was received
 //
 // The canary probe writes synthetic objects and measures write-to-delivery
 // latency (the wall-clock time from Write returning to the event appearing
@@ -210,10 +210,10 @@ func (v *Verifier) checkEvent(ev reader.Event) {
 
 	prevHWM := v.hwm[bucket]
 
-	// I3/I5/I6: monotonic hwm — seq must be strictly greater than previous hwm.
+	// I2/I4/I5: monotonic hwm — seq must be strictly greater than previous hwm.
 	if seq <= prevHWM {
 		v.addViolation(Violation{
-			Invariant: "I3",
+			Invariant: "I2",
 			Bucket:    bucket,
 			GVK:       v.cfg.GVK,
 			Detail:    fmt.Sprintf("non-monotonic: seq=%d <= hwm=%d", seq, prevHWM),

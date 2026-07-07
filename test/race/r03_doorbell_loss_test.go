@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// R3 — Doorbell loss (I5).
+// R3 — Doorbell loss (I3).
 // LISTEN connection drops silently; notifications lost.
 // Defense: poll-primary — baseline poll delivers regardless.
 // Test: watcher with NO listen connection (simulating total doorbell loss);

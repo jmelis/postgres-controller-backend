@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// R9 — RV backwards exposure (I6).
+// R9 — RV backwards exposure (I4).
 // Client presents an RV from a previous timeline epoch after failover.
 // Defense: epoch comparison → 410 Gone, relist.
 // Test: replay a pre-failover RV post-failover; assert rejection.

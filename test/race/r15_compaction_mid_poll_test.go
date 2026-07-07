@@ -13,7 +13,7 @@ import (
 	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
 )
 
-// R15 — Compaction mid-poll (B3: I7 direct violation).
+// R15 — Compaction mid-poll (B3: I6 direct violation).
 //
 // pollBucket checks the compaction horizon and then queries rows in two separate
 // statements with no shared snapshot. A compactor committing between them deletes

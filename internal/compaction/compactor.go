@@ -18,7 +18,7 @@ type Result struct {
 
 // Compact deletes fully-deleted tombstones (deletion_timestamp set, no active
 // finalizers) older than retention and advances the compaction horizon
-// atomically in a single CTE statement (I7: horizon never lags delete).
+// atomically in a single CTE statement (I6: horizon never lags delete).
 // Dying objects with active finalizers are preserved regardless of age.
 func Compact(ctx context.Context, conn *pgx.Conn, cfg Config) (*Result, error) {
 	if cfg.Retention == 0 {

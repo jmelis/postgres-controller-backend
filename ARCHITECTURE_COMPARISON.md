@@ -17,7 +17,7 @@ graph LR
 
 ```mermaid
 graph LR
-    API["Platform API"] --> PG["PostgreSQL\n(gapless counters)"]
+    API["Platform API"] --> PG["PostgreSQL\n(commit-ordered counters)"]
     Controllers -- "watch, reconcile loop" --> PG
 ```
 
@@ -33,13 +33,13 @@ graph LR
 | **Component count in reconcile loop**   | 5+ (Sentinel polls API -> CloudEvent -> Adapter fetches full state from API -> Adapter acts -> Adapter PUTs status to API)                                        | 2 (controller watches PG -> controller acts -> controller writes PG)                                                                                                                     |
 | **Postgres failure**                    | API returns 500s; Sentinel/Adapters retry. No concurrency control -- concurrent reconnects may race                                                               | Writers block with backpressure (never skip). Timeline epoch forces watchers to relist (I3/I5)                                                                                           |
 | **Intermediate service failure**        | If the API goes down, Sentinel can't poll, Adapters can't read or report status -- **full stop** on all reconciliation until API recovers                         | No intermediate service; only PG availability matters                                                                                                                                    |
-| **Split-brain / zombie writers**        | No mechanism -- two API replicas can write the same resource concurrently; GORM has no version checking                                                           | Optimistic concurrency (I7): every write checks `object_version`; stale writers get 409 Conflict. Timeline epochs (I5) force relist after failover                                       |
-| **Event ordering**                      | CloudEvents are "anemic" (ID + generation only); Adapters fetch full state. No sequence guarantee -- Sentinel polls on a cadence and may miss intermediate states | Gapless per-(GVK, bucket) sequence (I1/I2). Watchers see every committed state-change in commit order. Poll-primary ensures delivery even under total LISTEN/NOTIFY failure (I4)         |
+| **Split-brain / zombie writers**        | No mechanism -- two API replicas can write the same resource concurrently; GORM has no version checking                                                           | Optimistic concurrency (I6): every write checks `object_version`; stale writers get 409 Conflict. Timeline epochs (I4) force relist after failover                                       |
+| **Event ordering**                      | CloudEvents are "anemic" (ID + generation only); Adapters fetch full state. No sequence guarantee -- Sentinel polls on a cadence and may miss intermediate states | Commit-ordered per-(GVK, bucket) sequence (I1). Watchers see every committed state-change in commit order. Poll-primary ensures delivery even under total LISTEN/NOTIFY failure (I3)         |
 | **Lost events**                         | If a CloudEvent is lost (Sentinel -> broker -> Adapter), the resource stalls until the next Sentinel poll cycle discovers it's unreconciled                       | Poll-primary watch: events are pulled from the DB, not pushed. Doorbell (pg_notify) is latency-only. 5s baseline poll = hard upper bound on delivery delay under total notification loss |
 | **Consistency model**                   | READ operations run outside transactions (no isolation). List `total` can be inconsistent with `items` under concurrent deletes (documented as "cosmetic")        | List runs under `REPEATABLE READ` snapshot. resourceVersion is consistent with data -- built from the same snapshot (I4/I5). No skew window                                              |
-| **Optimistic concurrency**              | `generation` counter increments on spec change; no version check on write path (PATCH does not check generation)                                                  | `object_version` checked on every write (I7). 409 Conflict on stale version. Counter increment aborts with the txn on conflict -- no gap (I1)                                            |
+| **Optimistic concurrency**              | `generation` counter increments on spec change; no version check on write path (PATCH does not check generation)                                                  | `object_version` checked on every write (I6). 409 Conflict on stale version. Counter increment rolls back (I1)                                            |
 | **Failover data loss**                  | Depends on PG replication config (not specified in the design). If async, acknowledged writes can be lost                                                         | Synchronous Multi-AZ standby: **zero acknowledged-write loss** by construction. Writer tripwire detects sequence regression post-failover                                                |
-| **Continuous correctness verification** | None -- correctness is tested pre-deployment only                                                                                                                 | Production verifier (O(buckets) state) continuously checks I3/I5/I6 on sampled buckets. Canary writer measures write-to-delivery latency                                                 |
+| **Continuous correctness verification** | None -- correctness is tested pre-deployment only                                                                                                                 | Production verifier (O(buckets) state) continuously checks I2/I4/I5 on sampled buckets. Canary writer measures write-to-delivery latency                                                 |
 
 ### Reliability Verdict
 
@@ -47,7 +47,7 @@ The direct-to-Postgres design is significantly more reliable because:
 
 1. **Fewer failure domains.** Every intermediate service (API server, Sentinel, message broker) is a potential failure point. Removing them removes entire classes of outage.
 
-2. **Formal correctness guarantees.** Every write checks `object_version` for optimistic concurrency (409 on stale). Gapless per-bucket sequences ensure watchers never miss an event.
+2. **Formal correctness guarantees.** Every write checks `object_version` for optimistic concurrency (409 on stale). Commit-ordered per-bucket sequences ensure watchers never miss an event.
 
 3. **No event loss by construction.** The CLM pattern relies on push (CloudEvents) with poll-based fallback (Sentinel). If either mechanism fails, reconciliation stalls. The Postgres pattern's poll-primary watch means events are never "sent" -- they're rows in the database, read when the watcher polls. You can't "lose" a row.
 

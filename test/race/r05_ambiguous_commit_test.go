@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// R5 — Ambiguous commit (I1/I5).
+// R5 — Ambiguous commit (I1/I4).
 // Connection drops during COMMIT; client doesn't know if the write landed.
 // Defense: read-back protocol.
 //

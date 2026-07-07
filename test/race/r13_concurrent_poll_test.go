@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// R13 — Concurrent poll race (B1: I5 availability).
+// R13 — Concurrent poll race (B1: I4 availability).
 //
 // BEFORE Phase 2: the trailing-poll goroutine spawned by debouncedPoll called
 // w.poll concurrently with the main loop's baseline poll, racing on the

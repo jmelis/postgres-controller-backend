@@ -52,12 +52,12 @@ func TestDuplicateDetection_ViaMonotonicity(t *testing.T) {
 
 	var found bool
 	for _, viol := range v.violations {
-		if viol.Invariant == "I3" {
+		if viol.Invariant == "I2" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatal("duplicate delivery not detected by hwm monotonicity (I3)")
+		t.Fatal("duplicate delivery not detected by hwm monotonicity (I2)")
 	}
 }

@@ -25,7 +25,7 @@ files are:
 
 > **We are re-implementing the Kubernetes List/Watch API on top of Postgres,
 > and everything in the design exists to fake the one thing etcd gives you for
-> free: a gap-free, strictly-ordered version number.**
+> free: a commit-ordered version number.**
 
 Hold onto that sentence. Every table, every lock, and every bit of garbage
 collection traces back to it.
@@ -73,7 +73,7 @@ in `internal/schema/migrations/001_initial.sql`.
 | Table                  | Its one job                                                              | etcd analogy                |
 | ---------------------- | ------------------------------------------------------------------------ | --------------------------- |
 | `kubernetes_resources` | The object in one of three lifecycle states (live, dying, fully deleted) | the keyspace                |
-| `gvk_bucket_counters`  | The gapless version number, one row per (bucket, GVK)                    | the global revision         |
+| `gvk_bucket_counters`  | The commit-ordered version number, one row per (bucket, GVK)             | the global revision         |
 | `compaction_horizon`   | How far back history has been destroyed                                  | the compaction revision     |
 | `cluster_epoch`        | A generation number bumped on failover                                   | (etcd's built-in guarantee) |
 
@@ -114,7 +114,7 @@ Read it as: _"On generation 7 of the database, I have seen everything up to seq
 - The **epoch prefix** is the failover seatbelt. On every promotion,
   `cluster_epoch.timeline_id` increments. So even in a disaster where a sequence
   somehow rewound, `(epoch, seq)` still moves forward, and any client arriving
-  with an old epoch is told to start over. That is invariants I3/I5.
+  with an old epoch is told to start over. That is invariants I2/I4.
 
 The serialization is canonical (buckets sorted) so equal states compare equal.
 
@@ -182,7 +182,7 @@ it until COMMIT. Picture two writers to the same bucket:
 
 Therefore **if seq(A) < seq(B), then A committed before B** — sequence order
 equals commit order, with no holes (a rollback undoes the increment too). That is
-invariants I1 + I2. A plain Postgres `SEQUENCE` cannot do this: sequences are
+invariant I1 (commit-ordered sequences). A plain Postgres `SEQUENCE` cannot do this: sequences are
 non-transactional and hold nothing to commit, so A could take 5, B take 6, and B
 commit first. This one row lock is the price of rebuilding etcd's ordered
 revision — and it is also why per-bucket write throughput has a ceiling (writers
@@ -212,7 +212,7 @@ ceiling high in aggregate.
 Writes the new content, stamps the fresh `gvk_bucket_seq`, and bumps
 `object_version`. The `WHERE object_version = $expected` clause means a stale
 updater (who read version 3 while it is now 5) matches zero rows and gets a 409 —
-invariant I7, no lost updates.
+invariant I6, no lost updates.
 
 ### (d) The doorbell
 
@@ -401,7 +401,7 @@ Say you physically delete the tombstone at seq 12. Now a **slow watcher** appear
 whose bookmark is `hwm=9`. It runs `WHERE seq > 9`, and seq 12 is gone. It never
 sees the delete — **ghost object forever again.** The exact bug tombstones were
 meant to fix, just moved later in time. This is the "silent gap" hazard,
-invariant I6.
+invariant I5.
 
 Critically, the compactor only hard-deletes rows that are **fully deleted** —
 `deletion_timestamp IS NOT NULL` _and_ no active finalizers. A dying object
@@ -491,7 +491,7 @@ Top to bottom:
 > **many statements** into one atomic unit. The connection that makes the
 > compactor work: **a single statement is always atomic by itself** (Postgres
 > wraps a lone statement in an implicit transaction), so the CTE gets
-> delete-and-advance-horizon atomicity for free — exactly the I6 guarantee. The
+> delete-and-advance-horizon atomicity for free — exactly the I5 guarantee. The
 > write path uses a stored procedure (`pgctl_write()`) that performs multiple
 > operations server-side, wrapped in a transaction for atomicity. Rule of thumb:
 > a CTE organizes (and atomically binds) one statement; a transaction atomically
@@ -534,7 +534,7 @@ There are two independent cleanup mechanisms:
 | Level                | Application logic                                     | Storage engine                          |
 | Removes              | Fully-deleted objects (tombstones with no finalizers) | Dead _tuple versions_ from every UPDATE |
 | Triggered by         | Your compactor job                                    | Postgres, automatically                 |
-| Invariant it upholds | I6 (no silent gap)                                    | none — pure space reclamation           |
+| Invariant it upholds | I5 (no silent gap)                                    | none — pure space reclamation           |
 
 Every `UPDATE` in Postgres writes a new row version and leaves the old one dead
 (MVCC, as in the `fillfactor` aside in Section 4); autovacuum reclaims that space
@@ -593,14 +593,14 @@ makes sense, the rest of the system is variations on it.
 
 ## 9. How it all ties back to the one sentence
 
-| Mechanism                      | Which piece of "a gap-free ordered version" it defends                                                                                              |
+| Mechanism                      | Which piece of "a commit-ordered version" it defends                                                                                                |
 | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Counter row + exclusive lock   | Gapless issuance & commit-order = seq-order (I1, I2)                                                                                                |
-| `object_version` check         | No lost updates on one object (I7)                                                                                                                  |
-| Composite RV + `cluster_epoch` | Version never goes backward, even across failover (I3, I5)                                                                                          |
-| Tombstones + finalizers        | Deletes are visible events; dying objects (with finalizers) stay visible for cleanup, fully-deleted tombstones (no finalizers) signal deletion (I4) |
-| Compaction horizon + 410       | A watcher that fell too far behind is told loudly, never silently skipped; compaction only removes finalizer-free tombstones (I6)                   |
-| Poll loop                      | The delivery guarantee — the doorbell is only latency (I4)                                                                                          |
+| Counter row + exclusive lock   | Commit-ordered sequences: commit-order = seq-order (I1)                                                                                             |
+| `object_version` check         | No lost updates on one object (I6)                                                                                                                  |
+| Composite RV + `cluster_epoch` | Version never goes backward, even across failover (I2, I4)                                                                                          |
+| Tombstones + finalizers        | Deletes are visible events; dying objects (with finalizers) stay visible for cleanup, fully-deleted tombstones (no finalizers) signal deletion (I3) |
+| Compaction horizon + 410       | A watcher that fell too far behind is told loudly, never silently skipped; compaction only removes finalizer-free tombstones (I5)                   |
+| Poll loop                      | The delivery guarantee — the doorbell is only latency (I3)                                                                                          |
 
 Every mechanism is one repair to the gap between "what a Kubernetes client
 expects" and "what a plain SQL table gives you."
@@ -623,24 +623,24 @@ It exercises the machinery it is auditing.
 
 What it checks per (GVK, bucket):
 
-- **Monotonic high-water marks (I3/I5).** Every delivered event's seq must be
+- **Monotonic high-water marks (I2/I4).** Every delivered event's seq must be
   strictly greater than the previous high-water mark for its bucket. One rule
   catches two failure classes: a _regression_ (the sequence went backwards —
   e.g., a failover lost a commit) and a _duplicate delivery_ (I4) both manifest
   as `seq <= previous hwm`. That single comparison is the whole check, which is
   why verifier state is tiny — **O(buckets)**, one number per bucket, no per-key
   maps that grow with fleet size.
-- **Compaction consistency (I6)** comes free from the poll path itself: if the
+- **Compaction consistency (I5)** comes free from the poll path itself: if the
   verifier's bookmark ever falls below a horizon, it must receive a loud `410
 Gone` — silence there would itself be the violation.
 
-Just as important is what it deliberately does **not** check: per-event gap
+Just as important is what it deliberately does **not** check: per-event
 contiguity. Recall from Section 6 that coalescing is legal — two rapid writes to
 one object leave only the latest seq visible, so delivered seqs legitimately skip
-numbers. A naive "no gaps allowed" audit would false-alarm constantly. Gap
+numbers. A naive contiguity audit would false-alarm constantly. Contiguity
 auditing, if ever needed, must cross-check the table to prove a missing seq was
 superseded — out of scope for the stream-side verifier. (This is a nice example
-of the invariants doing real work: I4 _permits_ coalescing, so the verifier must
+of the invariants doing real work: I3 _permits_ coalescing, so the verifier must
 tolerate it.)
 
 The second probe is a **canary**: at a low rate, the verifier writes a synthetic

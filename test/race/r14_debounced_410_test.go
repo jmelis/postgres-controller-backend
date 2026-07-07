@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// R14 — Debounced 410 swallowing (B2: I6/I7).
+// R14 — Debounced 410 swallowing (B2: I5/I6).
 //
 // debouncedPoll discards the return value of w.poll. If a doorbell-triggered
 // poll detects an epoch mismatch (or sub-horizon hwm), the 410 Gone error is

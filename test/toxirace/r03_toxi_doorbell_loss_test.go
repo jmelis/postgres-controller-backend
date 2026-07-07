@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// R3 Toxi — Doorbell loss via reset_peer toxic (I5).
+// R3 Toxi — Doorbell loss via reset_peer toxic (I3).
 // The LISTEN connection goes through the proxy; a reset_peer toxic kills it mid-burst.
 // The poll connection goes direct (not through proxy). The watcher must deliver
 // all events via baseline poll despite the doorbell being murdered.

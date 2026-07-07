@@ -24,7 +24,7 @@ const phase3Name = "phase3_avalanche"
 //  1. Starts N writers (one per bucket), each writing continuously.
 //  2. After a warmup period, kills kill_fraction of them.
 //  3. New writers take over the killed buckets.
-//  4. Verifier checks gapless stream across handover.
+//  4. Verifier checks commit-ordered stream across handover.
 func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, error) {
 	pCfg := cfg.Phases.Phase3Avalanche
 	numBuckets := cfg.Cluster.Buckets

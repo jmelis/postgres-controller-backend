@@ -50,10 +50,10 @@ instrumentation with zero overhead.
 | Metric                                   | Type      | Labels      | Description                                                                                                   |
 | ---------------------------------------- | --------- | ----------- | ------------------------------------------------------------------------------------------------------------- |
 | `pgctl_verifier_canary_delivery_seconds` | Histogram | —           | Write-to-delivery latency for canary objects — times the full pipeline from commit to event channel delivery. |
-| `pgctl_verifier_violations_total`        | Counter   | `invariant` | Invariant violations detected (I3, I4, I5, I6). Any non-zero value should page.                               |
+| `pgctl_verifier_violations_total`        | Counter   | `invariant` | Invariant violations detected (I2, I3, I4, I5). Any non-zero value should page.                               |
 | `pgctl_verifier_events_checked_total`    | Counter   | —           | Total events processed by the verifier.                                                                       |
 
-**Invariant label values:** `I3` (non-monotonic sequence), `I4` (duplicate delivery), `I5` (epoch mismatch), `I6` (below-horizon gap).
+**Invariant label values:** `I2` (non-monotonic sequence), `I3` (duplicate delivery), `I4` (epoch mismatch), `I5` (below-horizon gap).
 
 ---
 

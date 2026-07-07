@@ -377,7 +377,7 @@ func (w *Watcher) poll(ctx context.Context) (int, error) {
 	}
 	defer tx.Rollback(ctx)
 
-	// Epoch check (I6/R9 defense)
+	// Epoch check (I5/R9 defense)
 	var currentEpoch int64
 	if err := tx.QueryRow(ctx, `SELECT timeline_id FROM cluster_epoch`).Scan(&currentEpoch); err != nil {
 		return 0, fmt.Errorf("poll epoch check: %w", err)

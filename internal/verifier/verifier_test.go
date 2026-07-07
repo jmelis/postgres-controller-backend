@@ -64,7 +64,7 @@ func TestVerifier_CleanStream_NoViolations(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	// Write 10 resources in order — clean, gapless stream
+	// Write 10 resources in order — clean, commit-ordered stream
 	wrConn := freshConn(t)
 	wr := writer.New(wrConn, nil)
 	for i := 0; i < 10; i++ {
@@ -160,7 +160,7 @@ func TestVerifier_DetectsDuplicate_I5(t *testing.T) {
 	result := v.Result()
 	assert.Equal(t, int64(1), result.EventsChecked)
 	// The watcher delivers no duplicates by design (seq > hwm),
-	// so no I5 violation should fire.
+	// so no I4 violation should fire.
 	assert.Empty(t, result.Violations)
 
 	verCancel()

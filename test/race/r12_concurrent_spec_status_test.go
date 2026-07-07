@@ -14,10 +14,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// R12 — Concurrent spec and status writes (I1/I2 for mixed write paths).
+// R12 — Concurrent spec and status writes (I1 for mixed write paths).
 // Both write to the same resource. Each write bumps the shared counter and
 // object_version. A watcher polling after each write sees the new state at the
-// correct sequence number — the shared counter produces a gapless sequence
+// correct sequence number — the shared counter produces a commit-ordered sequence
 // across spec and status writes.
 func TestR12_ConcurrentSpecStatus(t *testing.T) {
 	truncateAll(t)
@@ -71,13 +71,13 @@ func TestR12_ConcurrentSpecStatus(t *testing.T) {
 	assert.Equal(t, int64(4), r4.Seq)
 	assert.Equal(t, int64(4), r4.ObjectVersion)
 
-	// Shared counter is gapless: 1, 2, 3, 4 — proven by assertions above.
+	// Shared counter is contiguous: 1, 2, 3, 4 — proven by assertions above.
 	// The UID is stable across all 4 writes.
 	assert.Equal(t, r1.UID, r2.UID, "UID must be stable across spec/status writes")
 	assert.Equal(t, r1.UID, r3.UID)
 	assert.Equal(t, r1.UID, r4.UID)
 
-	// Watcher starting from seq=3 sees the resource at seq=4 (I3: monotonic hwm)
+	// Watcher starting from seq=3 sees the resource at seq=4 (I2: monotonic hwm)
 	pollConn := freshConn(t)
 	var currentEpoch int64
 	require.NoError(t, pollConn.QueryRow(ctx, `SELECT timeline_id FROM cluster_epoch`).Scan(&currentEpoch))

@@ -13,19 +13,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// B4 — Verifier false-positive I1 under event coalescing.
+// B4 — Verifier false-positive under event coalescing.
 //
 // When two writes target the same key between polls (create at seq=1, update at
 // seq=2), the row is updated in-place and only seq=2 survives. The watcher
-// delivers seq=2; the verifier sees a gap (expected 1, got 2) and flags I1.
-// This is a false positive: the gap is explained by legitimate coalescing, not
-// data loss.
+// delivers seq=2; the verifier sees a gap (expected 1, got 2) and could flag a
+// violation. This is a false positive: the gap is explained by legitimate
+// coalescing, not data loss.
 //
-// Defense (Phase 4): recognise coalescing gaps — only flag I1 when the gap is
+// Defense (Phase 4): recognise coalescing gaps — only flag when the gap is
 // NOT explainable by a seq that was overwritten by a newer version of the same
 // key before the poll snapshot.
 //
-// Expected current failure: verifier reports an I1 violation because the gap
+// Expected current failure: verifier reports a violation because the gap
 // from seq=1 to seq=2 is not explained by compaction_horizon.
 func TestCoalescingFalsePositive(t *testing.T) {
 	truncateAll(t)

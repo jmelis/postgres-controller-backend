@@ -156,7 +156,7 @@ func TestWriteStatus_Conflict(t *testing.T) {
 	assert.ErrorIs(t, err, writer.ErrConflict)
 }
 
-func TestSequentialWritesAreGapless(t *testing.T) {
+func TestSequentialWritesAreContiguous(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires postgres")
 	}

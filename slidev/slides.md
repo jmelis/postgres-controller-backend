@@ -116,7 +116,7 @@ We assumed we **couldn't have kube semantics on Postgres**.
 
 <v-click>
 
-The hard part is the watch contract: a **gap-free, commit-ordered event stream** per resource type. With naive sequences, a transaction can take seq *N* but commit **after** *N+1* — a watcher advances past *N* and misses it **forever**.
+The hard part is the watch contract: a **commit-ordered event stream** per resource type. With naive sequences, a transaction can take seq *N* but commit **after** *N+1* — a watcher advances past *N* and misses it **forever**.
 
 </v-click>
 
@@ -149,7 +149,7 @@ One counter per resource type
 
 <!--
 This is the crux slide: the reason we never seriously considered Postgres before.
-Ordering + gaplessness seems to require a serialization point, and the obvious
+Commit ordering seems to require a serialization point, and the obvious
 serialization points don't scale.
 -->
 
@@ -177,7 +177,7 @@ Split each GVK's objects into **buckets**; lock per **(GVK, bucket)** instead of
   - Cluster, Placement, NodePool, …
 - A client-side assigner maps object → bucket; parent and children co-locate
 
-**Result:** write contention drops by the bucket count — each bucket has its own gapless counter, its own ordering, its own doorbell. No global lock anywhere.
+**Result:** write contention drops by the bucket count — each bucket has its own commit-ordered counter, its own ordering, its own doorbell. No global lock anywhere.
 
 Controllers can scale horizontally and watch only their own buckets.
 
@@ -218,7 +218,7 @@ Zero serialization failures, zero sequence gaps, zero invariant violations acros
 
 <div/>
 
-Every mechanism is justified by one of **7 named invariants** (gapless issuance, commit order = sequence order, no regression across failover, exactly-once delivery, RV monotonicity, compaction safety, optimistic concurrency).
+Every mechanism is justified by one of **6 named invariants** (commit-ordered sequences, no regression across failover, exactly-once delivery, RV monotonicity, compaction safety, optimistic concurrency).
 
 Every invariant has a **deterministic test that forces the bad interleaving** — 21 race tests in total:
 
@@ -397,7 +397,7 @@ Timeline **epoch** + per-bucket high-water-mark **vector**. Failover bumps the e
 - A caller-supplied function maps (namespace, name) → bucket; the DB stores the ID and never re-shards
 - Bucket topology is part of the shared writer configuration, fixed for the deployment's life
 
-### Per-(GVK, bucket) gapless counters
+### Per-(GVK, bucket) commit-ordered counters
 ```sql
 INSERT INTO gvk_bucket_counters …
 ON CONFLICT (bucket_id, gvk)
@@ -461,7 +461,7 @@ SELECT pg_notify('resource_changes_b' || bucket, '');
 
 1. **No-op suppression** — content-equal writes consume no seq, emit no event (kube semantics)
 2. **Counter increment** — the exclusive row lock that serializes commit order
-3. **Upsert with `object_version` check** — mismatch raises ⇒ whole txn (incl. counter) rolls back: no gap
+3. **Upsert with `object_version` check** — mismatch raises ⇒ whole txn (incl. counter) rolls back cleanly
 
 <v-click>
 

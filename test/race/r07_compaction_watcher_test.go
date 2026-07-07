@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// R7 — Compaction vs. slow watcher (I7).
+// R7 — Compaction vs. slow watcher (I5).
 // Watcher resumes with hwm just below a freshly advanced horizon.
 // Defense: horizon advanced transactionally with the delete; boundary check on poll.
 // Test: freeze a watcher, compact past its hwm, resume; assert 410 Gone.

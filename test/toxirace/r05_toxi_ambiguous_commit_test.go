@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// R5 Toxi — Ambiguous commit via network-level connection kill (I1/I5).
+// R5 Toxi — Ambiguous commit via network-level connection kill (I1/I4).
 // The writer uses a proxied connection. At BeforeCommit, we add a reset_peer
 // toxic that kills the connection. The COMMIT is sent but the response is lost
 // (or the connection dies before the response arrives). The writer must detect

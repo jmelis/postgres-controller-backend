@@ -20,7 +20,7 @@ type ListResult struct {
 // objects (deletion_timestamp set, has finalizers) are included so controllers
 // can perform cleanup before removing their finalizers. The returned RV is
 // built from cluster_epoch + per-bucket counters within the same snapshot,
-// so there is no skew between the data and the version (I5/I6 handoff into Watch).
+// so there is no skew between the data and the version (I4/I5 handoff into Watch).
 func List(ctx context.Context, conn *pgx.Conn, gvk string, bucketIDs []int) (*ListResult, error) {
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel:   pgx.RepeatableRead,
