@@ -27,13 +27,14 @@ import (
 
 // Options configures a postgres-backed controller-runtime Manager.
 type Options struct {
-	Scheme         *runtime.Scheme
-	DSN            string
-	BucketIDs      []int
-	BucketAssigner func(ns, name string) int
-	Logger         logr.Logger
-	MaxPoolConns   int32
-	MinPoolConns   int32
+	Scheme                 *runtime.Scheme
+	DSN                    string
+	BucketIDs              []int
+	BucketAssigner         func(ns, name string) int
+	Logger                 logr.Logger
+	MaxPoolConns           int32
+	MinPoolConns           int32
+	HealthProbeBindAddress string
 }
 
 // NewManager creates a controller-runtime Manager backed by PostgreSQL.
@@ -106,6 +107,9 @@ func NewManager(opts Options) (manager.Manager, error) {
 
 		pool:    pool,
 		elected: elected,
+
+		healthzChecks: make(map[string]healthz.Checker),
+		readyzChecks:  make(map[string]healthz.Checker),
 	}, nil
 }
 
@@ -122,6 +126,9 @@ type pgManager struct {
 
 	mu        sync.Mutex
 	runnables []manager.Runnable
+
+	healthzChecks map[string]healthz.Checker
+	readyzChecks  map[string]healthz.Checker
 }
 
 // --- cluster.Cluster ---
@@ -159,10 +166,12 @@ func (m *pgManager) AddMetricsServerExtraHandler(path string, handler http.Handl
 }
 
 func (m *pgManager) AddHealthzCheck(name string, check healthz.Checker) error {
+	m.healthzChecks[name] = check
 	return nil
 }
 
 func (m *pgManager) AddReadyzCheck(name string, check healthz.Checker) error {
+	m.readyzChecks[name] = check
 	return nil
 }
 
@@ -170,6 +179,22 @@ func (m *pgManager) Start(ctx context.Context) error {
 	m.logger.Info("starting pgruntime manager")
 
 	var wg sync.WaitGroup
+
+	if addr := m.opts.HealthProbeBindAddress; addr != "" {
+		srv := m.buildHealthProbeServer(addr)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.logger.Info("starting health probe server", "addr", addr)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				m.logger.Error(err, "health probe server failed")
+			}
+		}()
+		go func() {
+			<-ctx.Done()
+			srv.Close()
+		}()
+	}
 
 	wg.Add(1)
 	go func() {
@@ -204,6 +229,28 @@ func (m *pgManager) Start(ctx context.Context) error {
 	wg.Wait()
 	m.pool.Close()
 	return nil
+}
+
+func (m *pgManager) buildHealthProbeServer(addr string) *http.Server {
+	mux := http.NewServeMux()
+	mux.Handle("/healthz", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.runChecks(w, r, m.healthzChecks)
+	}))
+	mux.Handle("/readyz", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.runChecks(w, r, m.readyzChecks)
+	}))
+	return &http.Server{Addr: addr, Handler: mux}
+}
+
+func (m *pgManager) runChecks(w http.ResponseWriter, r *http.Request, checks map[string]healthz.Checker) {
+	for name, check := range checks {
+		if err := check(r); err != nil {
+			http.Error(w, fmt.Sprintf("check %q failed: %v", name, err), http.StatusInternalServerError)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, "ok")
 }
 
 func (m *pgManager) GetWebhookServer() webhook.Server {
