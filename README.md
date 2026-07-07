@@ -1,23 +1,12 @@
 # postgres-controller-backend
 
-Run your controller-runtime controllers against plain PostgreSQL instead of kube-apiserver + etcd — same reconcile loops, one commodity managed database.
+Runs the controller-runtime controllers against plain PostgreSQL instead of kube-apiserver + etcd — same reconcile loops, one commodity managed database.
 
 This works because the library re-implements the Kubernetes List/Watch contract — commit-ordered event streams with `resourceVersion` semantics — on ordinary Postgres tables. Informers, reconcile loops, and optimistic concurrency behave as they always have; underneath, writers (controllers, or an API server fronting the database) and watchers talk to Postgres directly, with no etcd protocol, no kube-apiserver, and no consensus layer in the path.
 
-The motivation is operational. At fleet scale, etcd becomes the component you engineer around, and colocating application state in the cluster's own etcd ties your data's disaster-recovery story to the cluster's. One managed Postgres instance replaces it with a database your team already knows how to run — independent backup/restore, standard failover — and gives up nothing on throughput: ~10,000 writes/s on modest hardware (db.m6g.2xlarge, ~$500/mo), with correctness enforced by row locks rather than convention.
+The motivation is operational. At fleet scale, etcd becomes the component you engineer around, and colocating application state in the cluster's own etcd ties your data's disaster-recovery story to the cluster's. One managed Postgres instance replaces it with a database your team already knows how to run — independent backup/restore, standard failover — and gives up nothing on throughput: ~10,000 writes/s on modest hardware (db.m6g.2xlarge), with correctness enforced by row locks.
 
 **This is not a general-purpose etcd replacement.** It targets deployments where you own every writer and all writes go through this library. Check [Is this for you?](#is-this-for-you) to see if your use case matches the assumptions. If not, use [kine](https://github.com/k3s-io/kine).
-
-## The mental model
-
-Four ideas carry the whole design:
-
-- **Buckets.** Resources are partitioned client-side: a caller-supplied function maps each object (namespace, name) to one of N buckets. The database stores whatever bucket ID it's given and never re-shards. The bucket is the unit of write concurrency and event ordering.
-- **Commit-ordered sequences.** Each (GVK, bucket) pair has its own counter, created on first use — no global sequence bottleneck. Within a bucket, sequence order equals commit order — if seq N is visible, every seq before it is also visible — so watchers get a commit-ordered event stream.
-- **Poll-primary watch.** Watchers _pull_ events from the table; the LISTEN/NOTIFY doorbell is a latency-only optimization. Total notification loss costs latency (bounded by the baseline poll, 5s default), never events.
-- **Timeline epochs.** The resourceVersion is a timeline epoch plus a per-bucket high-water-mark vector. Failover bumps the epoch; watchers with stale positions get `410 Gone` and relist instead of silently missing events.
-
-[WALKTHROUGH.md](WALKTHROUGH.md) develops each of these in narrative form; [DESIGN.md](DESIGN.md) is the full specification.
 
 ## Is this for you?
 
@@ -25,9 +14,20 @@ Only use if you can satisfy both assumptions:
 
 1. **You own every writer, and every writer uses this library with the same configuration.** Writers can be controller-runtime reconcilers, an API server fronting the database, or any other component — as long as all writes go through this library and every writer shares one configuration (bucket topology and the object→bucket assigner are part of that configuration; how buckets uphold the guarantees is an implementation detail, explained in [DESIGN.md](DESIGN.md)). Nothing server-side validates a writer's configuration, so the guarantees hold only because every writer is yours. The configuration is fixed for the life of a deployment (changing it requires all watchers to relist).
 
-2. **Single-primary PostgreSQL 16+.** No multi-region, no multi-writer — the correctness mechanisms are row locks in one primary. Synchronous replication to a standby is required for the claim that failover never loses an acknowledged commit. AWS RDS Multi-AZ is the reference deployment (and where the performance numbers come from), not a requirement.
+2. **Single-primary PostgreSQL 16+.** Synchronous replication to a standby is required for the claim that failover never loses an acknowledged commit. AWS RDS Multi-AZ is the reference deployment (and where the performance numbers come from), not a requirement.
 
 Otherwise, use `etcd` or `kine`, for example.
+
+## The mental model
+
+Four ideas carry the whole design:
+
+- **Buckets.** Resources are partitioned client-side: a caller-supplied function maps each object (namespace, name) to one of N buckets. The database stores whatever bucket ID it's given and never re-shards. The bucket is the unit of write concurrency and event ordering.
+- **Commit-ordered sequences.** Each `(GVK, bucket)` pair has its own counter, created on first use — no global sequence bottleneck. Within a bucket, sequence order equals commit order — if seq N is visible, every seq before it is also visible — so watchers get a commit-ordered event stream.
+- **Poll-primary watch.** Watchers _pull_ events from the table; the LISTEN/NOTIFY doorbell is a latency-only optimization. Total notification loss costs latency (bounded by the baseline poll, 5s default), never events.
+- **Timeline epochs.** The resourceVersion is a timeline epoch plus a per-bucket high-water-mark vector. Failover bumps the epoch; watchers with stale positions get `410 Gone` and relist instead of silently missing events.
+
+[WALKTHROUGH.md](WALKTHROUGH.md) develops each of these in narrative form; [DESIGN.md](DESIGN.md) is the full specification.
 
 ## Getting started
 
