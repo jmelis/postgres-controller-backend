@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/verifier"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
@@ -46,22 +45,10 @@ func truncateAll(t *testing.T) {
 	conn.Close(context.Background())
 }
 
-func setupLease(t *testing.T, bucketID int, holder string, ttl time.Duration) int64 {
-	t.Helper()
-	conn := freshConn(t)
-	defer conn.Close(context.Background())
-	mgr := lease.NewSpecManager(conn, holder)
-	epoch, err := mgr.Acquire(context.Background(), bucketID, ttl)
-	require.NoError(t, err)
-	return epoch
-}
-
 func TestVerifier_CleanStream_NoViolations(t *testing.T) {
 	truncateAll(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
 
 	pollConn := manualConn(t)
 
@@ -85,7 +72,7 @@ func TestVerifier_CleanStream_NoViolations(t *testing.T) {
 			GVK: "apps/v1/Deployment", Namespace: "default",
 			Name: fmt.Sprintf("clean-%d", i), BucketID: 1,
 			Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
-			Metadata: json.RawMessage(`{}`), LeaseHolder: "holder-a", LeaseEpoch: epoch,
+			Metadata: json.RawMessage(`{}`),
 		}
 		_, err := wr.Write(ctx, req)
 		require.NoError(t, err)
@@ -108,8 +95,6 @@ func TestVerifier_WithCanary(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	pollConn := manualConn(t)
 	canaryConn := freshConn(t)
 
@@ -118,8 +103,6 @@ func TestVerifier_WithCanary(t *testing.T) {
 		BucketIDs:      []int{1},
 		PollInterval:   200 * time.Millisecond,
 		CanaryInterval: 300 * time.Millisecond,
-		CanaryHolder:   "holder-a",
-		CanaryEpoch:    epoch,
 	})
 
 	verCtx, verCancel := context.WithCancel(ctx)
@@ -148,15 +131,13 @@ func TestVerifier_DetectsDuplicate_I5(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	// Write one resource
 	wrConn := freshConn(t)
 	wr := writer.New(wrConn, nil)
 	req := model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "dup-test", BucketID: 1,
 		Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
-		Metadata: json.RawMessage(`{}`), LeaseHolder: "holder-a", LeaseEpoch: epoch,
+		Metadata: json.RawMessage(`{}`),
 	}
 	_, err := wr.Write(ctx, req)
 	require.NoError(t, err)

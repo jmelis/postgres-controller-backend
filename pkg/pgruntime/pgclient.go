@@ -21,17 +21,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-type leaseState struct {
-	specEpoch   int64
-	statusEpoch int64
-}
-
 type pgClient struct {
 	scheme     *runtime.Scheme
 	pool       *pgxpool.Pool
 	assign     func(ns, name string) int
-	holderID   string
-	leases     map[int]leaseState
+	bucketIDs  []int
 	restMapper meta.RESTMapper
 }
 
@@ -93,7 +87,7 @@ func (c *pgClient) List(ctx context.Context, list client.ObjectList, opts ...cli
 	defer poolConn.Release()
 	conn := poolConn.Conn()
 
-	result, err := reader.List(ctx, conn, gvkStr, c.bucketIDs())
+	result, err := reader.List(ctx, conn, gvkStr, c.bucketIDs)
 	if err != nil {
 		return err
 	}
@@ -141,7 +135,6 @@ func (c *pgClient) Create(ctx context.Context, obj client.Object, opts ...client
 
 	ns, name := obj.GetNamespace(), obj.GetName()
 	bucketID := c.assign(ns, name)
-	ls := c.leaseForBucket(bucketID)
 
 	poolConn, err := c.pool.Acquire(ctx)
 	if err != nil {
@@ -160,8 +153,6 @@ func (c *pgClient) Create(ctx context.Context, obj client.Object, opts ...client
 		Status:          status,
 		Metadata:        metadata,
 		ExpectedVersion: 0,
-		LeaseHolder:     c.holderID,
-		LeaseEpoch:      ls.specEpoch,
 	})
 	if err != nil {
 		r, wErr := mapWriteError(ctx, w, err, gvk, name, 0)
@@ -195,7 +186,6 @@ func (c *pgClient) Update(ctx context.Context, obj client.Object, opts ...client
 
 	ns, name := obj.GetNamespace(), obj.GetName()
 	bucketID := c.assign(ns, name)
-	ls := c.leaseForBucket(bucketID)
 
 	poolConn, err := c.pool.Acquire(ctx)
 	if err != nil {
@@ -217,7 +207,7 @@ func (c *pgClient) Update(ctx context.Context, obj client.Object, opts ...client
 		return err
 	}
 
-	if !jsonEqual(current.Spec, newSpec) {
+	if !writer.JSONEqual(current.Spec, newSpec) {
 		currentGen := currentGeneration(current.Metadata)
 		obj.SetGeneration(currentGen + 1)
 	}
@@ -228,7 +218,7 @@ func (c *pgClient) Update(ctx context.Context, obj client.Object, opts ...client
 	}
 
 	w := writer.New(conn, nil)
-	result, err := w.WriteSpec(ctx, model.SpecWriteRequest{
+	result, err := w.WriteObject(ctx, model.ObjectWriteRequest{
 		GVK:               gvkStr,
 		Namespace:          ns,
 		Name:               name,
@@ -237,8 +227,6 @@ func (c *pgClient) Update(ctx context.Context, obj client.Object, opts ...client
 		Metadata:           metadata,
 		DeletionTimestamp:  current.DeletionTimestamp,
 		ExpectedVersion:    expectedVersion,
-		LeaseHolder:        c.holderID,
-		LeaseEpoch:         ls.specEpoch,
 	})
 	if err != nil {
 		r, wErr := mapWriteError(ctx, w, err, gvk, name, 0)
@@ -264,7 +252,6 @@ func (c *pgClient) Delete(ctx context.Context, obj client.Object, opts ...client
 
 	ns, name := obj.GetNamespace(), obj.GetName()
 	bucketID := c.assign(ns, name)
-	ls := c.leaseForBucket(bucketID)
 
 	poolConn, err := c.pool.Acquire(ctx)
 	if err != nil {
@@ -321,8 +308,6 @@ func (c *pgClient) Delete(ctx context.Context, obj client.Object, opts ...client
 		Metadata:           metadata,
 		DeletionTimestamp:  deletionTS,
 		ExpectedVersion:    expectedVersion,
-		LeaseHolder:        c.holderID,
-		LeaseEpoch:         ls.specEpoch,
 	})
 	if err != nil {
 		_, wErr := mapWriteError(ctx, w, err, gvk, name, 0)
@@ -380,21 +365,6 @@ func (c *pgClient) IsObjectNamespaced(obj runtime.Object) (bool, error) {
 	return mapping.Scope.Name() == meta.RESTScopeNameNamespace, nil
 }
 
-func (c *pgClient) bucketIDs() []int {
-	ids := make([]int, 0, len(c.leases))
-	for id := range c.leases {
-		ids = append(ids, id)
-	}
-	return ids
-}
-
-func (c *pgClient) leaseForBucket(bucketID int) leaseState {
-	if ls, ok := c.leases[bucketID]; ok {
-		return ls
-	}
-	return leaseState{}
-}
-
 // pgStatusWriter implements client.SubResourceWriter for status updates.
 type pgStatusWriter struct {
 	c *pgClient
@@ -423,7 +393,6 @@ func (sw *pgStatusWriter) Update(ctx context.Context, obj client.Object, opts ..
 
 	ns, name := obj.GetNamespace(), obj.GetName()
 	bucketID := sw.c.assign(ns, name)
-	ls := sw.c.leaseForBucket(bucketID)
 
 	poolConn, err := sw.c.pool.Acquire(ctx)
 	if err != nil {
@@ -440,8 +409,6 @@ func (sw *pgStatusWriter) Update(ctx context.Context, obj client.Object, opts ..
 		BucketID:        bucketID,
 		Status:          status,
 		ExpectedVersion: expectedVersion,
-		LeaseHolder:     sw.c.holderID,
-		LeaseEpoch:      ls.statusEpoch,
 	})
 	if err != nil {
 		r, wErr := mapWriteError(ctx, w, err, gvk, name, 0)

@@ -27,12 +27,10 @@ func TestR14_Debounced410(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	// Write a resource so the initial poll has work
 	wr := newWriter(t, nil)
 	_, err := wr.Write(ctx, makeWriteReq("apps/v1/Deployment", "default",
-		"r14-test", 1, "holder-a", epoch))
+		"r14-test", 1))
 	require.NoError(t, err)
 
 	pollConn := connectManualShared(t)
@@ -78,11 +76,9 @@ func TestR14_Debounced410(t *testing.T) {
 
 	// Write another resource — the doorbell fires, debouncedPoll calls poll(),
 	// which detects the epoch mismatch and returns ErrGone.
-	// (The write itself succeeds because the fence checks bucket_leases (spec row),
-	// not cluster_epoch.)
 	wr2 := newWriter(t, nil)
 	_, _ = wr2.Write(ctx, makeWriteReq("apps/v1/Deployment", "default",
-		"r14-trigger", 1, "holder-a", epoch))
+		"r14-trigger", 1))
 
 	// The watcher must terminate with ErrGone.
 	// B2 bug: debouncedPoll discards the error; watcher keeps running.

@@ -7,10 +7,8 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
 )
@@ -51,23 +49,9 @@ func generatePayload(sizeBytes int, idx int) json.RawMessage {
 }
 
 // Seed populates the database with objects according to the config.
-// It acquires leases for all buckets, then writes objects round-robin.
+// It writes objects round-robin across buckets.
 func Seed(ctx context.Context, conn *pgx.Conn, cfg *Config) error {
 	numBuckets := cfg.Cluster.Buckets
-	holder := "loadtest-seeder"
-	ttl := cfg.Cluster.LeaseTTL
-
-	// Acquire leases for all buckets
-	bucketEpochs := make(map[int]int64)
-	leaseMgr := lease.NewSpecManager(conn, holder).WithMetrics(libLeaseMetrics)
-	for b := 1; b <= numBuckets; b++ {
-		epoch, err := leaseMgr.Acquire(ctx, b, ttl)
-		if err != nil {
-			return fmt.Errorf("acquire lease for bucket %d: %w", b, err)
-		}
-		bucketEpochs[b] = epoch
-	}
-	log.Printf("seeder: acquired leases for %d buckets", numBuckets)
 
 	wr := writer.New(conn, nil).WithMetrics(libWriterMetrics)
 	totalSeeded := 0
@@ -87,15 +71,13 @@ func Seed(ctx context.Context, conn *pgx.Conn, cfg *Config) error {
 				metadata := generatePayload(gvkCfg.MetadataSizeBytes, objIdx)
 
 				req := model.WriteRequest{
-					GVK:         gvkCfg.GVK,
-					Namespace:   "loadtest-seed",
-					Name:        fmt.Sprintf("seed-%s-%d", gvkCfg.GVK, objIdx),
-					BucketID:    b,
-					Spec:        spec,
-					Status:      status,
-					Metadata:    metadata,
-					LeaseHolder: holder,
-					LeaseEpoch:  bucketEpochs[b],
+					GVK:       gvkCfg.GVK,
+					Namespace: "loadtest-seed",
+					Name:      fmt.Sprintf("seed-%s-%d", gvkCfg.GVK, objIdx),
+					BucketID:  b,
+					Spec:      spec,
+					Status:    status,
+					Metadata:  metadata,
 				}
 
 				if _, err := wr.Write(ctx, req); err != nil {
@@ -119,35 +101,5 @@ func Seed(ctx context.Context, conn *pgx.Conn, cfg *Config) error {
 
 	log.Printf("seeder: total %d objects seeded across %d GVKs", totalSeeded, len(cfg.Seed.GVKs))
 
-	// Release all leases so phases can acquire them.
-	for b := 1; b <= numBuckets; b++ {
-		if err := leaseMgr.Release(ctx, b); err != nil {
-			return fmt.Errorf("release lease for bucket %d: %w", b, err)
-		}
-	}
-	log.Printf("seeder: released leases for %d buckets", numBuckets)
-
 	return nil
-}
-
-// acquireAllLeases acquires spec leases for all buckets and returns a map of bucketID -> epoch.
-func acquireAllLeases(ctx context.Context, conn *pgx.Conn, numBuckets int, holder string, ttl time.Duration) (map[int]int64, error) {
-	epochs := make(map[int]int64)
-	mgr := lease.NewSpecManager(conn, holder).WithMetrics(libLeaseMetrics)
-	for b := 1; b <= numBuckets; b++ {
-		epoch, err := mgr.Acquire(ctx, b, ttl)
-		if err != nil {
-			return nil, fmt.Errorf("acquire lease bucket %d: %w", b, err)
-		}
-		epochs[b] = epoch
-	}
-	return epochs, nil
-}
-
-// releaseAllLeases releases spec leases for all buckets.
-func releaseAllLeases(ctx context.Context, conn *pgx.Conn, numBuckets int, holder string) {
-	mgr := lease.NewSpecManager(conn, holder).WithMetrics(libLeaseMetrics)
-	for b := 1; b <= numBuckets; b++ {
-		_ = mgr.Release(ctx, b)
-	}
 }

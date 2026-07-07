@@ -11,10 +11,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
-	"github.com/stretchr/testify/require"
 )
 
 func TestCeiling_BucketScaling(t *testing.T) {
@@ -45,21 +43,8 @@ func TestCeiling_BucketScaling(t *testing.T) {
 			totalWorkers := bc.buckets * bc.workersPerBucket
 			const (
 				gvk          = "apps/v1/Deployment"
-				holder       = "ceiling-holder"
 				testDuration = 5 * time.Second
 			)
-
-			// Acquire leases for all buckets, store each epoch
-			bucketEpochs := make(map[int]int64)
-			for b := 1; b <= bc.buckets; b++ {
-				lc, err := pgx.Connect(ctx, sharedDB.ConnStr)
-				require.NoError(t, err)
-				mgr := lease.NewSpecManager(lc, holder)
-				ep, err := mgr.Acquire(ctx, b, 120*time.Second)
-				require.NoError(t, err)
-				bucketEpochs[b] = ep
-				lc.Close(ctx)
-			}
 
 			var totalWrites atomic.Int64
 			var totalErrors atomic.Int64
@@ -71,10 +56,9 @@ func TestCeiling_BucketScaling(t *testing.T) {
 
 			workerID := 0
 			for b := 1; b <= bc.buckets; b++ {
-				bucketEpoch := bucketEpochs[b]
 				for w := 0; w < bc.workersPerBucket; w++ {
 					wg.Add(1)
-					go func(wID, bucketID int, epoch int64) {
+					go func(wID, bucketID int) {
 						defer wg.Done()
 
 						conn, err := pgx.Connect(ctx, sharedDB.ConnStr)
@@ -93,7 +77,6 @@ func TestCeiling_BucketScaling(t *testing.T) {
 								GVK: gvk, Namespace: "ceiling", Name: fmt.Sprintf("w%d-r%d", wID, writeNum),
 								BucketID: bucketID, Spec: json.RawMessage(`{}`),
 								Status: json.RawMessage(`{}`), Metadata: json.RawMessage(`{}`),
-								LeaseHolder: holder, LeaseEpoch: epoch,
 							}
 
 							t0 := time.Now()
@@ -111,7 +94,7 @@ func TestCeiling_BucketScaling(t *testing.T) {
 						}
 
 						allLatencies.Store(wID, lats)
-					}(workerID, b, bucketEpoch)
+					}(workerID, b)
 					workerID++
 				}
 			}

@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/verifier"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
@@ -29,8 +28,6 @@ func RunPhase2(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	duration := pCfg.Duration
 	targetRPS := pCfg.TargetRPS
 	burstRPS := pCfg.BurstRPS
-	holder := "phase2-holder"
-	ttl := cfg.Cluster.LeaseTTL
 
 	gvk := "apps/v1/Deployment"
 	if len(cfg.Seed.GVKs) > 0 {
@@ -39,18 +36,6 @@ func RunPhase2(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 
 	log.Printf("phase2: starting steady-state test — target %.1f rps, burst %.1f rps, duration %v",
 		targetRPS, burstRPS, duration)
-
-	// Acquire leases.
-	leaseConn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("phase2: lease conn: %w", err)
-	}
-	defer leaseConn.Close(context.Background())
-
-	bucketEpochs, err := acquireAllLeases(ctx, leaseConn, numBuckets, holder, ttl)
-	if err != nil {
-		return nil, fmt.Errorf("phase2: %w", err)
-	}
 
 	// Start verifier.
 	var ver *verifier.Verifier
@@ -76,25 +61,6 @@ func RunPhase2(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 		go func() { verDone <- ver.Run(verCtx) }()
 	}
 
-	// Lease renewal goroutine — renew every ttl/3.
-	renewCtx, renewCancel := context.WithCancel(ctx)
-	defer renewCancel()
-	go func() {
-		ticker := time.NewTicker(ttl / 3)
-		defer ticker.Stop()
-		renewMgr := lease.NewSpecManager(leaseConn, holder).WithMetrics(libLeaseMetrics)
-		for {
-			select {
-			case <-renewCtx.Done():
-				return
-			case <-ticker.C:
-				for b := 1; b <= numBuckets; b++ {
-					_ = renewMgr.Renew(renewCtx, b, ttl)
-				}
-			}
-		}
-	}()
-
 	// Rate-limited writer pool.
 	// Each writer goroutine picks writes off a shared channel.
 	type writeJob struct {
@@ -108,7 +74,7 @@ func RunPhase2(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	var mu sync.Mutex
 	var allLatencies []time.Duration
 	var totalWrites atomic.Int64
-	var totalSerFail, totalFenceFail, totalOtherErr atomic.Int64
+	var totalSerFail, totalOtherErr atomic.Int64
 
 	var writerWg sync.WaitGroup
 	for w := 0; w < numWriters; w++ {
@@ -128,15 +94,13 @@ func RunPhase2(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 			for job := range jobCh {
 				name := fmt.Sprintf("p2-b%d-r%d", job.bucketID, job.writeNum)
 				req := model.WriteRequest{
-					GVK:         gvk,
-					Namespace:   "phase2",
-					Name:        name,
-					BucketID:    job.bucketID,
-					Spec:        json.RawMessage(fmt.Sprintf(`{"b":%d,"n":%d}`, job.bucketID, job.writeNum)),
-					Status:      json.RawMessage(`{}`),
-					Metadata:    json.RawMessage(`{}`),
-					LeaseHolder: holder,
-					LeaseEpoch:  bucketEpochs[job.bucketID],
+					GVK:       gvk,
+					Namespace: "phase2",
+					Name:      name,
+					BucketID:  job.bucketID,
+					Spec:      json.RawMessage(fmt.Sprintf(`{"b":%d,"n":%d}`, job.bucketID, job.writeNum)),
+					Status:    json.RawMessage(`{}`),
+					Metadata:  json.RawMessage(`{}`),
 				}
 
 				t0 := time.Now()
@@ -146,8 +110,6 @@ func RunPhase2(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 				if writeErr != nil {
 					if isSerializationFailure(writeErr) {
 						totalSerFail.Add(1)
-					} else if isFenceViolation(writeErr) {
-						totalFenceFail.Add(1)
 					} else {
 						totalOtherErr.Add(1)
 					}
@@ -219,7 +181,6 @@ loop:
 	writerWg.Wait()
 	elapsed := time.Since(start)
 	phaseDuration.WithLabelValues(phase2Name).Observe(elapsed.Seconds())
-	renewCancel()
 
 	// Collect verifier results.
 	var violations []string
@@ -251,14 +212,10 @@ loop:
 	}
 
 	serFail := totalSerFail.Load()
-	fenceFail := totalFenceFail.Load()
 	otherErr := totalOtherErr.Load()
 
 	if serFail > 0 {
 		errorsTotal.WithLabelValues(phase2Name, "serialization").Add(float64(serFail))
-	}
-	if fenceFail > 0 {
-		errorsTotal.WithLabelValues(phase2Name, "fence_violation").Add(float64(fenceFail))
 	}
 	if otherErr > 0 {
 		errorsTotal.WithLabelValues(phase2Name, "other").Add(float64(otherErr))
@@ -278,8 +235,6 @@ loop:
 		passed = false
 	}
 
-	releaseAllLeases(ctx, leaseConn, numBuckets, holder)
-
 	return &PhaseResult{
 		Name:        phase2Name,
 		Passed:      passed,
@@ -290,9 +245,8 @@ loop:
 		P99:         p99,
 		P999:        p999,
 		Errors: map[string]int64{
-			"serialization":  serFail,
-			"fence_violation": fenceFail,
-			"other":          otherErr,
+			"serialization": serFail,
+			"other":         otherErr,
 		},
 		VerifierViolations: violations,
 	}, nil

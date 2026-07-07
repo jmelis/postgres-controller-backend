@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/verifier"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
@@ -27,8 +26,6 @@ const phase2bName = "phase2b_skew"
 func RunPhase2b(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, error) {
 	pCfg := cfg.Phases.Phase2bSkew
 	numBuckets := cfg.Cluster.Buckets
-	holder := "phase2b-holder"
-	ttl := cfg.Cluster.LeaseTTL
 
 	// Phase2b runs for the same duration as phase2, or a default of 60s.
 	duration := cfg.Phases.Phase2Steady.Duration
@@ -62,37 +59,6 @@ func RunPhase2b(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, err
 
 	log.Printf("phase2b: starting skew test — %d%% writes to bucket 1, %d cold buckets, duration %v",
 		hotPct, numBuckets-1, duration)
-
-	// Acquire leases.
-	leaseConn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("phase2b: lease conn: %w", err)
-	}
-	defer leaseConn.Close(context.Background())
-
-	bucketEpochs, err := acquireAllLeases(ctx, leaseConn, numBuckets, holder, ttl)
-	if err != nil {
-		return nil, fmt.Errorf("phase2b: %w", err)
-	}
-
-	// Lease renewal.
-	renewCtx, renewCancel := context.WithCancel(ctx)
-	defer renewCancel()
-	go func() {
-		ticker := time.NewTicker(ttl / 3)
-		defer ticker.Stop()
-		renewMgr := lease.NewSpecManager(leaseConn, holder).WithMetrics(libLeaseMetrics)
-		for {
-			select {
-			case <-renewCtx.Done():
-				return
-			case <-ticker.C:
-				for b := 1; b <= numBuckets; b++ {
-					_ = renewMgr.Renew(renewCtx, b, ttl)
-				}
-			}
-		}
-	}()
 
 	// Start verifier.
 	var ver *verifier.Verifier
@@ -139,7 +105,7 @@ func RunPhase2b(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, err
 	}
 
 	var totalWrites atomic.Int64
-	var totalSerFail, totalFenceFail, totalOtherErr atomic.Int64
+	var totalSerFail, totalOtherErr atomic.Int64
 
 	// Writer pool — one conn per bucket.
 	type writeJob struct {
@@ -166,15 +132,13 @@ func RunPhase2b(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, err
 			for job := range jobCh {
 				name := fmt.Sprintf("p2b-b%d-r%d", job.bucketID, job.writeNum)
 				req := model.WriteRequest{
-					GVK:         gvk,
-					Namespace:   "phase2b",
-					Name:        name,
-					BucketID:    job.bucketID,
-					Spec:        json.RawMessage(fmt.Sprintf(`{"b":%d,"n":%d}`, job.bucketID, job.writeNum)),
-					Status:      json.RawMessage(`{}`),
-					Metadata:    json.RawMessage(`{}`),
-					LeaseHolder: holder,
-					LeaseEpoch:  bucketEpochs[job.bucketID],
+					GVK:       gvk,
+					Namespace: "phase2b",
+					Name:      name,
+					BucketID:  job.bucketID,
+					Spec:      json.RawMessage(fmt.Sprintf(`{"b":%d,"n":%d}`, job.bucketID, job.writeNum)),
+					Status:    json.RawMessage(`{}`),
+					Metadata:  json.RawMessage(`{}`),
 				}
 
 				t0 := time.Now()
@@ -184,8 +148,6 @@ func RunPhase2b(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, err
 				if writeErr != nil {
 					if isSerializationFailure(writeErr) {
 						totalSerFail.Add(1)
-					} else if isFenceViolation(writeErr) {
-						totalFenceFail.Add(1)
 					} else {
 						totalOtherErr.Add(1)
 					}
@@ -233,7 +195,6 @@ loop:
 	writerWg.Wait()
 	elapsed := time.Since(start)
 	phaseDuration.WithLabelValues(phase2bName).Observe(elapsed.Seconds())
-	renewCancel()
 
 	// Verifier.
 	var violations []string
@@ -299,7 +260,6 @@ loop:
 		coldCount, p50, p99)
 
 	serFail := totalSerFail.Load()
-	fenceFail := totalFenceFail.Load()
 	otherErr := totalOtherErr.Load()
 
 	if serFail > 0 {
@@ -315,8 +275,6 @@ loop:
 		passed = false
 	}
 
-	releaseAllLeases(ctx, leaseConn, numBuckets, holder)
-
 	return &PhaseResult{
 		Name:        phase2bName,
 		Passed:      passed,
@@ -327,9 +285,8 @@ loop:
 		P99:         p99,
 		P999:        p999,
 		Errors: map[string]int64{
-			"serialization":  serFail,
-			"fence_violation": fenceFail,
-			"other":          otherErr,
+			"serialization": serFail,
+			"other":         otherErr,
 		},
 		VerifierViolations: violations,
 	}, nil

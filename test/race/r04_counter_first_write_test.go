@@ -20,8 +20,6 @@ func TestR4_CounterFirstWriteRace(t *testing.T) {
 	truncateAll(t)
 	ctx := context.Background()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	w1 := newWriter(t, nil)
 	w2 := newWriter(t, nil)
 
@@ -40,7 +38,7 @@ func TestR4_CounterFirstWriteRace(t *testing.T) {
 			defer wg.Done()
 			<-barrier
 			req := makeWriteReq("apps/v1/Deployment", "default",
-				fmt.Sprintf("resource-%d", idx), 1, "holder-a", epoch)
+				fmt.Sprintf("resource-%d", idx), 1)
 			result, err := w2.Write(ctx, req)
 			mu.Lock()
 			defer mu.Unlock()

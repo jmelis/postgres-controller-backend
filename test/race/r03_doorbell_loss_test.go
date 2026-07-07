@@ -22,8 +22,6 @@ func TestR3_DoorbellLoss(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	// NO listen connection — doorbell is completely absent
 	pollConn := connectManualShared(t)
 	w := reader.NewWatcher(pollConn, nil, reader.WatcherConfig{
@@ -48,7 +46,7 @@ func TestR3_DoorbellLoss(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		wr := newWriter(t, nil)
 		req := makeWriteReq("apps/v1/Deployment", "default",
-			fmt.Sprintf("doorbell-loss-%d", i), 1, "holder-a", epoch)
+			fmt.Sprintf("doorbell-loss-%d", i), 1)
 		_, err := wr.Write(ctx, req)
 		require.NoError(t, err)
 	}

@@ -69,12 +69,11 @@ var (
 	)
 )
 
-// Library metrics — registered once, wired into every writer/watcher/verifier/lease instance.
+// Library metrics — registered once, wired into every writer/watcher/verifier instance.
 var (
 	libWriterMetrics   *metrics.WriterMetrics
 	libWatcherMetrics  *metrics.WatcherMetrics
 	libVerifierMetrics *metrics.VerifierMetrics
-	libLeaseMetrics    *metrics.LeaseMetrics
 )
 
 func init() {
@@ -90,7 +89,6 @@ func init() {
 	libWriterMetrics = metrics.NewWriterMetrics(prometheus.DefaultRegisterer)
 	libWatcherMetrics = metrics.NewWatcherMetrics(prometheus.DefaultRegisterer)
 	libVerifierMetrics = metrics.NewVerifierMetrics(prometheus.DefaultRegisterer)
-	libLeaseMetrics = metrics.NewLeaseMetrics(prometheus.DefaultRegisterer)
 }
 
 // StartMetricsServer starts a Prometheus /metrics HTTP server in a background

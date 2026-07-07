@@ -5,10 +5,8 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
 	"github.com/jmelis/postgres-controller-backend/test/testinfra"
@@ -49,7 +47,6 @@ func truncateAll(t *testing.T) {
 	tables := []string{
 		"kubernetes_resources",
 		"gvk_bucket_counters",
-		"bucket_leases",
 		"compaction_horizon",
 	}
 	ctx := context.Background()
@@ -62,22 +59,11 @@ func truncateAll(t *testing.T) {
 	conn.Exec(ctx, "UPDATE cluster_epoch SET timeline_id = 1")
 }
 
-func setupLease(t *testing.T, bucketID int, holder string, ttl time.Duration) int64 {
-	t.Helper()
-	conn := directConn(t)
-	mgr := lease.NewSpecManager(conn, holder)
-	epoch, err := mgr.Acquire(context.Background(), bucketID, ttl)
-	if err != nil {
-		t.Fatalf("setup lease: %v", err)
-	}
-	return epoch
-}
-
-func makeWriteReq(gvk, ns, name string, bucketID int, holder string, epoch int64) model.WriteRequest {
+func makeWriteReq(gvk, ns, name string, bucketID int) model.WriteRequest {
 	return model.WriteRequest{
 		GVK: gvk, Namespace: ns, Name: name, BucketID: bucketID,
 		Spec: json.RawMessage(`{"replicas":1}`), Status: json.RawMessage(`{}`),
-		Metadata: json.RawMessage(`{}`), LeaseHolder: holder, LeaseEpoch: epoch,
+		Metadata: json.RawMessage(`{}`),
 	}
 }
 

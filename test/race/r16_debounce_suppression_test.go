@@ -22,8 +22,6 @@ func TestR16_DebounceSuppression(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	pollConn := connectManualShared(t)
 	listenConn := connectManualShared(t)
 
@@ -71,7 +69,7 @@ func TestR16_DebounceSuppression(t *testing.T) {
 
 	// Write one real resource AFTER the burst to verify delivery survived suppression.
 	wr := newWriter(t, nil)
-	req := makeWriteReq("apps/v1/Deployment", "default", "debounce-survivor", 1, "holder-a", epoch)
+	req := makeWriteReq("apps/v1/Deployment", "default", "debounce-survivor", 1)
 	_, err := wr.Write(ctx, req)
 	require.NoError(t, err)
 
@@ -88,8 +86,6 @@ func TestR16_TrailingEdgeTiming(t *testing.T) {
 	truncateAll(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	setupLease(t, 1, "holder-a", 60_000_000_000)
 
 	pollConn := connectManualShared(t)
 	listenConn := connectManualShared(t)
@@ -212,8 +208,6 @@ func TestR16_DebounceSuppression_NoEventLoss(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	pollConn := connectManualShared(t)
 	listenConn := connectManualShared(t)
 
@@ -241,7 +235,7 @@ func TestR16_DebounceSuppression_NoEventLoss(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		wr := newWriter(t, nil)
 		req := makeWriteReq("apps/v1/Deployment", "default",
-			fmt.Sprintf("debounce-stress-%d", i), 1, "holder-a", epoch)
+			fmt.Sprintf("debounce-stress-%d", i), 1)
 		_, err := wr.Write(ctx, req)
 		require.NoError(t, err)
 	}

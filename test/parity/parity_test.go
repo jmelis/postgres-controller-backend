@@ -98,10 +98,9 @@ func newPostgresBackend(t *testing.T) *Backend {
 	conn.Close(context.Background())
 
 	mgr, err := pgruntime.NewManager(pgruntime.Options{
-		Scheme:   greeting.Scheme,
-		DSN:      sharedDB.ConnStr,
-		HolderID: "parity-" + sanitizeName(t.Name()),
-		Logger:   logr.Discard(),
+		Scheme: greeting.Scheme,
+		DSN:    sharedDB.ConnStr,
+		Logger: logr.Discard(),
 	})
 	require.NoError(t, err)
 

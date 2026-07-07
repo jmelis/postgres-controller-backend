@@ -23,12 +23,10 @@ func TestR9_RVBackwardsExposure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	// Write some data under epoch 1
 	wr := newWriter(t, nil)
 	_, err := wr.Write(ctx, makeWriteReq("apps/v1/Deployment", "default",
-		"pre-failover", 1, "holder-a", epoch))
+		"pre-failover", 1))
 	if err != nil {
 		t.Fatalf("write: %v", err)
 	}

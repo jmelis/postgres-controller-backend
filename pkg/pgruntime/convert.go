@@ -23,25 +23,6 @@ type storedMetadata struct {
 	Generation      int64                    `json:"generation,omitempty"`
 }
 
-func jsonEqual(a, b json.RawMessage) bool {
-	if len(a) == 0 && len(b) == 0 {
-		return true
-	}
-	if len(a) == 0 || len(b) == 0 {
-		return false
-	}
-	var va, vb any
-	if err := json.Unmarshal(a, &va); err != nil {
-		return false
-	}
-	if err := json.Unmarshal(b, &vb); err != nil {
-		return false
-	}
-	ra, _ := json.Marshal(va)
-	rb, _ := json.Marshal(vb)
-	return string(ra) == string(rb)
-}
-
 func gvkToString(gvk schema.GroupVersionKind) string {
 	return fmt.Sprintf("%s/%s/%s", gvk.Group, gvk.Version, gvk.Kind)
 }

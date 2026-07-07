@@ -77,7 +77,6 @@ func (db *TestDB) TruncateAll(t testing.TB, conn *pgx.Conn) {
 	tables := []string{
 		"kubernetes_resources",
 		"gvk_bucket_counters",
-		"bucket_leases",
 		"compaction_horizon",
 	}
 	ctx := context.Background()

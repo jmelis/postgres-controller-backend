@@ -27,8 +27,6 @@ func TestR13_ConcurrentPollRace(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	pollConn := connectManualShared(t)
 	listenConn := connectManualShared(t)
 
@@ -52,7 +50,7 @@ func TestR13_ConcurrentPollRace(t *testing.T) {
 	wr := newWriter(t, nil)
 	for i := 0; i < 10; i++ {
 		_, err := wr.Write(ctx, makeWriteReq("apps/v1/Deployment", "default",
-			"r13-"+string(rune('a'+i)), 1, "holder-a", epoch))
+			"r13-"+string(rune('a'+i)), 1))
 		require.NoError(t, err)
 		time.Sleep(30 * time.Millisecond)
 	}

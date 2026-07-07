@@ -158,31 +158,3 @@ func NewVerifierMetrics(reg prometheus.Registerer) *VerifierMetrics {
 	return m
 }
 
-// LeaseMetrics holds Prometheus metrics for lease operations.
-type LeaseMetrics struct {
-	AcquisitionsTotal   *prometheus.CounterVec
-	AcquisitionDuration *prometheus.HistogramVec
-}
-
-func NewLeaseMetrics(reg prometheus.Registerer) *LeaseMetrics {
-	if reg == nil {
-		return nil
-	}
-	m := &LeaseMetrics{
-		AcquisitionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "pgctl",
-			Subsystem: "lease",
-			Name:      "acquisitions_total",
-			Help:      "Total successful lease acquisitions.",
-		}, []string{"domain", "bucket_id"}),
-		AcquisitionDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: "pgctl",
-			Subsystem: "lease",
-			Name:      "acquisition_duration_seconds",
-			Help:      "Duration of lease acquisition operations.",
-			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0},
-		}, []string{"domain", "bucket_id"}),
-	}
-	reg.MustRegister(m.AcquisitionsTotal, m.AcquisitionDuration)
-	return m
-}

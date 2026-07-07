@@ -74,7 +74,6 @@ in `internal/schema/migrations/001_initial.sql`.
 | ---------------------- | ------------------------------------------------------------------------ | --------------------------- |
 | `kubernetes_resources` | The object in one of three lifecycle states (live, dying, fully deleted) | the keyspace                |
 | `gvk_bucket_counters`  | The gapless version number, one row per (bucket, GVK)                    | the global revision         |
-| `bucket_leases`        | Who is currently allowed to write a bucket                               | (etcd doesn't need this)    |
 | `compaction_horizon`   | How far back history has been destroyed                                  | the compaction revision     |
 | `cluster_epoch`        | A generation number bumped on failover                                   | (etcd's built-in guarantee) |
 
@@ -115,7 +114,7 @@ Read it as: _"On generation 7 of the database, I have seen everything up to seq
 - The **epoch prefix** is the failover seatbelt. On every promotion,
   `cluster_epoch.timeline_id` increments. So even in a disaster where a sequence
   somehow rewound, `(epoch, seq)` still moves forward, and any client arriving
-  with an old epoch is told to start over. That is invariants I3/I6.
+  with an old epoch is told to start over. That is invariants I3/I5.
 
 The serialization is canonical (buckets sorted) so equal states compare equal.
 
@@ -131,11 +130,8 @@ sequenceDiagram
     participant C as Controller (writer)
     participant DB as Postgres
     Note over C,DB: BEGIN (READ COMMITTED)
-    C->>DB: SELECT * FROM pgctl_write(domain, gvk, ns, name, bucket, holder, epoch, expected_version, force_write, spec, status, metadata, deletion_ts)
-    Note over DB: Inside pgctl_write(): (a) fence → (b) suppress? → (c) counter → (d) upsert
-    alt fence violation
-        DB-->>C: RAISE P0001 → ROLLBACK → ErrFenceViolation
-    end
+    C->>DB: SELECT * FROM pgctl_write(gvk, ns, name, bucket, expected_version, force_write, spec, status, metadata, deletion_ts)
+    Note over DB: Inside pgctl_write(): (a) suppress? → (b) counter → (c) upsert
     alt incoming content == stored content (suppressed)
         DB-->>C: (uid, version, 0, changed=false) → COMMIT
     end
@@ -152,43 +148,22 @@ ordering here comes from **row locks**, not from snapshots. (Isolation levels ar
 explained in the aside in Section 5, where the contrast with the read paths
 becomes visible.)
 
-The stored procedure (`pgctl_write()`) consolidates four formerly-separate
-SQL statements into one server-side call, eliminating three network round-trips
+The stored procedure (`pgctl_write()`) consolidates three formerly-separate
+SQL statements into one server-side call, eliminating two network round-trips
 per write. The doorbell fires **after** the commit, in a separate statement —
 this avoids a global lock on Postgres's notification queue that otherwise
-serializes all concurrent commits (see Section 4e).
+serializes all concurrent commits (see Section 4d).
 
-### (a) The fence — "am I still allowed to write?"
-
-```sql
-SELECT 1 FROM bucket_leases
-WHERE bucket_id=$1 AND domain=$2 AND holder=$3 AND epoch=$4 AND expires_at > now()
-FOR SHARE;
-```
-
-Only one replica may write a given bucket (invariant I4 — single writer, to
-prevent split-brain). It proves ownership by matching its `holder` and `epoch`
-against the lease row. The subtle part is `FOR SHARE`: it takes a **shared lock
-on the lease row and holds it until COMMIT.** A coordinator handing the lease to
-someone else must run `UPDATE bucket_leases SET epoch=epoch+1`, which needs an
-_exclusive_ lock — and exclusive conflicts with shared. So the lease cannot be
-reassigned while a write is in flight. Either the old writer commits first (it
-was still the legitimate holder), or the reassignment commits first and the old
-writer's fence now finds the wrong epoch and aborts. There is no interleaving in
-which a stale writer sneaks a commit through. Time (`expires_at`) is only a
-backstop; the lock is the real guarantee.
-
-### (b) No-op suppression — "did anything actually change?"
+### (a) No-op suppression — "did anything actually change?"
 
 The writer reads the current row and compares content. If identical, it commits
 _without_ touching the counter and reports `Changed=false`. This matches
 Kubernetes: an update that changes nothing does not advance resourceVersion.
-Crucially it runs _after_ the fence (so the lock discipline still holds) and
-_before_ the counter (so a no-op burns no sequence number — no gap). This is a
+It runs _before_ the counter (so a no-op burns no sequence number — no gap). This is a
 big deal in practice: status re-appliers that rewrite identical content every few
 minutes produce zero database writes and zero watch events.
 
-### (c) The counter — the heart of the whole design
+### (b) The counter — the heart of the whole design
 
 ```sql
 INSERT INTO gvk_bucket_counters (bucket_id, gvk, current_seq) VALUES ($1,$2,1)
@@ -232,14 +207,14 @@ ceiling high in aggregate.
 > update.** The cost (~2× the pages) is negligible — the table has one row per
 > (bucket, GVK).
 
-### (d) The upsert with optimistic concurrency
+### (c) The upsert with optimistic concurrency
 
 Writes the new content, stamps the fresh `gvk_bucket_seq`, and bumps
 `object_version`. The `WHERE object_version = $expected` clause means a stale
 updater (who read version 3 while it is now 5) matches zero rows and gets a 409 —
-invariant I8, no lost updates.
+invariant I7, no lost updates.
 
-### (e) The doorbell
+### (d) The doorbell
 
 `pg_notify` on the bucket's channel, empty payload. This is _only_ a latency
 optimization: it tells watchers "wake up and poll now" instead of waiting for
@@ -426,7 +401,7 @@ Say you physically delete the tombstone at seq 12. Now a **slow watcher** appear
 whose bookmark is `hwm=9`. It runs `WHERE seq > 9`, and seq 12 is gone. It never
 sees the delete — **ghost object forever again.** The exact bug tombstones were
 meant to fix, just moved later in time. This is the "silent gap" hazard,
-invariant I7.
+invariant I6.
 
 Critically, the compactor only hard-deletes rows that are **fully deleted** —
 `deletion_timestamp IS NOT NULL` _and_ no active finalizers. A dying object
@@ -516,7 +491,7 @@ Top to bottom:
 > **many statements** into one atomic unit. The connection that makes the
 > compactor work: **a single statement is always atomic by itself** (Postgres
 > wraps a lone statement in an implicit transaction), so the CTE gets
-> delete-and-advance-horizon atomicity for free — exactly the I7 guarantee. The
+> delete-and-advance-horizon atomicity for free — exactly the I6 guarantee. The
 > write path uses a stored procedure (`pgctl_write()`) that performs multiple
 > operations server-side, wrapped in a transaction for atomicity. Rule of thumb:
 > a CTE organizes (and atomically binds) one statement; a transaction atomically
@@ -559,7 +534,7 @@ There are two independent cleanup mechanisms:
 | Level                | Application logic                                     | Storage engine                          |
 | Removes              | Fully-deleted objects (tombstones with no finalizers) | Dead _tuple versions_ from every UPDATE |
 | Triggered by         | Your compactor job                                    | Postgres, automatically                 |
-| Invariant it upholds | I7 (no silent gap)                                    | none — pure space reclamation           |
+| Invariant it upholds | I6 (no silent gap)                                    | none — pure space reclamation           |
 
 Every `UPDATE` in Postgres writes a new row version and leaves the old one dead
 (MVCC, as in the `fillfactor` aside in Section 4); autovacuum reclaims that space
@@ -573,23 +548,22 @@ own housekeeping that you tune, not implement.
 
 Trace a single object in bucket 2 to see all the pieces interact.
 
-1. **Create.** Writer holds the bucket-2 spec lease. Fence passes. No existing
-   row, so no-op suppression does not fire. Counter for (bucket 2, GVK) goes
+1. **Create.** No existing row, so no-op suppression does not fire. Counter for (bucket 2, GVK) goes
    `0 → 1`. Row inserted with `gvk_bucket_seq=1`, `object_version=1`,
    `deletion_timestamp=NULL`. Doorbell fires. A watcher at `hwm=0` polls, sees
    seq 1, emits **Added**, advances to `hwm=1`.
 
-2. **Update.** Same writer. Fence passes. Content differs, so not suppressed.
+2. **Update.** Content differs, so not suppressed.
    Counter `1 → 2`. Row updated: `gvk_bucket_seq=2`, `object_version=2`. Watcher
    polls, sees seq 2, emits **Modified**, advances to `hwm=2`.
 
 3. **No-op re-apply.** A status re-applier writes byte-identical content.
-   Fence passes; the content check matches; the transaction commits with **no**
+   The content check matches; the transaction commits with **no**
    counter increment and **no** doorbell. Counter stays at 2. Watchers see
    nothing. `Changed=false`.
 
 4. **Delete (with finalizer).** The object has a finalizer
-   (`["cleanup.example.com"]`). Writer sets `deletion_timestamp=now()`. Counter
+   (`["cleanup.example.com"]`). The write sets `deletion_timestamp=now()`. Counter
    `2 → 3`. The row is now **dying** at `gvk_bucket_seq=3` — it has a deletion
    timestamp but still has active finalizers. The pgruntime watcher dispatches
    **OnUpdate** (not OnDelete), because the object is still visible and
@@ -611,7 +585,7 @@ Trace a single object in bucket 2 to see all the pieces interact.
    fresh RV) and resumes watching cleanly — never a ghost object, never a silent
    gap.
 
-That single lifecycle exercises the counter, the fence, no-op suppression,
+That single lifecycle exercises the counter, no-op suppression,
 finalizer-based dying/tombstone states, compaction, the horizon, and 410. If it
 makes sense, the rest of the system is variations on it.
 
@@ -622,12 +596,11 @@ makes sense, the rest of the system is variations on it.
 | Mechanism                      | Which piece of "a gap-free ordered version" it defends                                                                                              |
 | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Counter row + exclusive lock   | Gapless issuance & commit-order = seq-order (I1, I2)                                                                                                |
-| Lease fence `FOR SHARE`        | One writer only, no split-brain corruption (I4)                                                                                                     |
-| `object_version` check         | No lost updates on one object (I8)                                                                                                                  |
-| Composite RV + `cluster_epoch` | Version never goes backward, even across failover (I3, I6)                                                                                          |
-| Tombstones + finalizers        | Deletes are visible events; dying objects (with finalizers) stay visible for cleanup, fully-deleted tombstones (no finalizers) signal deletion (I5) |
-| Compaction horizon + 410       | A watcher that fell too far behind is told loudly, never silently skipped; compaction only removes finalizer-free tombstones (I7)                   |
-| Poll loop                      | The delivery guarantee — the doorbell is only latency (I5)                                                                                          |
+| `object_version` check         | No lost updates on one object (I7)                                                                                                                  |
+| Composite RV + `cluster_epoch` | Version never goes backward, even across failover (I3, I5)                                                                                          |
+| Tombstones + finalizers        | Deletes are visible events; dying objects (with finalizers) stay visible for cleanup, fully-deleted tombstones (no finalizers) signal deletion (I4) |
+| Compaction horizon + 410       | A watcher that fell too far behind is told loudly, never silently skipped; compaction only removes finalizer-free tombstones (I6)                   |
+| Poll loop                      | The delivery guarantee — the doorbell is only latency (I4)                                                                                          |
 
 Every mechanism is one repair to the gap between "what a Kubernetes client
 expects" and "what a plain SQL table gives you."
@@ -650,14 +623,14 @@ It exercises the machinery it is auditing.
 
 What it checks per (GVK, bucket):
 
-- **Monotonic high-water marks (I3/I6).** Every delivered event's seq must be
+- **Monotonic high-water marks (I3/I5).** Every delivered event's seq must be
   strictly greater than the previous high-water mark for its bucket. One rule
   catches two failure classes: a _regression_ (the sequence went backwards —
-  e.g., a failover lost a commit) and a _duplicate delivery_ (I5) both manifest
+  e.g., a failover lost a commit) and a _duplicate delivery_ (I4) both manifest
   as `seq <= previous hwm`. That single comparison is the whole check, which is
   why verifier state is tiny — **O(buckets)**, one number per bucket, no per-key
   maps that grow with fleet size.
-- **Compaction consistency (I7)** comes free from the poll path itself: if the
+- **Compaction consistency (I6)** comes free from the poll path itself: if the
   verifier's bookmark ever falls below a horizon, it must receive a loud `410
 Gone` — silence there would itself be the violation.
 
@@ -667,17 +640,17 @@ one object leave only the latest seq visible, so delivered seqs legitimately ski
 numbers. A naive "no gaps allowed" audit would false-alarm constantly. Gap
 auditing, if ever needed, must cross-check the table to prove a missing seq was
 superseded — out of scope for the stream-side verifier. (This is a nice example
-of the invariants doing real work: I5 _permits_ coalescing, so the verifier must
+of the invariants doing real work: I4 _permits_ coalescing, so the verifier must
 tolerate it.)
 
 The second probe is a **canary**: at a low rate, the verifier writes a synthetic
-object per sampled bucket through the real fenced write path and measures
+object per sampled bucket through the real write path and measures
 write-to-delivery latency — the wall-clock time from `Write` returning to the
 event appearing on the watcher channel. This times the full pipeline: commit
 visibility, `pg_notify` doorbell, poll scheduling, and channel delivery. Latency
 samples are kept in a bounded ring buffer (1,000 entries, p99) and also observed
 via the `pgctl_verifier_canary_delivery_seconds` Prometheus histogram. The
-doorbell is never required for correctness (Section 4e) and would fail
+doorbell is never required for correctness (Section 4d) and would fail
 _silently_ if nobody measured latency — events would still arrive, just up to
 5 s late. The canary is what turns "doorbell quietly broken" from an invisible
 degradation into a metric.
@@ -712,8 +685,7 @@ The trade is real and it is the whole "iff you accept the assumptions" clause:
 dropping the API server drops everything it does — admission/validation webhooks,
 RBAC, defaulting, CRDs, field/label selectors, server-side apply, and
 compatibility with the whole `kubectl`/operator ecosystem. kine keeps all of that
-because the apiserver stays. You also take on a single-writer-per-bucket lease
-model that a general apiserver does not impose, and you lose the apiserver's
+because the apiserver stays. You lose the apiserver's
 in-memory watch cache (which serves many watchers from one upstream watch), so
 very high watcher fan-out may need a caching layer here to match.
 

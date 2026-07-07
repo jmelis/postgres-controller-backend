@@ -31,7 +31,6 @@ type RDSConfig struct {
 
 type ClusterConfig struct {
 	Buckets              int           `yaml:"buckets"`
-	LeaseTTL             time.Duration `yaml:"lease_ttl"`
 	BaselinePollInterval time.Duration `yaml:"baseline_poll_interval"`
 	DebounceFloor        time.Duration `yaml:"debounce_floor"`
 }
@@ -92,9 +91,8 @@ type Phase2bConfig struct {
 }
 
 type Phase3Config struct {
-	Enabled       bool    `yaml:"enabled"`
-	KillFraction  float64 `yaml:"kill_fraction"`
-	ZombieWriters int     `yaml:"zombie_writers"`
+	Enabled      bool    `yaml:"enabled"`
+	KillFraction float64 `yaml:"kill_fraction"`
 }
 
 type Phase5Config struct {
@@ -145,9 +143,6 @@ func (c *Config) ComputeTotalObjects() int {
 func (c *Config) validate() error {
 	if c.Cluster.Buckets <= 0 {
 		return fmt.Errorf("cluster.buckets must be > 0")
-	}
-	if c.Cluster.LeaseTTL <= 0 {
-		c.Cluster.LeaseTTL = 60 * time.Second
 	}
 	if c.Cluster.BaselinePollInterval <= 0 {
 		c.Cluster.BaselinePollInterval = 5 * time.Second

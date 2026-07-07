@@ -39,8 +39,7 @@ func (w *Writer) Write(ctx context.Context, req model.WriteRequest) (model.Write
 	return w.writeStoredProc(ctx, req)
 }
 
-// WriteStatus updates only the status sub-resource, fencing against the
-// status row of bucket_leases instead of the spec row. The object must already
+// WriteStatus updates only the status sub-resource. The object must already
 // exist (ExpectedVersion > 0). Spec, metadata, and deletion_timestamp are not
 // touched. The shared gvk_bucket_seq counter and object_version are bumped so
 // watchers see status changes in the same ordered stream as spec changes.
@@ -55,19 +54,19 @@ func (w *Writer) WriteStatus(ctx context.Context, req model.StatusWriteRequest) 
 	return w.writeStatusStoredProc(ctx, req)
 }
 
-// WriteSpec updates only the spec sub-resource (spec, metadata, deletion_timestamp),
-// fencing against the spec row of bucket_leases. The object must already exist
-// (ExpectedVersion > 0). Status is not touched. The shared gvk_bucket_seq counter
-// and object_version are bumped so watchers see spec changes in the ordered stream.
-func (w *Writer) WriteSpec(ctx context.Context, req model.SpecWriteRequest) (model.WriteResult, error) {
+// WriteObject updates spec, metadata, and deletion_timestamp without touching
+// status. The object must already exist (ExpectedVersion > 0). The shared
+// gvk_bucket_seq counter and object_version are bumped so watchers see changes
+// in the ordered stream.
+func (w *Writer) WriteObject(ctx context.Context, req model.ObjectWriteRequest) (model.WriteResult, error) {
 	if req.ExpectedVersion == 0 {
-		return model.WriteResult{}, fmt.Errorf("WriteSpec requires ExpectedVersion > 0: object must exist")
+		return model.WriteResult{}, fmt.Errorf("WriteObject requires ExpectedVersion > 0: object must exist")
 	}
 
 	if w.hooks != nil {
-		return w.writeSpecMultiStatement(ctx, req)
+		return w.writeObjectMultiStatement(ctx, req)
 	}
-	return w.writeSpecStoredProc(ctx, req)
+	return w.writeObjectStoredProc(ctx, req)
 }
 
 // ReadBack resolves an ambiguous commit by checking if the write actually landed.
@@ -96,20 +95,20 @@ func (w *Writer) ReadBack(ctx context.Context, gvk, namespace, name string, seq 
 
 // --- Stored procedure path (production, hooks==nil) ---
 
-const pgctlWriteSQL = `SELECT * FROM pgctl_write($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`
+const pgctlWriteSQL = `SELECT * FROM pgctl_write($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`
 
 func (w *Writer) writeStoredProc(ctx context.Context, req model.WriteRequest) (model.WriteResult, error) {
 	start := time.Now()
 
 	result, err := w.callStoredProc(ctx, writeParams{
-		domain: "spec", gvk: req.GVK, namespace: req.Namespace, name: req.Name,
-		bucketID: req.BucketID, holder: req.LeaseHolder, epoch: req.LeaseEpoch,
+		statusOnly: false, gvk: req.GVK, namespace: req.Namespace, name: req.Name,
+		bucketID: req.BucketID,
 		expectedVersion: req.ExpectedVersion, forceWrite: req.ForceWrite,
 		spec: req.Spec, status: req.Status, metadata: req.Metadata,
 		deletionTimestamp: req.DeletionTimestamp,
 	})
 
-	w.observeResult(start, "spec", req.GVK, req.BucketID, result, err)
+	w.observeResult(start, req.GVK, req.BucketID, result, err)
 	return result, err
 }
 
@@ -117,29 +116,29 @@ func (w *Writer) writeStatusStoredProc(ctx context.Context, req model.StatusWrit
 	start := time.Now()
 
 	result, err := w.callStoredProc(ctx, writeParams{
-		domain: "status", gvk: req.GVK, namespace: req.Namespace, name: req.Name,
-		bucketID: req.BucketID, holder: req.LeaseHolder, epoch: req.LeaseEpoch,
+		statusOnly: true, gvk: req.GVK, namespace: req.Namespace, name: req.Name,
+		bucketID: req.BucketID,
 		expectedVersion: req.ExpectedVersion, forceWrite: req.ForceWrite,
 		spec: nil, status: req.Status, metadata: nil,
 		deletionTimestamp: nil,
 	})
 
-	w.observeResult(start, "status", req.GVK, req.BucketID, result, err)
+	w.observeResult(start, req.GVK, req.BucketID, result, err)
 	return result, err
 }
 
-func (w *Writer) writeSpecStoredProc(ctx context.Context, req model.SpecWriteRequest) (model.WriteResult, error) {
+func (w *Writer) writeObjectStoredProc(ctx context.Context, req model.ObjectWriteRequest) (model.WriteResult, error) {
 	start := time.Now()
 
 	result, err := w.callStoredProc(ctx, writeParams{
-		domain: "spec", gvk: req.GVK, namespace: req.Namespace, name: req.Name,
-		bucketID: req.BucketID, holder: req.LeaseHolder, epoch: req.LeaseEpoch,
+		statusOnly: false, gvk: req.GVK, namespace: req.Namespace, name: req.Name,
+		bucketID: req.BucketID,
 		expectedVersion: req.ExpectedVersion, forceWrite: req.ForceWrite,
 		spec: req.Spec, status: nil, metadata: req.Metadata,
 		deletionTimestamp: req.DeletionTimestamp,
 	})
 
-	w.observeResult(start, "spec", req.GVK, req.BucketID, result, err)
+	w.observeResult(start, req.GVK, req.BucketID, result, err)
 	return result, err
 }
 
@@ -154,20 +153,19 @@ func (w *Writer) callStoredProc(ctx context.Context, p writeParams) (model.Write
 	var uid uuid.UUID
 	var version, seq int64
 	var changed bool
-	var fenceUs, suppressUs, counterUs, upsertUs int64
+	var suppressUs, counterUs, upsertUs int64
 
 	err = tx.QueryRow(ctx, pgctlWriteSQL,
-		p.domain, p.gvk, p.namespace, p.name, p.bucketID,
-		p.holder, p.epoch, p.expectedVersion, p.forceWrite,
+		p.statusOnly, p.gvk, p.namespace, p.name, p.bucketID,
+		p.expectedVersion, p.forceWrite,
 		p.spec, p.status, p.metadata, p.deletionTimestamp,
-	).Scan(&uid, &version, &seq, &changed, &fenceUs, &suppressUs, &counterUs, &upsertUs)
+	).Scan(&uid, &version, &seq, &changed, &suppressUs, &counterUs, &upsertUs)
 	w.observeStep("stored_proc", time.Since(t0))
 
 	if err != nil {
 		return model.WriteResult{}, mapStoredProcError(err)
 	}
 
-	w.observeStep("fence_check", time.Duration(fenceUs)*time.Microsecond)
 	w.observeStep("suppression_check", time.Duration(suppressUs)*time.Microsecond)
 	w.observeStep("counter_increment", time.Duration(counterUs)*time.Microsecond)
 	w.observeStep("upsert", time.Duration(upsertUs)*time.Microsecond)
@@ -198,8 +196,6 @@ func mapStoredProcError(err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
-		case "P0001":
-			return ErrFenceViolation
 		case "P0002":
 			return ErrConflict
 		case "P0003":
@@ -228,16 +224,16 @@ func (w *Writer) fireDoorbell(ctx context.Context, bucketID int) {
 
 func (w *Writer) writeMultiStatement(ctx context.Context, req model.WriteRequest) (model.WriteResult, error) {
 	p := writeParams{
-		domain: "spec",
+		statusOnly: false,
 		gvk: req.GVK, namespace: req.Namespace, name: req.Name,
-		bucketID: req.BucketID, holder: req.LeaseHolder, epoch: req.LeaseEpoch,
+		bucketID: req.BucketID,
 		forceWrite: req.ForceWrite,
 	}
 
 	checker := func(existing *existingRow) bool {
-		return jsonEqual(existing.spec, req.Spec) &&
-			jsonEqual(existing.status, req.Status) &&
-			jsonEqual(existing.metadata, req.Metadata) &&
+		return JSONEqual(existing.spec, req.Spec) &&
+			JSONEqual(existing.status, req.Status) &&
+			JSONEqual(existing.metadata, req.Metadata) &&
 			timeEqual(existing.deletionTimestamp, req.DeletionTimestamp)
 	}
 
@@ -320,14 +316,14 @@ func (w *Writer) writeMultiStatement(ctx context.Context, req model.WriteRequest
 
 func (w *Writer) writeStatusMultiStatement(ctx context.Context, req model.StatusWriteRequest) (model.WriteResult, error) {
 	p := writeParams{
-		domain: "status",
+		statusOnly: true,
 		gvk: req.GVK, namespace: req.Namespace, name: req.Name,
-		bucketID: req.BucketID, holder: req.LeaseHolder, epoch: req.LeaseEpoch,
+		bucketID: req.BucketID,
 		forceWrite: req.ForceWrite,
 	}
 
 	checker := func(existing *existingRow) bool {
-		return jsonEqual(existing.status, req.Status)
+		return JSONEqual(existing.status, req.Status)
 	}
 
 	return w.execWrite(ctx, p, checker, func(ctx context.Context, tx pgx.Tx, seq int64) (uuid.UUID, int64, error) {
@@ -356,17 +352,17 @@ func (w *Writer) writeStatusMultiStatement(ctx context.Context, req model.Status
 	})
 }
 
-func (w *Writer) writeSpecMultiStatement(ctx context.Context, req model.SpecWriteRequest) (model.WriteResult, error) {
+func (w *Writer) writeObjectMultiStatement(ctx context.Context, req model.ObjectWriteRequest) (model.WriteResult, error) {
 	p := writeParams{
-		domain: "spec",
+		statusOnly: false,
 		gvk: req.GVK, namespace: req.Namespace, name: req.Name,
-		bucketID: req.BucketID, holder: req.LeaseHolder, epoch: req.LeaseEpoch,
+		bucketID: req.BucketID,
 		forceWrite: req.ForceWrite,
 	}
 
 	checker := func(existing *existingRow) bool {
-		return jsonEqual(existing.spec, req.Spec) &&
-			jsonEqual(existing.metadata, req.Metadata) &&
+		return JSONEqual(existing.spec, req.Spec) &&
+			JSONEqual(existing.metadata, req.Metadata) &&
 			timeEqual(existing.deletionTimestamp, req.DeletionTimestamp)
 	}
 
@@ -414,13 +410,11 @@ type existingRow struct {
 }
 
 type writeParams struct {
-	domain            string
+	statusOnly        bool
 	gvk               string
 	namespace         string
 	name              string
 	bucketID          int
-	holder            string
-	epoch             int64
 	expectedVersion   int64
 	forceWrite        bool
 	spec              json.RawMessage
@@ -433,11 +427,11 @@ func (w *Writer) execWrite(ctx context.Context, p writeParams, isContentEqual co
 	start := time.Now()
 	result, err := w.execWriteInner(ctx, p, isContentEqual, upsert)
 
-	w.observeResult(start, p.domain, p.gvk, p.bucketID, result, err)
+	w.observeResult(start, p.gvk, p.bucketID, result, err)
 	return result, err
 }
 
-func (w *Writer) observeResult(start time.Time, _, gvk string, bucketID int, result model.WriteResult, err error) {
+func (w *Writer) observeResult(start time.Time, gvk string, bucketID int, result model.WriteResult, err error) {
 	if w.metrics == nil {
 		return
 	}
@@ -450,8 +444,6 @@ func (w *Writer) observeResult(start time.Time, _, gvk string, bucketID int, res
 		w.metrics.NoopSuppressionsTotal.Inc()
 	case err == nil:
 		resultLabel = "success"
-	case errors.Is(err, ErrFenceViolation):
-		resultLabel = "fence_violation"
 	case errors.Is(err, ErrConflict):
 		resultLabel = "conflict"
 	case errors.Is(err, ErrAlreadyExists):
@@ -482,26 +474,6 @@ func (w *Writer) execWriteInner(ctx context.Context, p writeParams, isContentEqu
 	}
 	w.observeStep("begin_tx", time.Since(t0))
 	defer tx.Rollback(ctx) //nolint:errcheck
-
-	t0 = time.Now()
-	var fenceOK int
-	err = tx.QueryRow(ctx, `
-		SELECT 1 FROM bucket_leases
-		WHERE bucket_id = $1 AND domain = $2 AND holder = $3
-		  AND epoch = $4 AND expires_at > now()
-		FOR SHARE`,
-		p.bucketID, p.domain, p.holder, p.epoch).Scan(&fenceOK)
-	w.observeStep("fence_check", time.Since(t0))
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return model.WriteResult{}, ErrFenceViolation
-		}
-		return model.WriteResult{}, fmt.Errorf("fence: %w", err)
-	}
-
-	if err := w.hooks.AfterFence(ctx, tx); err != nil {
-		return model.WriteResult{}, err
-	}
 
 	t0 = time.Now()
 	if !p.forceWrite {
@@ -599,7 +571,7 @@ func readExisting(ctx context.Context, tx pgx.Tx, gvk, namespace, name string) (
 	return row, nil
 }
 
-func jsonEqual(a, b json.RawMessage) bool {
+func JSONEqual(a, b json.RawMessage) bool {
 	if len(a) == 0 && len(b) == 0 {
 		return true
 	}

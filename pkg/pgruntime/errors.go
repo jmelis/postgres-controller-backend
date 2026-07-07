@@ -34,9 +34,6 @@ func mapWriteError(ctx context.Context, w *writer.Writer, err error, gvk schema.
 	if errors.Is(err, writer.ErrConflict) {
 		return nil, apierrors.NewConflict(groupResource(gvk), name, err)
 	}
-	if errors.Is(err, writer.ErrFenceViolation) {
-		return nil, apierrors.NewConflict(groupResource(gvk), name, err)
-	}
 
 	var ace *writer.AmbiguousCommitError
 	if errors.As(err, &ace) {

@@ -3,7 +3,6 @@ package loadtest_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/verifier"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
@@ -73,16 +71,8 @@ func TestPhase1_CounterCeiling(t *testing.T) {
 		numWorkers   = 50
 		bucketID     = 1
 		gvk          = "apps/v1/Deployment"
-		holder       = "phase1-holder"
 		testDuration = 10 * time.Second
 	)
-
-	// Acquire lease
-	leaseConn := freshConn(t)
-	defer leaseConn.Close(context.Background())
-	mgr := lease.NewSpecManager(leaseConn, holder)
-	epoch, err := mgr.Acquire(ctx, bucketID, 120*time.Second)
-	require.NoError(t, err)
 
 	// Start verifier
 	verifyConn := manualConn(t)
@@ -97,11 +87,10 @@ func TestPhase1_CounterCeiling(t *testing.T) {
 
 	// Per-worker latency collection
 	type workerResult struct {
-		latencies    []time.Duration
-		writes       int64
-		serFailures  int64
-		fenceFailures int64
-		otherErrors  int64
+		latencies   []time.Duration
+		writes      int64
+		serFailures int64
+		otherErrors int64
 	}
 
 	results := make([]workerResult, numWorkers)
@@ -133,7 +122,6 @@ func TestPhase1_CounterCeiling(t *testing.T) {
 					GVK: gvk, Namespace: "loadtest", Name: name,
 					BucketID: bucketID, Spec: json.RawMessage(`{"w":` + fmt.Sprintf("%d", workerID) + `}`),
 					Status: json.RawMessage(`{}`), Metadata: json.RawMessage(`{}`),
-					LeaseHolder: holder, LeaseEpoch: epoch,
 				}
 
 				t0 := time.Now()
@@ -143,8 +131,6 @@ func TestPhase1_CounterCeiling(t *testing.T) {
 				if writeErr != nil {
 					if isSerializationFailure(writeErr) {
 						results[workerID].serFailures++
-					} else if isFenceViolation(writeErr) {
-						results[workerID].fenceFailures++
 					} else {
 						results[workerID].otherErrors++
 					}
@@ -170,11 +156,10 @@ func TestPhase1_CounterCeiling(t *testing.T) {
 
 	// Aggregate results
 	var allLatencies []time.Duration
-	var totalSerFail, totalFenceFail, totalOtherErr int64
+	var totalSerFail, totalOtherErr int64
 	for _, r := range results {
 		allLatencies = append(allLatencies, r.latencies...)
 		totalSerFail += r.serFailures
-		totalFenceFail += r.fenceFailures
 		totalOtherErr += r.otherErrors
 	}
 
@@ -203,7 +188,6 @@ func TestPhase1_CounterCeiling(t *testing.T) {
 	t.Logf("p99 latency:       %v", p99)
 	t.Logf("p99.9 latency:     %v", p999)
 	t.Logf("Serialization failures: %d", totalSerFail)
-	t.Logf("Fencing false-pos: %d", totalFenceFail)
 	t.Logf("Other errors:      %d", totalOtherErr)
 	t.Logf("Verifier events:   %d", verResult.EventsChecked)
 	t.Logf("Verifier violations: %d", len(verResult.Violations))
@@ -217,8 +201,6 @@ func TestPhase1_CounterCeiling(t *testing.T) {
 		"throughput must be ≥200 writes/s (got %.1f)", rps)
 	assert.Equal(t, int64(0), totalSerFail,
 		"zero serialization failures required")
-	assert.Equal(t, int64(0), totalFenceFail,
-		"zero fencing false-positives required")
 	assert.Empty(t, verResult.Violations,
 		"verifier must report zero violations")
 
@@ -253,6 +235,3 @@ func isSerializationFailure(err error) bool {
 	return strings.Contains(msg, "serialization") || strings.Contains(msg, "40001")
 }
 
-func isFenceViolation(err error) bool {
-	return errors.Is(err, writer.ErrFenceViolation)
-}

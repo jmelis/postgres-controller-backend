@@ -21,8 +21,6 @@ func TestR5_Toxi_AmbiguousCommit_ResetPeer(t *testing.T) {
 	truncateAll(t)
 	ctx := context.Background()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	// Writer uses PROXIED connection (will be killed)
 	proxiedWriterConn, err := pdb.ProxiedConn(ctx)
 	require.NoError(t, err)
@@ -30,7 +28,7 @@ func TestR5_Toxi_AmbiguousCommit_ResetPeer(t *testing.T) {
 	hook := &toxiCommitCutHook{t: t}
 	w := writer.New(proxiedWriterConn, hook)
 
-	req := makeWriteReq("apps/v1/Deployment", "default", "toxi-ambig", 1, "holder-a", epoch)
+	req := makeWriteReq("apps/v1/Deployment", "default", "toxi-ambig", 1)
 	result, writeErr := w.Write(ctx, req)
 
 	if writeErr != nil {
@@ -89,7 +87,6 @@ type toxiCommitCutHook struct {
 	t *testing.T
 }
 
-func (h *toxiCommitCutHook) AfterFence(_ context.Context, _ pgx.Tx) error                    { return nil }
 func (h *toxiCommitCutHook) AfterSuppressionCheck(_ context.Context, _ pgx.Tx, _ bool) error { return nil }
 func (h *toxiCommitCutHook) AfterCounter(_ context.Context, _ pgx.Tx, _ int64) error         { return nil }
 

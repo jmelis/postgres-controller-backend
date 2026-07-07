@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/verifier"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
@@ -53,7 +51,7 @@ func RunPhase1(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 			if run == 0 {
 				log.Printf("phase1: sweep — clearing and reseeding for %d buckets", buckets)
 			}
-			if _, err := conn.Exec(ctx, "TRUNCATE kubernetes_resources, gvk_bucket_counters, bucket_leases, compaction_horizon"); err != nil {
+			if _, err := conn.Exec(ctx, "TRUNCATE kubernetes_resources, gvk_bucket_counters, compaction_horizon"); err != nil {
 				conn.Close(context.Background())
 				return nil, fmt.Errorf("phase1 sweep: truncate: %w", err)
 			}
@@ -128,8 +126,6 @@ func runPhase1Single(ctx context.Context, dsn string, cfg *Config, numBuckets in
 	workersPerBucket := pCfg.WorkersPerBucket
 	totalWorkers := workersPerBucket * numBuckets
 	duration := pCfg.Duration
-	holder := "phase1-holder"
-	ttl := cfg.Cluster.LeaseTTL
 
 	// Use the first configured GVK, or default.
 	gvk := "apps/v1/Deployment"
@@ -141,23 +137,6 @@ func runPhase1Single(ctx context.Context, dsn string, cfg *Config, numBuckets in
 
 	log.Printf("phase1: starting ceiling test — %d workers x %d buckets, duration %v (warm-up %v)",
 		workersPerBucket, numBuckets, duration, warmUp)
-
-	// Acquire leases for all buckets.
-	leaseConn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("phase1: lease conn: %w", err)
-	}
-	defer leaseConn.Close(context.Background())
-
-	bucketEpochs := make(map[int]int64)
-	leaseMgr := lease.NewSpecManager(leaseConn, holder).WithMetrics(libLeaseMetrics)
-	for b := 1; b <= numBuckets; b++ {
-		epoch, err := leaseMgr.Acquire(ctx, b, ttl)
-		if err != nil {
-			return nil, fmt.Errorf("phase1: acquire lease bucket %d: %w", b, err)
-		}
-		bucketEpochs[b] = epoch
-	}
 
 	// Start verifier if enabled.
 	var ver *verifier.Verifier
@@ -186,11 +165,10 @@ func runPhase1Single(ctx context.Context, dsn string, cfg *Config, numBuckets in
 
 	// Per-worker latency collection.
 	type workerResult struct {
-		latencies     []time.Duration
-		writes        int64
-		serFailures   int64
-		fenceFailures int64
-		otherErrors   int64
+		latencies   []time.Duration
+		writes      int64
+		serFailures int64
+		otherErrors int64
 	}
 
 	results := make([]workerResult, totalWorkers)
@@ -225,15 +203,13 @@ func runPhase1Single(ctx context.Context, dsn string, cfg *Config, numBuckets in
 
 				name := fmt.Sprintf("p1-w%d-r%d", workerID, writeNum)
 				req := model.WriteRequest{
-					GVK:         gvk,
-					Namespace:   "phase1",
-					Name:        name,
-					BucketID:    bucketID,
-					Spec:        json.RawMessage(fmt.Sprintf(`{"w":%d,"n":%d}`, workerID, writeNum)),
-					Status:      json.RawMessage(`{}`),
-					Metadata:    json.RawMessage(`{}`),
-					LeaseHolder: holder,
-					LeaseEpoch:  bucketEpochs[bucketID],
+					GVK:       gvk,
+					Namespace: "phase1",
+					Name:      name,
+					BucketID:  bucketID,
+					Spec:      json.RawMessage(fmt.Sprintf(`{"w":%d,"n":%d}`, workerID, writeNum)),
+					Status:    json.RawMessage(`{}`),
+					Metadata:  json.RawMessage(`{}`),
 				}
 
 				t0 := time.Now()
@@ -243,8 +219,6 @@ func runPhase1Single(ctx context.Context, dsn string, cfg *Config, numBuckets in
 				if writeErr != nil {
 					if isSerializationFailure(writeErr) {
 						results[workerID].serFailures++
-					} else if isFenceViolation(writeErr) {
-						results[workerID].fenceFailures++
 					} else {
 						results[workerID].otherErrors++
 					}
@@ -285,11 +259,10 @@ func runPhase1Single(ctx context.Context, dsn string, cfg *Config, numBuckets in
 
 	// Aggregate results.
 	var allLatencies []time.Duration
-	var totalSerFail, totalFenceFail, totalOtherErr int64
+	var totalSerFail, totalOtherErr int64
 	for _, r := range results {
 		allLatencies = append(allLatencies, r.latencies...)
 		totalSerFail += r.serFailures
-		totalFenceFail += r.fenceFailures
 		totalOtherErr += r.otherErrors
 	}
 
@@ -311,17 +284,14 @@ func runPhase1Single(ctx context.Context, dsn string, cfg *Config, numBuckets in
 	if totalSerFail > 0 {
 		errorsTotal.WithLabelValues(phase1Name, "serialization").Add(float64(totalSerFail))
 	}
-	if totalFenceFail > 0 {
-		errorsTotal.WithLabelValues(phase1Name, "fence_violation").Add(float64(totalFenceFail))
-	}
 	if totalOtherErr > 0 {
 		errorsTotal.WithLabelValues(phase1Name, "other").Add(float64(totalOtherErr))
 	}
 
 	log.Printf("phase1: completed — %d writes in %v (%.1f w/s), p50=%v p99=%v p999=%v",
 		total, elapsed.Round(time.Millisecond), rps, p50, p99, p999)
-	log.Printf("phase1: serialization_failures=%d fence_violations=%d other_errors=%d verifier_violations=%d",
-		totalSerFail, totalFenceFail, totalOtherErr, len(violations))
+	log.Printf("phase1: serialization_failures=%d other_errors=%d verifier_violations=%d",
+		totalSerFail, totalOtherErr, len(violations))
 
 	// Evaluate pass/fail.
 	passed := true
@@ -334,14 +304,9 @@ func runPhase1Single(ctx context.Context, dsn string, cfg *Config, numBuckets in
 	if totalSerFail > 0 {
 		passed = false
 	}
-	if totalFenceFail > 0 {
-		passed = false
-	}
 	if len(violations) > 0 {
 		passed = false
 	}
-
-	releaseAllLeases(ctx, leaseConn, numBuckets, holder)
 
 	return &PhaseResult{
 		Name:        phase1Name,
@@ -353,9 +318,8 @@ func runPhase1Single(ctx context.Context, dsn string, cfg *Config, numBuckets in
 		P99:         p99,
 		P999:        p999,
 		Errors: map[string]int64{
-			"serialization":  totalSerFail,
-			"fence_violation": totalFenceFail,
-			"other":          totalOtherErr,
+			"serialization": totalSerFail,
+			"other":         totalOtherErr,
 		},
 		VerifierViolations: violations,
 	}, nil
@@ -383,10 +347,6 @@ func isSerializationFailure(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "serialization") || strings.Contains(msg, "40001")
-}
-
-func isFenceViolation(err error) bool {
-	return errors.Is(err, writer.ErrFenceViolation)
 }
 
 func makeBucketIDs(n int) []int {

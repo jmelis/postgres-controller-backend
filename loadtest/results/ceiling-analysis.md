@@ -4,7 +4,7 @@
 **Region:** us-east-1
 **Engine:** PostgreSQL 16.4
 **Storage:** gp3, 100 GB (baseline 3,000 IOPS / 125 MiBps)
-**Workers per bucket:** 1 (matches production: exactly 1 lease holder per bucket)
+**Workers per bucket:** 1
 
 > **Note:** Tests 1–3 below were run with the old multi-statement write path (5 SQL round-trips + pg_notify inside the transaction). The stored procedure optimization recommended at the bottom has since been implemented — see the [loadtest README](../README.md) for current results (9,622 w/s @ 64 buckets on db.m6g.2xlarge).
 
@@ -12,49 +12,49 @@
 
 ### Test 1: db.r6g.large (2 vCPU, 16 GB) — Multi-AZ
 
-| Buckets | RPS   | p50     | p99      |
-|---------|-------|---------|----------|
-| 1       | 363.4 | 2.6ms   | 4.2ms    |
-| 4       | 679.5 | 5.7ms   | 10.3ms   |
-| 8       | 682.8 | 11.4ms  | 18.4ms   |
-| 16      | 685.6 | 22.9ms  | 33.3ms   |
-| 32      | 654.3 | 46.1ms  | 99.9ms   |
-| 64      | 655.5 | 92.9ms  | 148.2ms  |
+| Buckets | RPS   | p50    | p99     |
+| ------- | ----- | ------ | ------- |
+| 1       | 363.4 | 2.6ms  | 4.2ms   |
+| 4       | 679.5 | 5.7ms  | 10.3ms  |
+| 8       | 682.8 | 11.4ms | 18.4ms  |
+| 16      | 685.6 | 22.9ms | 33.3ms  |
+| 32      | 654.3 | 46.1ms | 99.9ms  |
+| 64      | 655.5 | 92.9ms | 148.2ms |
 
 **Ceiling: ~685 w/s (reached at 4 buckets)**
 
 ### Test 2: db.m6g.2xlarge (8 vCPU, 32 GB) — Multi-AZ
 
-| Buckets | RPS   | p50     | p99      |
-|---------|-------|---------|----------|
-| 1       | 209.5 | 4.7ms   | 5.4ms    |
-| 4       | 705.9 | 5.7ms   | 6.9ms    |
-| 8       | 694.5 | 11.4ms  | 14.1ms   |
-| 16      | 685.0 | 23.0ms  | 27.4ms   |
-| 32      | 677.5 | 46.7ms  | 54.0ms   |
-| 64      | 683.7 | 92.6ms  | 103.6ms  |
+| Buckets | RPS   | p50    | p99     |
+| ------- | ----- | ------ | ------- |
+| 1       | 209.5 | 4.7ms  | 5.4ms   |
+| 4       | 705.9 | 5.7ms  | 6.9ms   |
+| 8       | 694.5 | 11.4ms | 14.1ms  |
+| 16      | 685.0 | 23.0ms | 27.4ms  |
+| 32      | 677.5 | 46.7ms | 54.0ms  |
+| 64      | 683.7 | 92.6ms | 103.6ms |
 
 **Ceiling: ~706 w/s (reached at 4 buckets)**
 
 ### Test 3: db.r6g.large (2 vCPU, 16 GB) — Single-AZ
 
-| Buckets | RPS   | p50     | p99      |
-|---------|-------|---------|----------|
-| 1       | 243.8 | 4.0ms   | 5.0ms    |
-| 4       | 914.0 | 4.2ms   | 6.7ms    |
-| 8       | 971.4 | 8.0ms   | 13.1ms   |
-| 16      | 961.8 | 16.2ms  | 24.9ms   |
-| 32      | 868.6 | 32.6ms  | 154.4ms  |
-| 64      | 934.1 | 65.8ms  | 95.2ms   |
+| Buckets | RPS   | p50    | p99     |
+| ------- | ----- | ------ | ------- |
+| 1       | 243.8 | 4.0ms  | 5.0ms   |
+| 4       | 914.0 | 4.2ms  | 6.7ms   |
+| 8       | 971.4 | 8.0ms  | 13.1ms  |
+| 16      | 961.8 | 16.2ms | 24.9ms  |
+| 32      | 868.6 | 32.6ms | 154.4ms |
+| 64      | 934.1 | 65.8ms | 95.2ms  |
 
 **Ceiling: ~970 w/s (reached at 8 buckets)**
 
 ### Local reference (MacBook, no network)
 
-| Buckets | Workers | RPS    |
-|---------|---------|--------|
-| 1       | 10      | 1,384  |
-| 16      | 48      | 2,754  |
+| Buckets | Workers | RPS   |
+| ------- | ------- | ----- |
+| 1       | 10      | 1,384 |
+| 16      | 48      | 2,754 |
 
 ## Analysis
 
@@ -95,11 +95,11 @@ latency, which is inherently parallelizable across buckets.
 
 Pre-stored-procedure (old baseline for reference):
 
-| Metric | Old (multi-statement) | Current (stored proc, 64 buckets) |
-|--------|----------------------|-----------------------------------|
-| Write ceiling (Multi-AZ) | ~685 w/s | **9,622 w/s** |
-| Burst rate per cluster | 0.0748 w/s | 0.0748 w/s |
-| Max clusters at burst | ~9,200 | **~128,000** |
+| Metric                   | Old (multi-statement) | Current (stored proc, 64 buckets) |
+| ------------------------ | --------------------- | --------------------------------- |
+| Write ceiling (Multi-AZ) | ~685 w/s              | **9,622 w/s**                     |
+| Burst rate per cluster   | 0.0748 w/s            | 0.0748 w/s                        |
+| Max clusters at burst    | ~9,200                | **~128,000**                      |
 
 ### Instance class matters less than expected
 
@@ -111,13 +111,13 @@ below. The 2xlarge is the right cost/performance choice.
 
 ### What WOULD increase the write ceiling
 
-| Option | Expected improvement | Trade-off | Status |
-|--------|---------------------|-----------|--------|
-| **Reduce round-trips** | ~14x (685 -> 9,622 w/s @ 64 buckets) | — | **Done.** `pgctl_write()` stored procedure + external `pg_notify`. |
-| **Disable Multi-AZ** | +42% (on old path) | No HA — failover requires manual intervention or restore from backup | Not recommended |
-| **Batch writes** | 2-5x | Requires application-level changes to group multiple writes per COMMIT | Not needed at current ceiling |
-| **Async commit** | ~2x | Risk of losing last ~100ms of committed data on crash | Next lever if needed |
-| **Horizontal sharding** | Linear | Multiple RDS instances, each owning a subset of buckets — adds operational complexity | Not needed |
+| Option                  | Expected improvement                 | Trade-off                                                                             | Status                                                             |
+| ----------------------- | ------------------------------------ | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| **Reduce round-trips**  | ~14x (685 -> 9,622 w/s @ 64 buckets) | —                                                                                     | **Done.** `pgctl_write()` stored procedure + external `pg_notify`. |
+| **Disable Multi-AZ**    | +42% (on old path)                   | No HA — failover requires manual intervention or restore from backup                  | Not recommended                                                    |
+| **Batch writes**        | 2-5x                                 | Requires application-level changes to group multiple writes per COMMIT                | Not needed at current ceiling                                      |
+| **Async commit**        | ~2x                                  | Risk of losing last ~100ms of committed data on crash                                 | Next lever if needed                                               |
+| **Horizontal sharding** | Linear                               | Multiple RDS instances, each owning a subset of buckets — adds operational complexity | Not needed                                                         |
 
 ### Recommendation (updated)
 

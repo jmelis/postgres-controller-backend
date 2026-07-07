@@ -34,7 +34,6 @@ func TestMigrateCreatesAllTables(t *testing.T) {
 
 	sort.Strings(tables)
 	expected := []string{
-		"bucket_leases",
 		"cluster_epoch",
 		"compaction_horizon",
 		"gvk_bucket_counters",

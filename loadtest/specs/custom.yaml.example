@@ -12,7 +12,6 @@ rds:
 
 cluster:
   buckets: 16                           # Number of buckets to use
-  lease_ttl: 120s                       # Lease TTL for writers
   baseline_poll_interval: 5s            # Watcher poll interval when no doorbell
   debounce_floor: 100ms                 # Minimum time between doorbell-triggered polls
 
@@ -51,7 +50,6 @@ phases:
   phase3_avalanche:
     enabled: false
     kill_fraction: 0.5                  # Kill this fraction of writers mid-test
-    zombie_writers: 1                   # Start N stale-epoch writers (must be fenced)
 
   phase5_poll:
     enabled: true

@@ -22,14 +22,12 @@ func TestR7_CompactionVsSlowWatcher(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	// Write some resources, some as tombstones with old timestamps
 	wr := newWriter(t, nil)
 	for i := 0; i < 3; i++ {
 		past := time.Now().Add(-48 * time.Hour)
 		req := makeWriteReq("apps/v1/Deployment", "default",
-			fmt.Sprintf("compact-victim-%d", i), 1, "holder-a", epoch)
+			fmt.Sprintf("compact-victim-%d", i), 1)
 		req.DeletionTimestamp = &past
 		_, err := wr.Write(ctx, req)
 		require.NoError(t, err)
@@ -43,7 +41,7 @@ func TestR7_CompactionVsSlowWatcher(t *testing.T) {
 
 	// Write a live resource at seq=4
 	_, err = wr.Write(ctx, makeWriteReq("apps/v1/Deployment", "default",
-		"survivor", 1, "holder-a", epoch))
+		"survivor", 1))
 	require.NoError(t, err)
 
 	// Compact — removes the 3 tombstones, advances horizon to seq=3
@@ -84,11 +82,9 @@ func TestR7_CompactionBoundary_Exact(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	epoch := setupLease(t, 1, "holder-a", 60_000_000_000)
-
 	wr := newWriter(t, nil)
 	past := time.Now().Add(-48 * time.Hour)
-	req := makeWriteReq("apps/v1/Deployment", "default", "compact-exact", 1, "holder-a", epoch)
+	req := makeWriteReq("apps/v1/Deployment", "default", "compact-exact", 1)
 	req.DeletionTimestamp = &past
 	_, err := wr.Write(ctx, req)
 	require.NoError(t, err)
@@ -101,7 +97,7 @@ func TestR7_CompactionBoundary_Exact(t *testing.T) {
 
 	// Write live at seq=2
 	_, err = wr.Write(ctx, makeWriteReq("apps/v1/Deployment", "default",
-		"exact-survivor", 1, "holder-a", epoch))
+		"exact-survivor", 1))
 	require.NoError(t, err)
 
 	// Compact: horizon at 1

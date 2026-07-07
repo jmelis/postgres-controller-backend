@@ -48,8 +48,6 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	numWatchers := pCfg.NumWatchers
 	writeRate := pCfg.WriteRate
 	writeCount := pCfg.WriteCount
-	holder := "phase5-holder"
-	ttl := cfg.Cluster.LeaseTTL
 	baselineInterval := cfg.Cluster.BaselinePollInterval
 
 	gvk := "apps/v1/Deployment"
@@ -70,22 +68,9 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	log.Printf("phase5: starting poll test — %d watchers, %d writes at %d/s",
 		numWatchers, writeCount, writeRate)
 
-	// Acquire leases.
-	leaseConn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("phase5: lease conn: %w", err)
-	}
-	defer leaseConn.Close(context.Background())
-
-	bucketEpochs, err := acquireAllLeases(ctx, leaseConn, numBuckets, holder, ttl)
-	if err != nil {
-		return nil, fmt.Errorf("phase5: %w", err)
-	}
-
 	bucketIDs := makeBucketIDs(numBuckets)
 
-	// Get starting HWM: write one dummy resource per bucket to establish a baseline,
-	// then use a probe watcher to discover the current sequence position.
+	// Get starting HWM: use a probe watcher to discover the current sequence position.
 	probeConn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("phase5: probe conn: %w", err)
@@ -260,15 +245,13 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 		bucketID := (i % numBuckets) + 1
 		name := fmt.Sprintf("phase5-db-%d", i)
 		req := model.WriteRequest{
-			GVK:         gvk,
-			Namespace:   "phase5-db",
-			Name:        name,
-			BucketID:    bucketID,
-			Spec:        json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
-			Status:      json.RawMessage(`{}`),
-			Metadata:    json.RawMessage(`{}`),
-			LeaseHolder: holder,
-			LeaseEpoch:  bucketEpochs[bucketID],
+			GVK:       gvk,
+			Namespace: "phase5-db",
+			Name:      name,
+			BucketID:  bucketID,
+			Spec:      json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
+			Status:    json.RawMessage(`{}`),
+			Metadata:  json.RawMessage(`{}`),
 		}
 		writeTimesMu.Lock()
 		writeTimes[name] = time.Now()
@@ -402,15 +385,13 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 			bucketID := (i % numBuckets) + 1
 			name := fmt.Sprintf("phase5-loss-%d", i)
 			req := model.WriteRequest{
-				GVK:         gvk,
-				Namespace:   "phase5-loss",
-				Name:        name,
-				BucketID:    bucketID,
-				Spec:        json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
-				Status:      json.RawMessage(`{}`),
-				Metadata:    json.RawMessage(`{}`),
-				LeaseHolder: holder,
-				LeaseEpoch:  bucketEpochs[bucketID],
+				GVK:       gvk,
+				Namespace: "phase5-loss",
+				Name:      name,
+				BucketID:  bucketID,
+				Spec:      json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
+				Status:    json.RawMessage(`{}`),
+				Metadata:  json.RawMessage(`{}`),
 			}
 			lossWriteTimesMu.Lock()
 			lossWriteTimes[name] = time.Now()
@@ -466,8 +447,6 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 		totalWriteCount += int64(writeCount)
 	}
 
-	releaseAllLeases(ctx, leaseConn, numBuckets, holder)
-
 	return &PhaseResult{
 		Name:        phase5Name,
 		Passed:      passed,
@@ -478,9 +457,9 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 		P99:         dbP99,
 		P999:        idleP99, // report idle p99 as p999 slot for reference
 		Errors: map[string]int64{
-			"write_errors":  allErrors,
-			"loss_p99_ms":   lossP99.Milliseconds(),
-			"idle_p99_ms":   idleP99.Milliseconds(),
+			"write_errors": allErrors,
+			"loss_p99_ms":  lossP99.Milliseconds(),
+			"idle_p99_ms":  idleP99.Milliseconds(),
 		},
 	}, nil
 }

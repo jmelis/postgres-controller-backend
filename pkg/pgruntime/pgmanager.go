@@ -6,12 +6,9 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	pgschema "github.com/jmelis/postgres-controller-backend/internal/schema"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -30,20 +27,17 @@ import (
 
 // Options configures a postgres-backed controller-runtime Manager.
 type Options struct {
-	Scheme             *runtime.Scheme
-	DSN                string
-	HolderID           string
-	BucketIDs          []int
-	BucketAssigner     func(ns, name string) int
-	LeaseTTL           time.Duration
-	LeaseRenewInterval time.Duration
-	Logger             logr.Logger
-	MaxPoolConns       int32
-	MinPoolConns       int32
+	Scheme         *runtime.Scheme
+	DSN            string
+	BucketIDs      []int
+	BucketAssigner func(ns, name string) int
+	Logger         logr.Logger
+	MaxPoolConns   int32
+	MinPoolConns   int32
 }
 
 // NewManager creates a controller-runtime Manager backed by PostgreSQL.
-// It connects to the database, runs schema migrations, and acquires leases.
+// It connects to the database and runs schema migrations.
 func NewManager(opts Options) (manager.Manager, error) {
 	if opts.Scheme == nil {
 		return nil, fmt.Errorf("pgruntime: Scheme is required")
@@ -51,20 +45,11 @@ func NewManager(opts Options) (manager.Manager, error) {
 	if opts.DSN == "" {
 		return nil, fmt.Errorf("pgruntime: DSN is required")
 	}
-	if opts.HolderID == "" {
-		opts.HolderID = "pgruntime"
-	}
 	if len(opts.BucketIDs) == 0 {
 		opts.BucketIDs = []int{0}
 	}
 	if opts.BucketAssigner == nil {
 		opts.BucketAssigner = func(_, _ string) int { return opts.BucketIDs[0] }
-	}
-	if opts.LeaseTTL == 0 {
-		opts.LeaseTTL = 60 * time.Second
-	}
-	if opts.LeaseRenewInterval == 0 {
-		opts.LeaseRenewInterval = 10 * time.Second
 	}
 	if opts.Logger.GetSink() == nil {
 		opts.Logger = logr.Discard()
@@ -89,43 +74,23 @@ func NewManager(opts Options) (manager.Manager, error) {
 	}
 	migrationConn.Release()
 
-	leasePoolConn, err := pool.Acquire(ctx)
-	if err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("pgruntime: acquire conn for leases: %w", err)
-	}
-	leaseConn := leasePoolConn.Hijack()
-
-	leaseMgr := lease.NewBothManager(leaseConn, opts.HolderID)
-	leases := make(map[int]leaseState, len(opts.BucketIDs))
-	for _, bid := range opts.BucketIDs {
-		epochs, err := leaseMgr.AcquireBoth(ctx, bid, opts.LeaseTTL)
-		if err != nil {
-			leaseConn.Close(ctx)
-			pool.Close()
-			return nil, fmt.Errorf("pgruntime: acquire lease for bucket %d: %w", bid, err)
-		}
-		leases[bid] = leaseState{specEpoch: epochs.Spec, statusEpoch: epochs.Status}
-	}
-
 	restMapper := buildRESTMapper(opts.Scheme)
 
 	pgclient := &pgClient{
 		scheme:     opts.Scheme,
 		pool:       pool,
 		assign:     opts.BucketAssigner,
-		holderID:   opts.HolderID,
-		leases:     leases,
+		bucketIDs:  opts.BucketIDs,
 		restMapper: restMapper,
 	}
 
 	pgcache := &pgCache{
-		scheme:    opts.Scheme,
-		pool:      pool,
-		bucketIDs: opts.BucketIDs,
+		scheme:     opts.Scheme,
+		pool:       pool,
+		bucketIDs:  opts.BucketIDs,
 		restMapper: restMapper,
-		logger:    opts.Logger.WithName("cache"),
-		informers: make(map[schema.GroupVersionKind]*pgInformer),
+		logger:     opts.Logger.WithName("cache"),
+		informers:  make(map[schema.GroupVersionKind]*pgInformer),
 	}
 
 	elected := make(chan struct{})
@@ -139,10 +104,8 @@ func NewManager(opts Options) (manager.Manager, error) {
 		logger:     opts.Logger,
 		opts:       opts,
 
-		pool:      pool,
-		leaseConn: leaseConn,
-		leaseMgr:    leaseMgr,
-		elected:     elected,
+		pool:    pool,
+		elected: elected,
 	}, nil
 }
 
@@ -154,10 +117,8 @@ type pgManager struct {
 	logger     logr.Logger
 	opts       Options
 
-	pool      *pgxpool.Pool
-	leaseConn *pgx.Conn
-	leaseMgr  *lease.BothManager
-	elected     chan struct{}
+	pool    *pgxpool.Pool
+	elected chan struct{}
 
 	mu        sync.Mutex
 	runnables []manager.Runnable
@@ -208,8 +169,6 @@ func (m *pgManager) AddReadyzCheck(name string, check healthz.Checker) error {
 func (m *pgManager) Start(ctx context.Context) error {
 	m.logger.Info("starting pgruntime manager")
 
-	go m.renewLeases(ctx)
-
 	var wg sync.WaitGroup
 
 	wg.Add(1)
@@ -242,7 +201,6 @@ func (m *pgManager) Start(ctx context.Context) error {
 
 	<-ctx.Done()
 	m.logger.Info("shutting down pgruntime manager")
-	m.leaseConn.Close(context.Background())
 	wg.Wait()
 	m.pool.Close()
 	return nil
@@ -261,23 +219,6 @@ func (m *pgManager) GetControllerOptions() config.Controller {
 // GetConverterRegistry is a stub; CRD conversion webhooks are not supported.
 func (m *pgManager) GetConverterRegistry() conversion.Registry {
 	return conversion.NewRegistry()
-}
-
-func (m *pgManager) renewLeases(ctx context.Context) {
-	ticker := time.NewTicker(m.opts.LeaseRenewInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			for _, bid := range m.opts.BucketIDs {
-				if err := m.leaseMgr.RenewBoth(ctx, bid, m.opts.LeaseTTL); err != nil {
-					m.logger.Error(err, "lease renewal failed", "bucket", bid)
-				}
-			}
-		}
-	}
 }
 
 func buildRESTMapper(s *runtime.Scheme) meta.RESTMapper {

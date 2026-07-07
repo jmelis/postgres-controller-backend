@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
 )
@@ -106,11 +105,9 @@ func measureSyncCommitCost(ctx context.Context, dsn string, iterations int, cfg 
 	if len(cfg.Seed.GVKs) > 0 {
 		gvk = cfg.Seed.GVKs[0].GVK
 	}
-	holder := "phase0-sync-test"
-	ttl := cfg.Cluster.LeaseTTL
 
 	// Run with sync commit ON (default).
-	syncRPS, syncP50, err := runSingleThreadedWrites(ctx, dsn, iterations, gvk, holder, ttl, "phase0-sync", "")
+	syncRPS, syncP50, err := runSingleThreadedWrites(ctx, dsn, iterations, gvk, "phase0-sync", "")
 	if err != nil {
 		return fmt.Errorf("sync commit on: %w", err)
 	}
@@ -118,7 +115,7 @@ func measureSyncCommitCost(ctx context.Context, dsn string, iterations int, cfg 
 	result.SyncCommitP50 = syncP50
 
 	// Run with sync commit OFF.
-	asyncRPS, asyncP50, err := runSingleThreadedWrites(ctx, dsn, iterations, gvk, holder, ttl, "phase0-async", "off")
+	asyncRPS, asyncP50, err := runSingleThreadedWrites(ctx, dsn, iterations, gvk, "phase0-async", "off")
 	if err != nil {
 		return fmt.Errorf("sync commit off: %w", err)
 	}
@@ -128,10 +125,10 @@ func measureSyncCommitCost(ctx context.Context, dsn string, iterations int, cfg 
 	return nil
 }
 
-// runSingleThreadedWrites creates a fresh connection, acquires a lease on bucket 1,
-// writes iterations objects, and returns RPS and p50 latency. If syncCommitMode is
-// non-empty, it issues SET synchronous_commit = <mode> before writing.
-func runSingleThreadedWrites(ctx context.Context, dsn string, iterations int, gvk, holder string, ttl time.Duration, namespace, syncCommitMode string) (rps float64, p50 time.Duration, err error) {
+// runSingleThreadedWrites creates a fresh connection, writes iterations objects,
+// and returns RPS and p50 latency. If syncCommitMode is non-empty, it issues
+// SET synchronous_commit = <mode> before writing.
+func runSingleThreadedWrites(ctx context.Context, dsn string, iterations int, gvk, namespace, syncCommitMode string) (rps float64, p50 time.Duration, err error) {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return 0, 0, fmt.Errorf("connect: %w", err)
@@ -139,7 +136,7 @@ func runSingleThreadedWrites(ctx context.Context, dsn string, iterations int, gv
 	defer conn.Close(context.Background())
 
 	// Clean slate.
-	if _, err := conn.Exec(ctx, "TRUNCATE kubernetes_resources, gvk_bucket_counters, bucket_leases"); err != nil {
+	if _, err := conn.Exec(ctx, "TRUNCATE kubernetes_resources, gvk_bucket_counters"); err != nil {
 		return 0, 0, fmt.Errorf("truncate: %w", err)
 	}
 
@@ -148,13 +145,6 @@ func runSingleThreadedWrites(ctx context.Context, dsn string, iterations int, gv
 		if _, err := conn.Exec(ctx, fmt.Sprintf("SET synchronous_commit = %s", syncCommitMode)); err != nil {
 			return 0, 0, fmt.Errorf("set synchronous_commit: %w", err)
 		}
-	}
-
-	// Acquire lease.
-	mgr := lease.NewSpecManager(conn, holder).WithMetrics(libLeaseMetrics)
-	epoch, err := mgr.Acquire(ctx, 1, ttl)
-	if err != nil {
-		return 0, 0, fmt.Errorf("acquire lease: %w", err)
 	}
 
 	wr := writer.New(conn, nil).WithMetrics(libWriterMetrics)
@@ -167,15 +157,13 @@ func runSingleThreadedWrites(ctx context.Context, dsn string, iterations int, gv
 
 	for i := 0; i < iterations; i++ {
 		req := model.WriteRequest{
-			GVK:         gvk,
-			Namespace:   namespace,
-			Name:        fmt.Sprintf("p0-%s-%d", namespace, i),
-			BucketID:    1,
-			Spec:        spec,
-			Status:      status,
-			Metadata:    metadata,
-			LeaseHolder: holder,
-			LeaseEpoch:  epoch,
+			GVK:       gvk,
+			Namespace: namespace,
+			Name:      fmt.Sprintf("p0-%s-%d", namespace, i),
+			BucketID:  1,
+			Spec:      spec,
+			Status:    status,
+			Metadata:  metadata,
 		}
 		t0 := time.Now()
 		if _, err := wr.Write(ctx, req); err != nil {
@@ -197,11 +185,9 @@ func measureStoredProcComparison(ctx context.Context, dsn string, iterations int
 	if len(cfg.Seed.GVKs) > 0 {
 		gvk = cfg.Seed.GVKs[0].GVK
 	}
-	holder := "phase0-sproc-test"
-	ttl := cfg.Cluster.LeaseTTL
 
 	// --- Go writer baseline ---
-	goRPS, goP50, err := runSingleThreadedWrites(ctx, dsn, iterations, gvk, holder, ttl, "phase0-go", "")
+	goRPS, goP50, err := runSingleThreadedWrites(ctx, dsn, iterations, gvk, "phase0-go", "")
 	if err != nil {
 		return fmt.Errorf("go writer: %w", err)
 	}
@@ -218,7 +204,7 @@ func measureStoredProcComparison(ctx context.Context, dsn string, iterations int
 	result.GoWriterP50 = goP50
 
 	// Compute Go writer p99 by running a smaller batch.
-	goP99Lats, err := runWritesWithLatencies(ctx, dsn, min(iterations, 200), gvk, holder, ttl, "phase0-go-p99")
+	goP99Lats, err := runWritesWithLatencies(ctx, dsn, min(iterations, 200), gvk, "phase0-go-p99")
 	if err != nil {
 		return fmt.Errorf("go writer p99: %w", err)
 	}
@@ -232,15 +218,8 @@ func measureStoredProcComparison(ctx context.Context, dsn string, iterations int
 	defer spConn.Close(context.Background())
 
 	// Clean slate — pgctl_write is created by the schema migration.
-	if _, err := spConn.Exec(ctx, "TRUNCATE kubernetes_resources, gvk_bucket_counters, bucket_leases"); err != nil {
+	if _, err := spConn.Exec(ctx, "TRUNCATE kubernetes_resources, gvk_bucket_counters"); err != nil {
 		return fmt.Errorf("truncate for sproc: %w", err)
-	}
-
-	// Acquire lease.
-	mgr := lease.NewSpecManager(spConn, holder).WithMetrics(libLeaseMetrics)
-	epoch, err := mgr.Acquire(ctx, 1, ttl)
-	if err != nil {
-		return fmt.Errorf("acquire lease for sproc: %w", err)
 	}
 
 	spec := json.RawMessage(`{"phase0": true}`)
@@ -260,11 +239,12 @@ func measureStoredProcComparison(ctx context.Context, dsn string, iterations int
 		var uid [16]byte
 		var version, seq int64
 		var changed bool
+		var suppressUs, counterUs, upsertUs int64
 		err = tx.QueryRow(ctx,
-			"SELECT * FROM pgctl_write($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
-			"spec", gvk, "phase0-sproc", name, 1, holder, epoch,
+			"SELECT * FROM pgctl_write($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+			false, gvk, "phase0-sproc", name, 1,
 			int64(0), false, spec, status, metadata, nil,
-		).Scan(&uid, &version, &seq, &changed)
+		).Scan(&uid, &version, &seq, &changed, &suppressUs, &counterUs, &upsertUs)
 		if err != nil {
 			tx.Rollback(ctx) //nolint:errcheck
 			return fmt.Errorf("sproc call %d: %w", i, err)
@@ -290,21 +270,15 @@ func measureStoredProcComparison(ctx context.Context, dsn string, iterations int
 }
 
 // runWritesWithLatencies is like runSingleThreadedWrites but returns sorted latencies.
-func runWritesWithLatencies(ctx context.Context, dsn string, iterations int, gvk, holder string, ttl time.Duration, namespace string) ([]time.Duration, error) {
+func runWritesWithLatencies(ctx context.Context, dsn string, iterations int, gvk, namespace string) ([]time.Duration, error) {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
 	defer conn.Close(context.Background())
 
-	if _, err := conn.Exec(ctx, "TRUNCATE kubernetes_resources, gvk_bucket_counters, bucket_leases"); err != nil {
+	if _, err := conn.Exec(ctx, "TRUNCATE kubernetes_resources, gvk_bucket_counters"); err != nil {
 		return nil, fmt.Errorf("truncate: %w", err)
-	}
-
-	mgr := lease.NewSpecManager(conn, holder).WithMetrics(libLeaseMetrics)
-	epoch, err := mgr.Acquire(ctx, 1, ttl)
-	if err != nil {
-		return nil, fmt.Errorf("acquire lease: %w", err)
 	}
 
 	wr := writer.New(conn, nil).WithMetrics(libWriterMetrics)
@@ -315,15 +289,13 @@ func runWritesWithLatencies(ctx context.Context, dsn string, iterations int, gvk
 	latencies := make([]time.Duration, 0, iterations)
 	for i := 0; i < iterations; i++ {
 		req := model.WriteRequest{
-			GVK:         gvk,
-			Namespace:   namespace,
-			Name:        fmt.Sprintf("p0-%s-%d", namespace, i),
-			BucketID:    1,
-			Spec:        spec,
-			Status:      status,
-			Metadata:    metadata,
-			LeaseHolder: holder,
-			LeaseEpoch:  epoch,
+			GVK:       gvk,
+			Namespace: namespace,
+			Name:      fmt.Sprintf("p0-%s-%d", namespace, i),
+			BucketID:  1,
+			Spec:      spec,
+			Status:    status,
+			Metadata:  metadata,
 		}
 		t0 := time.Now()
 		if _, err := wr.Write(ctx, req); err != nil {
@@ -350,7 +322,6 @@ func snapshotPgStat(ctx context.Context, conn *pgx.Conn) (map[string]pgStatRow, 
 		FROM pg_stat_statements
 		WHERE query LIKE '%kubernetes_resources%'
 		   OR query LIKE '%gvk_bucket_counters%'
-		   OR query LIKE '%bucket_leases%'
 		   OR query LIKE '%pg_notify%'
 		ORDER BY total_exec_time DESC
 		LIMIT 50`)

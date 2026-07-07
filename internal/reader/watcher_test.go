@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelis/postgres-controller-backend/internal/lease"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/reader"
 	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
@@ -45,11 +44,6 @@ func TestWatchReceivesWrittenEvents(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	leaseConn := db.Connect(t)
-	mgr := lease.NewSpecManager(leaseConn, "replica-1")
-	epoch, err := mgr.Acquire(ctx, 1, 60*time.Second)
-	require.NoError(t, err)
-
 	pollConn := connectManual(t, db)
 	listenConn := connectManual(t, db)
 
@@ -79,7 +73,7 @@ func TestWatchReceivesWrittenEvents(t *testing.T) {
 			GVK: "apps/v1/Deployment", Namespace: "default",
 			Name: fmt.Sprintf("deploy-%d", i), BucketID: 1,
 			Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
-			Metadata: json.RawMessage(`{}`), LeaseHolder: "replica-1", LeaseEpoch: epoch,
+			Metadata: json.RawMessage(`{}`),
 		})
 		require.NoError(t, err)
 	}
@@ -110,18 +104,13 @@ func TestWatchDetectsDeletion(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	leaseConn := db.Connect(t)
-	mgr := lease.NewSpecManager(leaseConn, "replica-1")
-	epoch, err := mgr.Acquire(ctx, 1, 60*time.Second)
-	require.NoError(t, err)
-
 	writerConn := db.Connect(t)
 	wr := writer.New(writerConn, nil)
 
 	result, err := wr.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "to-delete",
 		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
-		Metadata: json.RawMessage(`{}`), LeaseHolder: "replica-1", LeaseEpoch: epoch,
+		Metadata: json.RawMessage(`{}`),
 	})
 	require.NoError(t, err)
 
@@ -131,7 +120,6 @@ func TestWatchDetectsDeletion(t *testing.T) {
 		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`), DeletionTimestamp: &now,
 		ExpectedVersion: result.ObjectVersion,
-		LeaseHolder:     "replica-1", LeaseEpoch: epoch,
 	})
 	require.NoError(t, err)
 
@@ -179,11 +167,6 @@ func TestWatchBaselinePollDelivers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	leaseConn := db.Connect(t)
-	mgr := lease.NewSpecManager(leaseConn, "replica-1")
-	epoch, err := mgr.Acquire(ctx, 1, 60*time.Second)
-	require.NoError(t, err)
-
 	pollConn := connectManual(t, db)
 	w := reader.NewWatcher(pollConn, nil, reader.WatcherConfig{
 		GVK: "apps/v1/Deployment", BucketIDs: []int{1},
@@ -203,10 +186,10 @@ func TestWatchBaselinePollDelivers(t *testing.T) {
 
 	writerConn := db.Connect(t)
 	wr := writer.New(writerConn, nil)
-	_, err = wr.Write(ctx, model.WriteRequest{
+	_, err := wr.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "baseline-test",
 		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
-		Metadata: json.RawMessage(`{}`), LeaseHolder: "replica-1", LeaseEpoch: epoch,
+		Metadata: json.RawMessage(`{}`),
 	})
 	require.NoError(t, err)
 
@@ -226,12 +209,6 @@ func TestListenLoop_NoHotSpinOnDeadConn(t *testing.T) {
 	db := testinfra.StartPostgres(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	// Acquire lease on bucket 1
-	leaseConn := db.Connect(t)
-	mgr := lease.NewSpecManager(leaseConn, "replica-1")
-	epoch, err := mgr.Acquire(ctx, 1, 60*time.Second)
-	require.NoError(t, err)
 
 	pollConn := connectManual(t, db)
 	listenConn := connectManual(t, db)
@@ -261,10 +238,10 @@ func TestListenLoop_NoHotSpinOnDeadConn(t *testing.T) {
 	// watcher still works despite the dead listen connection.
 	writerConn := db.Connect(t)
 	wr := writer.New(writerConn, nil)
-	_, err = wr.Write(ctx, model.WriteRequest{
+	_, err := wr.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "backoff-test",
 		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
-		Metadata: json.RawMessage(`{}`), LeaseHolder: "replica-1", LeaseEpoch: epoch,
+		Metadata: json.RawMessage(`{}`),
 	})
 	require.NoError(t, err)
 
@@ -288,12 +265,6 @@ func TestListenLoop_DegradedModeSignal(t *testing.T) {
 	db := testinfra.StartPostgres(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	// Acquire lease on bucket 1
-	leaseConn := db.Connect(t)
-	mgr := lease.NewSpecManager(leaseConn, "replica-1")
-	epoch, err := mgr.Acquire(ctx, 1, 60*time.Second)
-	require.NoError(t, err)
 
 	pollConn := connectManual(t, db)
 	listenConn := connectManual(t, db)
@@ -327,7 +298,7 @@ func TestListenLoop_DegradedModeSignal(t *testing.T) {
 			GVK: "apps/v1/Deployment", Namespace: "default",
 			Name: fmt.Sprintf("degraded-%d", i), BucketID: 1,
 			Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
-			Metadata: json.RawMessage(`{}`), LeaseHolder: "replica-1", LeaseEpoch: epoch,
+			Metadata: json.RawMessage(`{}`),
 		})
 		require.NoError(t, err)
 	}
