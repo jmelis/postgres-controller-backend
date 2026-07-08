@@ -26,7 +26,15 @@ type pgClient struct {
 	pool       *pgxpool.Pool
 	assign     func(ns, name string) int
 	bucketIDs  []int
+	unsharded  map[schema.GroupVersionKind]bool
 	restMapper meta.RESTMapper
+}
+
+func (c *pgClient) bucketFor(gvk schema.GroupVersionKind, ns, name string) int {
+	if c.unsharded[gvk] {
+		return UnshardedBucket
+	}
+	return c.assign(ns, name)
 }
 
 func (c *pgClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
@@ -87,7 +95,12 @@ func (c *pgClient) List(ctx context.Context, list client.ObjectList, opts ...cli
 	defer poolConn.Release()
 	conn := poolConn.Conn()
 
-	result, err := reader.List(ctx, conn, gvkStr, c.bucketIDs)
+	buckets := c.bucketIDs
+	if c.unsharded[itemGVK] {
+		buckets = []int{UnshardedBucket}
+	}
+
+	result, err := reader.List(ctx, conn, gvkStr, buckets)
 	if err != nil {
 		return err
 	}
@@ -134,7 +147,7 @@ func (c *pgClient) Create(ctx context.Context, obj client.Object, opts ...client
 	}
 
 	ns, name := obj.GetNamespace(), obj.GetName()
-	bucketID := c.assign(ns, name)
+	bucketID := c.bucketFor(gvk, ns, name)
 
 	poolConn, err := c.pool.Acquire(ctx)
 	if err != nil {
@@ -185,7 +198,7 @@ func (c *pgClient) Update(ctx context.Context, obj client.Object, opts ...client
 	}
 
 	ns, name := obj.GetNamespace(), obj.GetName()
-	bucketID := c.assign(ns, name)
+	bucketID := c.bucketFor(gvk, ns, name)
 
 	poolConn, err := c.pool.Acquire(ctx)
 	if err != nil {
@@ -251,7 +264,7 @@ func (c *pgClient) Delete(ctx context.Context, obj client.Object, opts ...client
 	gvkStr := gvkToString(gvk)
 
 	ns, name := obj.GetNamespace(), obj.GetName()
-	bucketID := c.assign(ns, name)
+	bucketID := c.bucketFor(gvk, ns, name)
 
 	poolConn, err := c.pool.Acquire(ctx)
 	if err != nil {
@@ -392,7 +405,7 @@ func (sw *pgStatusWriter) Update(ctx context.Context, obj client.Object, opts ..
 	}
 
 	ns, name := obj.GetNamespace(), obj.GetName()
-	bucketID := sw.c.assign(ns, name)
+	bucketID := sw.c.bucketFor(gvk, ns, name)
 
 	poolConn, err := sw.c.pool.Acquire(ctx)
 	if err != nil {

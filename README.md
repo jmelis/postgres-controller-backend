@@ -22,7 +22,7 @@ Otherwise, use `etcd` or `kine`, for example.
 
 Four ideas carry the whole design:
 
-- **Buckets.** Resources are partitioned client-side: a caller-supplied function maps each object (namespace, name) to one of N buckets. The database stores whatever bucket ID it's given and never re-shards. The bucket is the unit of write concurrency and event ordering.
+- **Buckets.** Resources are partitioned client-side: a caller-supplied function maps each object (namespace, name) to one of N buckets. The database stores whatever bucket ID it's given and never re-shards. The bucket is the unit of write concurrency and event ordering. GVKs listed in `UnshardedGVKs` bypass the assigner and use sentinel bucket `-1`, which every replica watches — useful for cluster-wide configuration resources that all pods need to see.
 - **Commit-ordered sequences.** Each `(GVK, bucket)` pair has its own counter, created on first use — no global sequence bottleneck. Within a bucket, sequence order equals commit order — if seq N is visible, every seq before it is also visible — so watchers get a commit-ordered event stream.
 - **Poll-primary watch.** Watchers _pull_ events from the table; the LISTEN/NOTIFY doorbell is a latency-only optimization. Total notification loss costs latency (bounded by the baseline poll, 5s default), never events.
 - **Timeline epochs.** The resourceVersion is a timeline epoch plus a per-bucket high-water-mark vector. Failover bumps the epoch; watchers with stale positions get `410 Gone` and relist instead of silently missing events.

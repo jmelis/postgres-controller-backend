@@ -352,7 +352,7 @@ func (w *Watcher) listenLoop(ctx context.Context, notify chan<- struct{}) {
 func (w *Watcher) listenAll(ctx context.Context, conn *pgx.Conn) error {
 	for _, bid := range w.cfg.BucketIDs {
 		channel := fmt.Sprintf("resource_changes_b%d", bid)
-		if _, err := conn.Exec(ctx, "LISTEN "+channel); err != nil {
+		if _, err := conn.Exec(ctx, fmt.Sprintf(`LISTEN "%s"`, channel)); err != nil {
 			return fmt.Errorf("listen %s: %w", channel, err)
 		}
 	}
