@@ -219,27 +219,6 @@ This is optional — your controller's reconcile loop only needs
 `pgruntime.TypedClient` and the `Manager`. The HTTP API is for external
 consumers who would otherwise use kubectl.
 
-## Line count comparison
-
-|                           | etcd-controller       | postgres-controller |
-| ------------------------- | --------------------- | ------------------- |
-| types / deepcopy / scheme | 193                   | 32 (plain structs)  |
-| controller + reconcile    | 108                   | 93                  |
-| main / bootstrap          | 32                    | 168                 |
-| validator                 | 0 (apiserver does it) | 129                 |
-| HTTP API                  | 0 (apiserver does it) | 242                 |
-| **Total**                 | **333**               | **664**             |
-
-The reconcile function is now roughly the same size as the etcd version. The
-remaining delta is:
-
-- Bootstrap (~136 lines)
-- CRD validation (~129 lines)
-- HTTP API for external access (~242 lines, optional)
-
-Without the optional HTTP API, the delta is ~422 lines — and most of that is
-validation and bootstrap, not controller logic.
-
 ## Migration checklist
 
 1. **Replace type boilerplate with plain structs** — delete deepcopy methods,
