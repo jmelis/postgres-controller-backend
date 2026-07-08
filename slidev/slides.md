@@ -318,11 +318,12 @@ Any system that follows the **reconciler pattern against kube-apiserver + etcd**
 
 ## ⚠️ Pitfall: this *feels* like Kube, but it is not Kube
 
-WIP:
+Planned:
 - cluster-wide resources (nullable namespace)
 - gvk's without buckets (nullable buckets)
 - Owner-reference GC cascade
 - CRD validation (client-side)
+- CRD Lifecycling
 
 Not supported:
 - No admission webhooks
