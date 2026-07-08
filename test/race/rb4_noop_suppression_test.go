@@ -102,7 +102,7 @@ func TestRB4c_WatcherSeesNoEventForSuppressed(t *testing.T) {
 	watchConn := freshConn(t)
 	listenConn := freshConn(t)
 
-	startRV := resourceversion.RV{Epoch: 1, Buckets: map[int]int64{1: r1.Seq}}
+	startRV := resourceversion.RV{Buckets: map[int]int64{1: r1.Seq}}
 	watcher := reader.NewWatcher(watchConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
 		BucketIDs:        []int{1},

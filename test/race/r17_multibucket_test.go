@@ -29,7 +29,6 @@ func TestR17_InterleavedDelivery(t *testing.T) {
 		GVK:       "apps/v1/Deployment",
 		BucketIDs: []int{1, 2, 3},
 		StartRV: resourceversion.RV{
-			Epoch:   1,
 			Buckets: map[int]int64{1: 0, 2: 0, 3: 0},
 		},
 		BaselineInterval: 300 * time.Millisecond,
@@ -106,7 +105,6 @@ func TestR17_DoorbellPerChannel(t *testing.T) {
 		GVK:       "apps/v1/Deployment",
 		BucketIDs: []int{1, 2, 3},
 		StartRV: resourceversion.RV{
-			Epoch:   1,
 			Buckets: map[int]int64{1: 0, 2: 0, 3: 0},
 		},
 		BaselineInterval: 10 * time.Second, // long baseline — doorbell must drive delivery
@@ -181,7 +179,6 @@ func TestR17_Partial410(t *testing.T) {
 		GVK:       "apps/v1/Deployment",
 		BucketIDs: []int{1, 2, 3},
 		StartRV: resourceversion.RV{
-			Epoch:   1,
 			Buckets: map[int]int64{1: 0, 2: 0, 3: 0},
 		},
 		BaselineInterval: 300 * time.Millisecond,

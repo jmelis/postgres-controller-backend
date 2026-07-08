@@ -77,7 +77,7 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	}
 	defer probeConn.Close(context.Background())
 
-	startRV := resourceversion.RV{Epoch: 1, Buckets: make(map[int]int64)}
+	startRV := resourceversion.RV{Buckets: make(map[int]int64)}
 
 	// Build initial HWM from a list query.
 	listResult, err := reader.List(ctx, probeConn, gvk, bucketIDs)
@@ -115,7 +115,7 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 		w := reader.NewWatcher(pc, nil, reader.WatcherConfig{
 			GVK:              gvk,
 			BucketIDs:        bucketIDs,
-			StartRV:          resourceversion.RV{Epoch: startRV.Epoch, Buckets: copyHWM(startRV.Buckets)},
+			StartRV:          resourceversion.RV{Buckets: copyHWM(startRV.Buckets)},
 			BaselineInterval: baselineInterval,
 		}, hooks).WithMetrics(libWatcherMetrics)
 
@@ -184,7 +184,7 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 		w := reader.NewWatcher(pc, lc, reader.WatcherConfig{
 			GVK:              gvk,
 			BucketIDs:        bucketIDs,
-			StartRV:          resourceversion.RV{Epoch: startRV.Epoch, Buckets: copyHWM(startRV.Buckets)},
+			StartRV:          resourceversion.RV{Buckets: copyHWM(startRV.Buckets)},
 			BaselineInterval: 10 * time.Second,
 			DebounceFloor:    50 * time.Millisecond,
 		}, nil).WithMetrics(libWatcherMetrics)
@@ -325,7 +325,7 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 			w := reader.NewWatcher(pc, nil, reader.WatcherConfig{
 				GVK:              gvk,
 				BucketIDs:        bucketIDs,
-				StartRV:          resourceversion.RV{Epoch: 1, Buckets: copyHWM(lossHWM)},
+				StartRV:          resourceversion.RV{Buckets: copyHWM(lossHWM)},
 				BaselineInterval: baselineInterval,
 			}, nil).WithMetrics(libWatcherMetrics)
 			lossWatchers[i] = w

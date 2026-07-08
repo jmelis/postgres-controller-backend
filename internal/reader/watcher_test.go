@@ -50,7 +50,7 @@ func TestWatchReceivesWrittenEvents(t *testing.T) {
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
 		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Epoch: 1, Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
 		BaselineInterval: 500 * time.Millisecond,
 		DebounceFloor:    50 * time.Millisecond,
 	}, nil)
@@ -126,7 +126,7 @@ func TestWatchDetectsDeletion(t *testing.T) {
 	pollConn := connectManual(t, db)
 	w := reader.NewWatcher(pollConn, nil, reader.WatcherConfig{
 		GVK: "apps/v1/Deployment", BucketIDs: []int{1},
-		StartRV:          resourceversion.RV{Epoch: 1, Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
 		BaselineInterval: 500 * time.Millisecond,
 	}, nil)
 
@@ -170,7 +170,7 @@ func TestWatchBaselinePollDelivers(t *testing.T) {
 	pollConn := connectManual(t, db)
 	w := reader.NewWatcher(pollConn, nil, reader.WatcherConfig{
 		GVK: "apps/v1/Deployment", BucketIDs: []int{1},
-		StartRV:          resourceversion.RV{Epoch: 1, Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
 		BaselineInterval: 300 * time.Millisecond,
 	}, nil)
 
@@ -219,7 +219,7 @@ func TestListenLoop_NoHotSpinOnDeadConn(t *testing.T) {
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
 		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Epoch: 1, Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
 		BaselineInterval: 300 * time.Millisecond,
 	}, nil)
 
@@ -275,7 +275,7 @@ func TestListenLoop_DegradedModeSignal(t *testing.T) {
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
 		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Epoch: 1, Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
 		BaselineInterval: 300 * time.Millisecond,
 		// No ListenConnFactory — watcher should fall back to baseline-only.
 	}, nil)

@@ -27,7 +27,7 @@ func TestR3_DoorbellLoss(t *testing.T) {
 	w := reader.NewWatcher(pollConn, nil, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
 		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Epoch: 1, Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
 		BaselineInterval: 300 * time.Millisecond,
 	}, nil)
 

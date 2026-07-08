@@ -85,9 +85,6 @@ func (db *TestDB) TruncateAll(t testing.TB, conn *pgx.Conn) {
 			t.Fatalf("truncate %s: %v", tbl, err)
 		}
 	}
-	if _, err := conn.Exec(ctx, "UPDATE cluster_epoch SET timeline_id = 1"); err != nil {
-		t.Fatalf("reset cluster_epoch: %v", err)
-	}
 }
 
 func freePort(t testing.TB) int {

@@ -55,8 +55,6 @@ func truncateAll(t *testing.T) {
 			t.Fatalf("truncate %s: %v", tbl, err)
 		}
 	}
-	// Reset timeline epoch
-	conn.Exec(ctx, "UPDATE cluster_epoch SET timeline_id = 1")
 }
 
 func makeWriteReq(gvk, ns, name string, bucketID int) model.WriteRequest {

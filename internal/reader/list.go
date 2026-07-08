@@ -19,8 +19,8 @@ type ListResult struct {
 // (deletion_timestamp set, no finalizers) are excluded by the query. Dying
 // objects (deletion_timestamp set, has finalizers) are included so controllers
 // can perform cleanup before removing their finalizers. The returned RV is
-// built from cluster_epoch + per-bucket counters within the same snapshot,
-// so there is no skew between the data and the version (I4/I5 handoff into Watch).
+// built from per-bucket counters within the same snapshot, so there is no
+// skew between the data and the version (I4/I5 handoff into Watch).
 func List(ctx context.Context, conn *pgx.Conn, gvk string, bucketIDs []int) (*ListResult, error) {
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel:   pgx.RepeatableRead,
@@ -31,14 +31,8 @@ func List(ctx context.Context, conn *pgx.Conn, gvk string, bucketIDs []int) (*Li
 	}
 	defer tx.Rollback(ctx)
 
-	// Read timeline epoch
-	var epoch int64
-	if err := tx.QueryRow(ctx, `SELECT timeline_id FROM cluster_epoch`).Scan(&epoch); err != nil {
-		return nil, fmt.Errorf("list epoch: %w", err)
-	}
-
 	// Read per-bucket counters (build RV)
-	rv := resourceversion.RV{Epoch: epoch, Buckets: make(map[int]int64, len(bucketIDs))}
+	rv := resourceversion.RV{Buckets: make(map[int]int64, len(bucketIDs))}
 
 	counterRows, err := tx.Query(ctx, `
 		SELECT bucket_id, current_seq FROM gvk_bucket_counters

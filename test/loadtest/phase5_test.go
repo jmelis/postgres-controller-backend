@@ -73,7 +73,7 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 
 	// Get current HWMs from a quick watcher start
 	probeConn := manualConn(t)
-	startRV := resourceversion.RV{Epoch: 1, Buckets: make(map[int]int64)}
+	startRV := resourceversion.RV{Buckets: make(map[int]int64)}
 	probeWatcher := reader.NewWatcher(probeConn, nil, reader.WatcherConfig{
 		GVK: gvk, BucketIDs: bucketIDs(numBuckets),
 		StartRV: startRV, BaselineInterval: 100 * time.Millisecond,
@@ -121,7 +121,7 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 		hooks := &phase5TimingHooks{timing: timing}
 		w := reader.NewWatcher(pc, nil, reader.WatcherConfig{
 			GVK: gvk, BucketIDs: bucketIDs(numBuckets),
-			StartRV: resourceversion.RV{Epoch: 1, Buckets: copyHWM(seedHWM)},
+			StartRV: resourceversion.RV{Buckets: copyHWM(seedHWM)},
 			BaselineInterval: baselineForAll,
 		}, hooks)
 		idleWatchers[i] = w
@@ -202,7 +202,7 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 		dbListenConns[i] = lc
 		w := reader.NewWatcher(pc, lc, reader.WatcherConfig{
 			GVK: gvk, BucketIDs: bucketIDs(numBuckets),
-			StartRV: resourceversion.RV{Epoch: 1, Buckets: copyHWM(seedHWM)},
+			StartRV: resourceversion.RV{Buckets: copyHWM(seedHWM)},
 			BaselineInterval: 10 * time.Second,
 			DebounceFloor:    50 * time.Millisecond,
 		}, nil)
@@ -334,7 +334,7 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 		lossConns[i] = pc
 		w := reader.NewWatcher(pc, nil, reader.WatcherConfig{
 			GVK: gvk, BucketIDs: bucketIDs(numBuckets),
-			StartRV: resourceversion.RV{Epoch: 1, Buckets: copyHWM(phaseC_HWM)},
+			StartRV: resourceversion.RV{Buckets: copyHWM(phaseC_HWM)},
 			BaselineInterval: lossBaseline,
 		}, nil)
 		lossWatchers[i] = w
