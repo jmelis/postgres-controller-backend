@@ -42,7 +42,7 @@ layout: section
 
 - ~8 GB practical ceiling
 - ~500k max objects before degraded performance
-- Backup / restore / DR story tied to the cluster's own etcd (no **pitr**)
+- HA / Backup / restore / story remains a problem (no **pitr**)
 
 </v-click>
 
@@ -60,7 +60,7 @@ layout: section
   - [Example configuration](https://github.com/openshift-online/rosa-hyperfleet/blob/942b09d42b71f4cf5891317ca4b2879d8144fece/argocd/config/regional-cluster/hyperfleet-adapter1-chart/adapter-task-config.yaml)
   - Dependency on CLM team, lack of autonomy (example `maestro` to `kube-applier`)
 - **Lots of moving parts** — CLM API, broker, sentinel, adapters, database
-- **New custom tooling** - Everything built from the ground up, no opportunity to reuse
+- **Custom tooling** - Everything built from the ground up, no opportunity to reuse
 - **Velocity** — features took long to land (Cluster deletion ~6 months)
 
 </div>
@@ -72,7 +72,7 @@ What we really wanted all along was
 
 ## controller-runtime operators
 
-The reconciler pattern, informers, work queues — the mature, well-understood Kubernetes toolchain.
+The `controller-runtime` semantics, reconciler pattern — the mature, well-understood Kubernetes toolchain.
 
 </div>
 </div>
@@ -119,6 +119,8 @@ We assumed we **couldn't have kube semantics on Postgres**.
 
 The hard part is the watch contract: a **commit-ordered event stream** per resource type. With naive sequences, a transaction can take seq *N* but commit **after** *N+1* — a watcher advances past *N* and misses it **forever**.
 
+The watch contract is the **core correctness invariant** of the reconciler pattern, and Postgres doesn't provide it out of the box. Concurrent writes can commit out of order, creating gaps that silently swallow events.
+
 </v-click>
 
 <v-click>
@@ -158,23 +160,20 @@ layout: section
 
 ---
 
-# The key idea: buckets
+# Horizontal scaling: data sharding
 
 <div/>
 
-Split each GVK's objects into **buckets**; lock per **(GVK, bucket)** instead of per GVK.
+Distributing work across controller replicas is a well-understood pattern — consistent hashing, namespace-based sharding, label selectors. Our approach: **partition by (GVK, bucket)**.
 
 <div class="grid grid-cols-2 gap-8">
 <div>
 
-- Each bucket contains a number of **slices**
-- A slice is **all the CRs related to a single cluster**
-  - Cluster, Placement, NodePool, …
-- A client-side assigner maps object → bucket; parent and children co-locate
+- Objects assigned to buckets by a deterministic function (e.g. hash of namespace)
+- Related CRs (Cluster, Placement, NodePool) co-locate in the same bucket
+- Each replica watches and reconciles its own slice of the bucket space
 
-**Result:** write contention drops by the bucket count — each bucket has its own commit-ordered counter, its own ordering, its own doorbell. No global lock anywhere.
-
-Controllers can scale horizontally and watch only their own buckets.
+**Result:** write contention scales down with bucket count. Controllers scale horizontally.
 
 </div>
 <div>
@@ -213,17 +212,22 @@ Zero serialization failures, zero sequence gaps, zero invariant violations acros
 
 <div/>
 
-Every mechanism is justified by one of **6 named invariants** (commit-ordered sequences, no regression across failover, exactly-once delivery, RV monotonicity, compaction safety, optimistic concurrency).
+Every correctness property has a **deterministic test that forces the failure scenario**:
 
-Every invariant has a **deterministic test that forces the bad interleaving** — 21 race tests in total:
+<div class="text-sm">
 
-| Theme | What they prove |
-| --- | --- |
-| Sequence integrity | Concurrent writes, ambiguous commits, 409 rollbacks never create gaps or duplicates |
-| Watch delivery | No event swallowed by debouncing, doorbell loss, or coalescing |
-| Compaction & failover | Stale watchers get `410 Gone` — never a silent skip |
+|                                   |                                                             |
+| --------------------------------- | ----------------------------------------------------------- |
+| **Commit-ordered sequences**      | Concurrent writes, ambiguous commits never create gaps      |
+| **No regression across failover** | Stale watchers get `410 Gone`, never a silent skip          |
+| **Exactly-once delivery**         | No event swallowed by debouncing or coalescing              |
+| **RV monotonicity**               | Resource versions never go backwards across list→watch      |
+| **Compaction safety**             | Compacted watchers correctly expired                        |
+| **Optimistic concurrency**        | Stale writes get `409 Conflict`, counter rolls back cleanly |
+| **Toxiproxy fault injection**     | TCP RST, killed connections mid-COMMIT                      |
+| **Continuous verifier**           | Same checks run in production                               |
 
-Plus **Toxiproxy** fault injection (TCP RST, killed connections mid-COMMIT) — and a **continuous verifier** that runs the same invariant checks in production.
+</div>
 
 ---
 
@@ -240,11 +244,11 @@ Replacing CLM with this approach took ~2 weeks of design and ~1 week of implemen
 
 ---
 
-# Migrating a controller
+# Implementing a controller
 
 <div/>
 
-The `examples/` directory has the **same controller implemented twice** — once against etcd, once against Postgres. The reconciler doesn't change; the manager wiring does:
+The `examples/` directory has the **same controller implemented twice** — once against etcd, once against Postgres. The reconciler doesn't change; only the manager wiring does:
 
 ```go
 mgr, _ := pgruntime.NewManager(pgruntime.Options{
@@ -262,11 +266,11 @@ mgr.Start(ctx)
 
 ---
 
-# Scaling out: bucket assignment
+# Horizontal scaling
 
 <div/>
 
-Single replica? The defaults (one bucket, ID 0) just work. For multi-replica, each replica claims a slice of the bucket space:
+Single replica? The defaults just work. For multi-replica, each replica claims a slice of the bucket space — a standard sharding pattern:
 
 ```go
 mgr, _ := pgruntime.NewManager(pgruntime.Options{
@@ -289,17 +293,14 @@ mgr, _ := pgruntime.NewManager(pgruntime.Options{
 
 | | |
 | --- | --- |
-| **Database (Postgres)** | ✅ Retained |
-| **Adapters** | ➡️ Become native **controller-runtime** controllers |
-| **CLM API** | ❌ Removed |
-| **Sentinel** | ❌ Removed |
+| **Database (Postgres)** | ✅ Retained — scope expanded (stored procedures, write path) |
+| **Adapters** | ➡️ Become `controller-runtime` controllers with PG backend |
+| **CLM API** | ❌ Removed (some functionality absorbed by other components) |
+| **Sentinel** | ❌ Removed — sharding handled by controllers |
 | **Broker** | ❌ Removed |
+| **PG client library** | 🆕 New — manager, client, cache targeting Postgres |
 
-<v-click>
-
-## Fewer components, same guarantees.
-
-</v-click>
+## Fewer components — but some have grown in scope.
 
 ---
 
@@ -314,24 +315,53 @@ Any system that follows the **reconciler pattern against kube-apiserver + etcd**
 
 <v-click>
 
-<div class="mt-8"></div>
+<br/>
 
 ## ⚠️ Pitfall: this *feels* like Kube, but it is not Kube
 
-Planned:
-- cluster-wide resources (nullable namespace)
-- gvk's without buckets (nullable buckets)
+<div class="grid grid-cols-2 gap-6 mt-4">
+<div>
+
+### Planned 🚧
+
 - Owner-reference GC cascade
 - CRD validation (client-side)
-- CRD Lifecycling
+- CRD lifecycle (schema versioning, rollout coordination)
 
-Not supported:
-- No admission webhooks
-- No RBAC
+</div>
+<div>
+
+### Not supported
+
+- Admission webhooks
+- RBAC
 - CRD validation (server-side)
 - Server-side apply
 
-**Mitigation:** keep clear documentation of what **IS** supported vs what is **NOT**.
+</div>
+</div>
+
+**Mitigation:** clear documentation of what **is** vs **is not** supported.
+
+</v-click>
+
+---
+
+# Why ownership matters
+
+<div/>
+
+- This is the **business logic of the service** — not generic infrastructure
+- Each pillar owns its core lifecycle independently
+- Owning the full stack enables **velocity**: features land in days, not months
+
+<v-click>
+
+GCP and ROSA implementations align on:
+
+1. Full ownership over cluster lifecycle tech
+2. High-level architecture: controllers reconciling against a database
+3. Each pillar chooses its own implementation details
 
 </v-click>
 
@@ -343,12 +373,10 @@ layout: center
 
 <div/>
 
-- **The proposal:**
-  - controller-runtime controllers on plain Postgres
-  - buckets make the watch contract scale.
-- **Why:** we want **controller-runtime** ecosystem and operator semantics **without operating etcd**.
-- **Why removal of CLM:** Same guarantees achieved with **fewer components** and **increased developer velocity**.
-- **Perfscale** 2xlarge **~9.6k writes/s** measured (**~200/s** needed).
+- **Why:** owning the full lifecycle enables **velocity** and **autonomy**
+- **The proposal:** controller-runtime controllers against Postgres, with data sharding for horizontal scale
+- **Trade-offs:** fewer components, but some have grown in scope — complexity moved, not just removed
+- **Confidence:** scalable, performant, and correct, with correctness tests and continuous verification
 
 ---
 layout: center
