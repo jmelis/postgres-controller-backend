@@ -26,6 +26,7 @@ type pgCache struct {
 	scheme     *runtime.Scheme
 	pool       *pgxpool.Pool
 	bucketIDs  []int
+	unsharded  map[schema.GroupVersionKind]bool
 	restMapper meta.RESTMapper
 	logger     logr.Logger
 
@@ -94,7 +95,12 @@ func (c *pgCache) List(ctx context.Context, list client.ObjectList, opts ...clie
 	}
 	defer poolConn.Release()
 
-	result, err := reader.List(ctx, poolConn.Conn(), gvkStr, c.bucketIDs)
+	buckets := c.bucketIDs
+	if c.unsharded[itemGVK] {
+		buckets = []int{UnshardedBucket}
+	}
+
+	result, err := reader.List(ctx, poolConn.Conn(), gvkStr, buckets)
 	if err != nil {
 		return err
 	}
@@ -202,12 +208,17 @@ func (c *pgCache) getOrCreateInformer(gvk schema.GroupVersionKind) (*pgInformer,
 		return inf, nil
 	}
 
+	buckets := c.bucketIDs
+	if c.unsharded[gvk] {
+		buckets = []int{UnshardedBucket}
+	}
+
 	inf := &pgInformer{
 		gvk:         gvk,
 		gvkStr:      gvkToString(gvk),
 		scheme:      c.scheme,
 		pool:      c.pool,
-		bucketIDs: c.bucketIDs,
+		bucketIDs: buckets,
 		logger:      c.logger.WithValues("gvk", gvk.String()),
 		store:       make(map[types.NamespacedName]storedObject),
 	}

@@ -106,6 +106,15 @@ New concepts with no etcd equivalent:
   is useful when parent and child resources share a namespace. The assigner
   is the same on every replica; only `BucketIDs` differs.
 
+- **Unsharded GVKs** — `Options.UnshardedGVKs` lists GVKs that bypass bucket
+  sharding entirely. These are assigned to sentinel bucket `-1`, which every
+  replica watches regardless of its `BucketIDs` slice. Use this for
+  configuration resources that all pods need to see.
+  Unsharded GVKs can be namespaced or cluster-scoped — the sharding
+  behavior is independent of scope. **Trade-off:** every pod's informer polls
+  bucket `-1`, so high-churn unsharded GVKs amplify database reads across all
+  replicas. Best suited for small, rarely-changing configuration resources.
+
 ### 2. Validation: apiserver does it → you do it
 
 With etcd, the apiserver validates payloads against the CRD schema before

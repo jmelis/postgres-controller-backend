@@ -63,7 +63,7 @@ CREATE TABLE kubernetes_resources (
     namespace          TEXT NOT NULL,
     name               TEXT NOT NULL,
     uid                UUID NOT NULL DEFAULT gen_random_uuid(),
-    bucket_id          INT NOT NULL,
+    bucket_id          INT NOT NULL,   -- -1 = unsharded (sentinel for UnshardedGVKs, watched by every replica; keep few & low-churn)
     gvk_bucket_seq     BIGINT NOT NULL,
     object_version     BIGINT NOT NULL DEFAULT 1,
     spec               JSONB NOT NULL,
