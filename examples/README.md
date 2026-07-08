@@ -1,4 +1,4 @@
-# Migrating a controller-runtime controller to postgres-controller-backend
+# Migrating a controller-runtime controller from etcd to PostgreSQL
 
 This directory contains two implementations of the same controller — one using
 controller-runtime against etcd, and one using `pgruntime` against PostgreSQL.
@@ -12,241 +12,130 @@ Both manage three CRDs that exercise the three common controller patterns:
 
 ## What changes, what stays the same
 
-The reconcile logic is identical between the two controllers. The differences
-are in how you talk to the storage layer and how you wire up watches. Here is
-the full list of things that change.
+`pgruntime.NewManager` returns a standard `manager.Manager` backed by
+PostgreSQL instead of etcd. Types, `client.Client` CRUD, error handling, and
+`SetupWithManager` watch setup are all unchanged — your reconciler code works
+as-is. The differences are in startup bootstrapping and the absence of an
+apiserver.
 
-### 1. Types: `metav1.ObjectMeta` boilerplate → plain Go structs
+### 1. Startup: `ctrl.NewManager` → `pgruntime.NewManager`
 
-**etcd** — typed Go structs with `metav1.ObjectMeta`, `DeepCopyObject()`,
-scheme registration, and code generation boilerplate (~193 lines for three
-types):
-
-```go
-type Greeting struct {
-    metav1.TypeMeta   `json:",inline"`
-    metav1.ObjectMeta `json:"metadata,omitempty"`
-    Spec              GreetingSpec   `json:"spec,omitempty"`
-    Status            GreetingStatus `json:"status,omitempty"`
-}
-// + DeepCopyObject, DeepCopyInto, SchemeBuilder.Register, ...
-```
-
-**postgres** — plain Go structs for spec and status, no metadata boilerplate,
-no deepcopy, no scheme registration (~32 lines for three types):
+**etcd**:
 
 ```go
-type GreetingSpec struct {
-    Name string `json:"name"`
-}
-
-type GreetingStatus struct {
-    Message string `json:"message,omitempty"`
-    Phase   string `json:"phase,omitempty"`
-    CardRef string `json:"cardRef,omitempty"`
-}
+mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+    Scheme: greeting.Scheme,
+})
 ```
 
-The `pgruntime.TypedObject[S, T]` generic type carries the standard metadata
-(namespace, name, UID, resourceVersion) alongside your typed spec and status:
+**postgres**:
 
 ```go
-type TypedObject[S any, T any] struct {
-    GVK             string
-    Namespace       string
-    Name            string
-    UID             uuid.UUID
-    ResourceVersion string
-    Spec            S              // your spec type
-    Status          T              // your status type
-    // ...
-}
+mgr, err := pgruntime.NewManager(pgruntime.Options{
+    Scheme: greeting.Scheme,
+    DSN:    dsn,
+})
 ```
 
-### 2. CRUD: `client.Client` → `pgruntime.TypedClient[S, T]`
-
-| Operation     | controller-runtime             | pgruntime                                  |
-| ------------- | ------------------------------ | ------------------------------------------ |
-| Get           | `r.Get(ctx, key, &obj)`        | `client.Get(ctx, ns, name)`                |
-| Create        | `r.Create(ctx, &obj)`          | `client.Create(ctx, ns, name, spec)`       |
-| Update spec   | `r.Update(ctx, &obj)`          | `client.Update(ctx, obj)`                  |
-| Update status | `r.Status().Update(ctx, &obj)` | `client.Status().Update(ctx, obj, status)` |
-| Delete        | `r.Delete(ctx, &obj)`          | `client.Delete(ctx, obj)`                  |
-| List          | `r.List(ctx, &list, opts...)`  | `client.List(ctx)`                         |
-
-Key differences:
-
-- `pgruntime.TypedClient` is **per-GVK** (one client per kind). controller-runtime
-  uses a single `client.Client` for all types.
-- Create takes the typed spec directly — status defaults to the zero value.
-- Status updates take the typed object + new typed status value.
-- There is no `CreateOrUpdate` helper — you Get, check `ErrNotFound`, and
-  branch into Create or Update yourself.
-- All operations return `*TypedObject[S, T]` with typed fields — no
-  `json.Unmarshal` needed in controller code.
-
-An untyped `pgruntime.Client` is also available for code that works with raw
-JSON (e.g., HTTP APIs). Access it via `typedClient.Untyped()`.
-
-### 3. Error handling: `errors.IsNotFound()` → sentinel errors
-
-| Condition      | controller-runtime            | pgruntime                           |
-| -------------- | ----------------------------- | ----------------------------------- |
-| Not found      | `errors.IsNotFound(err)`      | `err == pgruntime.ErrNotFound`      |
-| Already exists | `errors.IsAlreadyExists(err)` | `err == pgruntime.ErrAlreadyExists` |
-| Conflict       | `errors.IsConflict(err)`      | `err == pgruntime.ErrConflict`      |
-
-### 4. Watches: `SetupWithManager` → `NewControllerFor`
-
-**etcd** — declarative, one-liner watch setup:
-
-```go
-ctrl.NewControllerManagedBy(mgr).
-    For(&Greeting{}).
-    Owns(&GreetingCard{}).
-    Watches(&GreetingPolicy{}, handler.EnqueueRequestsFromMapFunc(mapFn)).
-    Complete(r)
-```
-
-**postgres** — same declarative pattern via `pgruntime.NewControllerFor`:
-
-```go
-pgruntime.NewControllerFor[GreetingSpec, GreetingStatus](mgr, gvkGreeting, reconciler).
-    Watches(gvkGreetingPolicy, reconciler.policyToGreetings).
-    Complete()
-```
-
-The `Manager` handles all the list-watch-relist loops, work queue, and
-reconcile dispatch internally. You only write:
-
-- A `Reconcile(ctx, *TypedObject[S, T]) (Result, error)` method
-- A `MapFunc` for cross-type watches (e.g., policy change → requeue greetings)
-
-The `MapFunc` receives an untyped `*Object` because it operates at the watch
-level. In the common case (requeue by namespace) only `obj.Namespace` is needed:
-
-```go
-func (r *GreetingReconciler) policyToGreetings(ctx context.Context, obj *pgruntime.Object) []pgruntime.Request {
-    result, _ := r.Greetings.List(ctx)
-    var requests []pgruntime.Request
-    for _, g := range result.Objects {
-        if !g.Deleted && g.Namespace == obj.Namespace {
-            requests = append(requests, pgruntime.Request{Namespace: g.Namespace, Name: g.Name})
-        }
-    }
-    return requests
-}
-```
-
-### 5. Startup: `ctrl.NewManager` → `pgruntime.NewManager`
-
-**etcd** — 3 lines:
-
-```go
-mgr, _ := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{Scheme: scheme})
-(&GreetingReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr)
-mgr.Start(ctrl.SetupSignalHandler())
-```
-
-**postgres** — connect, migrate, then use the Manager:
-
-```go
-// 1. Connect to postgres (with retry loop)
-conn, _ := pgx.Connect(ctx, dsn)
-
-// 2. Migrate schema
-schema.Migrate(ctx, conn)
-
-// 3. Create typed clients
-greetingClient := pgruntime.NewTypedClient[GreetingSpec, GreetingStatus](
-    pgruntime.NewClient(connFactory, gvk, assigner),
-    pgruntime.NewListerWatcher(connFactory, gvk, buckets),
-)
-
-// 4. Create Manager, register controller, start
-mgr := pgruntime.NewManager(pgruntime.ManagerConfig{...})
-pgruntime.NewControllerFor[GreetingSpec, GreetingStatus](mgr, gvk, reconciler).
-    Watches(gvkGreetingPolicy, reconciler.policyToGreetings).
-    Complete()
-mgr.Start(ctx)
-```
+Everything after the manager creation is identical — `SetupWithManager`,
+`mgr.Start`, error handling all stay the same.
 
 New concepts with no etcd equivalent:
 
-- **Schema migration** — `schema.Migrate()` creates the postgres tables.
+- **Schema migration** — handled automatically by `NewManager` on startup.
   Idempotent, safe to call on every startup.
-- **Connection factory** — `pgruntime.TypedClient` and `ListerWatcher` take a
-  `func() (*pgx.Conn, error)` rather than a single connection, so each
-  operation gets its own connection.
-- **Bucket assignment** — a `func(namespace, name string) int` that maps
-  objects to buckets. For a single-replica controller, return a constant.
+- **PostgreSQL connection pooling** — `NewManager` creates a `pgxpool.Pool`
+  internally to manage connections to PostgreSQL. Every CRUD call and every
+  informer poll acquires a connection from this pool, so pool size bounds how
+  many concurrent database operations can run. Configure with `MaxPoolConns`
+  and `MinPoolConns` in `Options` (defaults come from pgxpool: max 4, min 0).
+- **Bucket assignment** — `Options.BucketIDs` and `Options.BucketAssigner`
+  partition objects across controller replicas. The `BucketAssigner` is a
+  `func(namespace, name string) int` called only on **Create** to decide which
+  bucket a new object is written to. Once stored, the `bucket_id` lives in
+  the row — reads and watches use the stored value. The function must be
+  deterministic so all replicas agree on bucket ownership without coordination.
+  For a single-replica controller, the defaults (one bucket, ID 0) are
+  sufficient. For multi-replica deployments, each replica claims a subset of
+  bucket IDs and all replicas share the same `BucketAssigner` function.
 
-### 6. Validation: apiserver does it → you do it
+  **Example: StatefulSet with 32 buckets, sharded by namespace.** The
+  replica count comes from an env var (e.g., set in the StatefulSet spec),
+  and the ordinal is parsed from the pod hostname (`pod-0`, `pod-1`, …).
+  All replicas share the same `BucketAssigner` so creates are routed
+  consistently regardless of which replica handles the write:
+
+  ```go
+  import (
+      "hash/crc32"
+      "os"
+      "strconv"
+      "strings"
+  )
+
+  const totalBuckets = 32
+
+  func myBuckets(replicaIndex, replicaCount int) []int {
+      var ids []int
+      for b := replicaIndex; b < totalBuckets; b += replicaCount {
+          ids = append(ids, b)
+      }
+      return ids
+  }
+
+  // REPLICA_COUNT is set in the StatefulSet env (matching spec.replicas).
+  // The ordinal is the trailing number in the pod hostname (e.g., "controller-2" → 2).
+  replicaCount, _ := strconv.Atoi(os.Getenv("REPLICA_COUNT"))
+  hostname, _     := os.Hostname()
+  parts           := strings.Split(hostname, "-")
+  ordinal, _      := strconv.Atoi(parts[len(parts)-1])
+
+  mgr, err := pgruntime.NewManager(pgruntime.Options{
+      Scheme:    greeting.Scheme,
+      DSN:       dsn,
+      BucketIDs: myBuckets(ordinal, replicaCount),
+      BucketAssigner: func(ns, _ string) int {
+          return int(crc32.ChecksumIEEE([]byte(ns))) % totalBuckets
+      },
+  })
+  ```
+
+  `BucketIDs` controls which buckets this replica **reads and watches**.
+  `BucketAssigner` controls which bucket a **new object is written to** —
+  sharding by namespace keeps all objects in a namespace co-located, which
+  is useful when parent and child resources share a namespace. The assigner
+  is the same on every replica; only `BucketIDs` differs.
+
+### 2. Validation: apiserver does it → you do it
 
 With etcd, the apiserver validates payloads against the CRD schema before
-writing. With postgres, there is no apiserver — you must validate yourself.
+writing. With postgres, there is no apiserver — if you expose an HTTP API for
+creating resources, you must validate payloads yourself. One approach is to
+embed CRD YAMLs and use `k8s.io/apiextensions-apiserver` to parse the OpenAPI
+schema and validate against it.
 
-The example uses the exact same validator the apiserver uses:
-
-```go
-// Embed CRD YAMLs, parse the OpenAPI schema, build a structural validator
-validator, _ := NewValidator()
-
-// Before every write:
-if err := validator.ValidateSpec(gvk, specJSON); err != nil {
-    return 422, err  // "spec.name: Invalid value: ..."
-}
-```
-
-This is ~130 lines in `validator.go`. It uses `k8s.io/apiextensions-apiserver`
-to parse CRD YAML into a structural schema and validate against it. The error
-messages are identical to what the apiserver produces.
-
-### 7. API surface: kubectl → HTTP (or your own)
+### 3. API surface: kubectl → HTTP (or your own)
 
 With etcd, clients use kubectl or client-go. With postgres, there is no
-apiserver serving your CRDs. You provide your own API. The example uses a
-simple HTTP server (`httpapi.go`, ~240 lines) with REST-like routes:
+apiserver serving your CRDs. If external consumers need to read or write your
+CRs, you provide your own API (e.g., an HTTP server with REST-like routes).
 
-```
-POST   /namespaces/{ns}/greetings          → Create
-GET    /namespaces/{ns}/greetings/{name}   → Get
-GET    /namespaces/{ns}/greetings          → List
-PUT    /namespaces/{ns}/greetings/{name}   → Update
-```
-
-This is optional — your controller's reconcile loop only needs
-`pgruntime.TypedClient` and the `Manager`. The HTTP API is for external
-consumers who would otherwise use kubectl.
+This is optional — your controller's reconcile loop only needs the `Manager`
+and `client.Client`. The HTTP API is for external consumers who would
+otherwise use kubectl.
 
 ## Migration checklist
 
-1. **Replace type boilerplate with plain structs** — delete deepcopy methods,
-   scheme registration, `metav1.ObjectMeta` embedding. Define simple Go structs
-   for spec and status fields.
+1. **Replace bootstrap code** — swap `ctrl.NewManager` for
+   `pgruntime.NewManager` with your DSN and scheme. Connection pooling and
+   schema migration are handled automatically. Types, `client.Client`,
+   error handling, and `SetupWithManager` all work unchanged.
 
-2. **Replace `client.Client` with `pgruntime.TypedClient[S, T]`** — one typed
-   client per GVK. Update all CRUD calls to the new signatures (see table
-   above). Access `.Spec` and `.Status` directly on the returned
-   `TypedObject` — no `json.Unmarshal` needed.
+2. **Add CRD validation** (if exposing an HTTP API) — embed CRD YAMLs and
+   validate payloads before writes since there is no apiserver to do it.
 
-3. **Replace error checks** — `errors.IsNotFound(err)` → `err == pgruntime.ErrNotFound`,
-   etc.
+3. **Add an HTTP API** (if needed) — if external consumers need to read or
+   write your CRs, expose an HTTP server that wraps `mgr.GetClient()`.
 
-4. **Replace `SetupWithManager` with `NewControllerFor`** — implement the
-   `Reconciler[S, T]` interface, use `Watches()` for cross-type triggers,
-   call `Complete()` to register with the Manager. The Manager handles
-   list-watch-relist loops and the work queue internally.
-
-5. **Add bootstrap code** — connect to postgres, migrate schema, create typed
-   clients, create a `Manager`.
-
-6. **Add CRD validation** — embed CRD YAMLs, build a `Validator`, call
-   `ValidateSpec`/`ValidateStatus` before every write in the HTTP API layer.
-
-7. **Add an HTTP API** (if needed) — if external consumers need to read or
-   write your CRs, expose an HTTP server that wraps `pgruntime.Client` (use
-   `typedClient.Untyped()` to get the raw client).
-
-8. **Update deployment manifest** — remove RBAC (ServiceAccount, ClusterRole,
+4. **Update deployment manifest** — remove RBAC (ServiceAccount, ClusterRole,
    ClusterRoleBinding). Add postgres connection env vars.

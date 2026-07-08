@@ -19,6 +19,23 @@ func main() {
 		dsn = "postgres://greeting:greeting@localhost:5432/greetings?sslmode=disable"
 	}
 
+	// For multi-replica deployments, configure BucketIDs and BucketAssigner
+	// to partition work across replicas. BucketAssigner is called on Create to
+	// decide which bucket a new object is written to. It must be deterministic.
+	//
+	// Shard by object (namespace + name):
+	//
+	//   BucketAssigner: func(ns, name string) int {
+	//       return int(crc32.ChecksumIEEE([]byte(ns+"/"+name))) % totalBuckets
+	//   },
+	//
+	// Shard by namespace only (all objects in a namespace land in the same bucket):
+	//
+	//   BucketAssigner: func(ns, _ string) int {
+	//       return int(crc32.ChecksumIEEE([]byte(ns))) % totalBuckets
+	//   },
+	//
+	// By default, a single bucket (0) is used — suitable for single-replica controllers.
 	mgr, err := pgruntime.NewManager(pgruntime.Options{
 		Scheme: greeting.Scheme,
 		DSN:    dsn,
