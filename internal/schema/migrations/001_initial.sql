@@ -86,6 +86,7 @@ BEGIN
          WHERE kr.gvk = p_gvk AND kr.namespace = p_namespace AND kr.name = p_name;
 
         IF FOUND THEN
+            -- Branch: WriteStatus — compare status only
             IF p_status_only THEN
                 IF v_existing.status = p_status THEN
                     v_suppress_us := extract(microseconds from clock_timestamp() - v_t0)::BIGINT;
@@ -93,6 +94,7 @@ BEGIN
                         v_suppress_us, v_counter_us, v_upsert_us;
                     RETURN;
                 END IF;
+            -- Branch: Write/WriteObject — compare spec+metadata+deletion_ts, and status if non-NULL
             ELSE
                 IF v_existing.spec = p_spec
                    AND (p_status IS NULL OR v_existing.status = p_status)
@@ -117,8 +119,13 @@ BEGIN
     RETURNING current_seq INTO v_seq;
     v_counter_us := extract(microseconds from clock_timestamp() - v_t0)::BIGINT;
 
-    -- 3. Upsert
+    -- 3. Upsert — three mutually exclusive branches:
+    --    a) p_status_only            → WriteStatus (update status only, version > 0)
+    --    b) p_expected_version = 0   → Create (with tombstone revival on conflict)
+    --    c) else                     → Update via Write/WriteObject
     v_t0 := clock_timestamp();
+
+    -- Branch A: WriteStatus
     IF p_status_only THEN
         IF p_expected_version = 0 THEN
             RAISE EXCEPTION 'WriteStatus requires ExpectedVersion > 0' USING ERRCODE = 'P0004';
@@ -136,6 +143,7 @@ BEGIN
         IF NOT FOUND THEN
             RAISE EXCEPTION 'conflict' USING ERRCODE = 'P0002';
         END IF;
+    -- Branch B: Create (p_expected_version = 0)
     ELSIF p_expected_version = 0 THEN
         BEGIN
             INSERT INTO kubernetes_resources
@@ -169,6 +177,8 @@ BEGIN
                 RAISE EXCEPTION 'already exists' USING ERRCODE = 'P0003';
             END IF;
         END;
+    -- Branch C: Update via Write/WriteObject (p_expected_version > 0)
+    -- COALESCE(p_status, status) preserves existing status when p_status is NULL (WriteObject)
     ELSE
         UPDATE kubernetes_resources
            SET gvk_bucket_seq     = v_seq,
