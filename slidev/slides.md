@@ -53,7 +53,7 @@ layout: section
 <div class="grid grid-cols-2 gap-8">
 <div>
 
-### The problems
+### The Challenges
 
 - **Adapters were hard to develop and debug**
   - Adapter development became the bottleneck for our progress
@@ -95,7 +95,8 @@ The only reason we hadn't just used Kubernetes was **etcd management**.
 
 So we studied the direct route for a week: **controllers + kube-apiserver + etcd**
 
-|  |  |
+
+|  **Challenges**  | |
 | --- | --- |
 | **PITR** | Point-in-time recovery for application state living in etcd |
 | **etcd scalability** | ~8 GB ceiling ⇒ sharding across multiple etcds |
@@ -146,12 +147,6 @@ One counter per resource type
 </div>
 
 </v-click>
-
-<!--
-This is the crux slide: the reason we never seriously considered Postgres before.
-Commit ordering seems to require a serialization point, and the obvious
-serialization points don't scale.
--->
 
 ---
 layout: section
@@ -265,10 +260,6 @@ mgr.Start(ctx)
 - Standard `manager.Manager` comes back — reconcile loops, `Owns()` watches, optimistic concurrency all behave as they always have
 - Full migration guide with a line-count breakdown and step-by-step checklist in `examples/README.md`
 
-<!--
-Live-demo candidate: show the side-by-side diff of the two example controllers.
--->
-
 ---
 
 # Mapping CLM components
@@ -287,11 +278,6 @@ Live-demo candidate: show the side-by-side diff of the two example controllers.
 
 </v-click>
 
-<!--
-One database, N controllers. Everything between them is gone.
-(An API server fronting the database is planned — it's just another writer using the library.)
--->
-
 ---
 
 # Is this generalizable?
@@ -307,11 +293,19 @@ Any system that follows the **reconciler pattern against kube-apiserver + etcd**
 
 <div class="mt-8"></div>
 
-## ⚠️ Pitfall: this *feels* like kube, but it is not kube
+## ⚠️ Pitfall: this *feels* like Kube, but it is not Kube
 
+WIP:
+- cluster-wide resources (nullable namespace)
+- gvk's without buckets (nullable buckets)
+- Owner-reference GC cascade
+- CRD validation (client-side)
+
+Not supported:
 - No admission webhooks
 - No RBAC
-- No owner-reference GC cascade (for now)
+- CRD validation (server-side)
+- Server-side apply
 
 **Mitigation:** keep clear documentation of what **IS** supported vs what is **NOT**.
 
@@ -328,7 +322,7 @@ layout: center
 - **The proposal:**
   - controller-runtime controllers on plain Postgres
   - buckets make the watch contract scale.
-- **Why:** we want **controller-runtime** operator semantics **without operating etcd**.
+- **Why:** we want **controller-runtime** ecosystem and operator semantics **without operating etcd**.
 - **Why removal of CLM:** Same guarantees achieved with **fewer components** and **increased developer velocity**.
 - **Perfscale** 2xlarge **~9.6k writes/s** measured (**~200/s** needed).
 
