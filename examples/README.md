@@ -109,11 +109,11 @@ New concepts with no etcd equivalent:
 - **Unsharded GVKs** — `Options.UnshardedGVKs` lists GVKs that bypass bucket
   sharding entirely. These are assigned to sentinel bucket `-1`, which every
   replica watches regardless of its `BucketIDs` slice. Use this for
-  cluster-wide configuration resources that all pods need to see (e.g., a
-  ManagementCluster registry). Unsharded GVKs are registered as cluster-scoped
-  in the REST mapper. **Trade-off:** every pod's informer polls bucket `-1`,
-  so high-churn unsharded GVKs amplify database reads across all replicas.
-  Best suited for small, rarely-changing configuration resources.
+  configuration resources that all pods need to see (e.g., a ManagementCluster
+  registry). Unsharded GVKs can be namespaced or cluster-scoped — the sharding
+  behavior is independent of scope. **Trade-off:** every pod's informer polls
+  bucket `-1`, so high-churn unsharded GVKs amplify database reads across all
+  replicas. Best suited for small, rarely-changing configuration resources.
 
 ### 2. Validation: apiserver does it → you do it
 

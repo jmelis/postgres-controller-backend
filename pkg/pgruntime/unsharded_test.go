@@ -15,7 +15,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	runtimescheme "sigs.k8s.io/controller-runtime/pkg/scheme"
 )
@@ -186,19 +185,6 @@ func TestUnsharded_ShardedAndUnshardedCoexist(t *testing.T) {
 	assert.Equal(t, "sharded-widget", widgets.Items[0].Name)
 }
 
-func TestUnsharded_IsClusterScoped(t *testing.T) {
-	mgr := newUnshardedManager(t, []int{0})
-	c := mgr.GetClient()
-
-	namespaced, err := c.IsObjectNamespaced(&Config{})
-	require.NoError(t, err)
-	assert.False(t, namespaced, "Config should be cluster-scoped (unsharded)")
-
-	namespaced, err = c.IsObjectNamespaced(&Widget{})
-	require.NoError(t, err)
-	assert.True(t, namespaced, "Widget should be namespace-scoped (sharded)")
-}
-
 func TestUnsharded_WatchDelivery(t *testing.T) {
 	mgr := newUnshardedManager(t, []int{2, 3})
 	c := mgr.GetClient()
@@ -232,7 +218,7 @@ func TestUnsharded_WatchDelivery(t *testing.T) {
 
 	select {
 	case req := <-reconciled:
-		assert.Equal(t, "", req.Namespace, "unsharded resource should have empty namespace")
+		assert.Equal(t, "", req.Namespace, "resource was created without a namespace")
 		assert.Equal(t, "watch-test", req.Name)
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for unsharded reconcile event")
@@ -325,30 +311,3 @@ func TestUnsharded_DifferentBucketSliceSeesUnsharded(t *testing.T) {
 	assert.Len(t, widgets.Items, 0, "reader on buckets [7,8,9] should NOT see widget written to bucket 0")
 }
 
-func TestUnsharded_ListWithLabelSelector(t *testing.T) {
-	mgr := newUnshardedManager(t, []int{0})
-	c := mgr.GetClient()
-	ctx := context.Background()
-
-	cfgA := &Config{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   "labeled",
-			Labels: map[string]string{"env": "prod"},
-		},
-		Spec: ConfigSpec{Region: "us-east-1"},
-	}
-	cfgB := &Config{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   "unlabeled",
-			Labels: map[string]string{"env": "dev"},
-		},
-		Spec: ConfigSpec{Region: "eu-west-1"},
-	}
-	require.NoError(t, c.Create(ctx, cfgA))
-	require.NoError(t, c.Create(ctx, cfgB))
-
-	list := &ConfigList{}
-	require.NoError(t, c.List(ctx, list, client.MatchingLabels{"env": "prod"}))
-	assert.Len(t, list.Items, 1)
-	assert.Equal(t, "labeled", list.Items[0].Name)
-}

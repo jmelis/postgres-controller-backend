@@ -87,7 +87,7 @@ func NewManager(opts Options) (manager.Manager, error) {
 
 	unshardedMap := buildUnshardedMap(opts.UnshardedGVKs)
 
-	restMapper := buildRESTMapper(opts.Scheme, unshardedMap)
+	restMapper := buildRESTMapper(opts.Scheme)
 
 	pgclient := &pgClient{
 		scheme:     opts.Scheme,
@@ -290,17 +290,13 @@ func buildUnshardedMap(gvks []schema.GroupVersionKind) map[schema.GroupVersionKi
 	return m
 }
 
-func buildRESTMapper(s *runtime.Scheme, unsharded map[schema.GroupVersionKind]bool) meta.RESTMapper {
+func buildRESTMapper(s *runtime.Scheme) meta.RESTMapper {
 	mapper := meta.NewDefaultRESTMapper(s.PrioritizedVersionsAllGroups())
 	for gvk := range s.AllKnownTypes() {
 		if strings.HasSuffix(gvk.Kind, "List") || gvk.Kind == "" {
 			continue
 		}
-		if unsharded[gvk] {
-			mapper.Add(gvk, meta.RESTScopeRoot)
-		} else {
-			mapper.Add(gvk, meta.RESTScopeNamespace)
-		}
+		mapper.Add(gvk, meta.RESTScopeNamespace)
 	}
 	return mapper
 }
@@ -385,7 +381,7 @@ func NewClient(opts Options) (client.Client, func(), error) {
 		assign:     opts.BucketAssigner,
 		bucketIDs:  opts.BucketIDs,
 		unsharded:  unshardedMap,
-		restMapper: buildRESTMapper(opts.Scheme, unshardedMap),
+		restMapper: buildRESTMapper(opts.Scheme),
 	}
 
 	return c, pool.Close, nil
