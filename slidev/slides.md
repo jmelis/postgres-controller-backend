@@ -262,6 +262,29 @@ mgr.Start(ctx)
 
 ---
 
+# Scaling out: bucket assignment
+
+<div/>
+
+Single replica? The defaults (one bucket, ID 0) just work. For multi-replica, each replica claims a slice of the bucket space:
+
+```go
+mgr, _ := pgruntime.NewManager(pgruntime.Options{
+    Scheme:    scheme,
+    DSN:       dsn,
+    BucketIDs: myBuckets(ordinal, replicaCount), // which buckets this replica watches
+    BucketAssigner: func(ns, _ string) int {     // which bucket a new object is written to
+        return int(crc32.ChecksumIEEE([]byte(ns))) % totalBuckets
+    },
+})
+```
+
+- **`BucketIDs`** — derived from the pod ordinal; each replica gets a non-overlapping slice
+- **`BucketAssigner`** — same function on every replica; sharding by namespace keeps parent + children co-located
+- Full example with StatefulSet ordinal parsing in `examples/README.md`
+
+---
+
 # Mapping CLM components
 
 | | |
