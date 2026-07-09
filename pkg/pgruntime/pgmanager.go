@@ -3,9 +3,11 @@ package pgruntime
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -39,6 +41,8 @@ type Options struct {
 	Logger                 logr.Logger
 	MaxPoolConns           int32
 	MinPoolConns           int32
+	SlowQueryThreshold     time.Duration
+	SlowQueryLogger        *slog.Logger
 	HealthProbeBindAddress string
 }
 
@@ -315,20 +319,24 @@ func (r *noopEventsRecorder) Eventf(regarding runtime.Object, related runtime.Ob
 }
 
 func createPool(ctx context.Context, opts Options) (*pgxpool.Pool, error) {
-	if opts.MaxPoolConns > 0 || opts.MinPoolConns > 0 {
-		config, err := pgxpool.ParseConfig(opts.DSN)
-		if err != nil {
-			return nil, fmt.Errorf("parse DSN: %w", err)
-		}
-		if opts.MaxPoolConns > 0 {
-			config.MaxConns = opts.MaxPoolConns
-		}
-		if opts.MinPoolConns > 0 {
-			config.MinConns = opts.MinPoolConns
-		}
-		return pgxpool.NewWithConfig(ctx, config)
+	config, err := pgxpool.ParseConfig(opts.DSN)
+	if err != nil {
+		return nil, fmt.Errorf("parse DSN: %w", err)
 	}
-	return pgxpool.New(ctx, opts.DSN)
+	if opts.MaxPoolConns > 0 {
+		config.MaxConns = opts.MaxPoolConns
+	}
+	if opts.MinPoolConns > 0 {
+		config.MinConns = opts.MinPoolConns
+	}
+	if opts.SlowQueryThreshold > 0 {
+		logger := opts.SlowQueryLogger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		config.ConnConfig.Tracer = NewSlowQueryTracer(opts.SlowQueryThreshold, logger)
+	}
+	return pgxpool.NewWithConfig(ctx, config)
 }
 
 // NewClient creates a standalone client.Client backed by PostgreSQL, without
