@@ -20,6 +20,10 @@ type slowQueryTracer struct {
 	logger    *slog.Logger
 }
 
+func NewSlowQueryTracer(threshold time.Duration, logger *slog.Logger) pgx.QueryTracer {
+	return &slowQueryTracer{threshold: threshold, logger: logger}
+}
+
 func (t *slowQueryTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
 	return context.WithValue(ctx, traceContextKey{}, traceData{start: time.Now(), sql: data.SQL})
 }

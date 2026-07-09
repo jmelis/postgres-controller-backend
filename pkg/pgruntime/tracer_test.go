@@ -8,36 +8,32 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jmelis/postgres-controller-backend/pkg/pgruntime"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 )
+
+func newTracedPool(t *testing.T, threshold time.Duration, logger *slog.Logger) *pgxpool.Pool {
+	t.Helper()
+	config, err := pgxpool.ParseConfig(sharedDB.ConnStr)
+	require.NoError(t, err)
+	config.ConnConfig.Tracer = pgruntime.NewSlowQueryTracer(threshold, logger)
+
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	return pool
+}
 
 func TestSlowQueryTracer_LogsSlowQuery(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-
-	conn := sharedDB.Connect(t)
-	sharedDB.TruncateAll(t, conn)
-	conn.Close(context.Background())
-
-	c, cleanup, err := pgruntime.NewClient(pgruntime.Options{
-		Scheme:             testScheme,
-		DSN:                sharedDB.ConnStr,
-		SlowQueryThreshold: time.Nanosecond,
-		SlowQueryLogger:    logger,
-	})
-	require.NoError(t, err)
-	defer cleanup()
+	pool := newTracedPool(t, 500*time.Millisecond, logger)
 
 	ctx := context.Background()
-	w := &Widget{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "tracer-test"},
-		Spec:       WidgetSpec{Color: "blue"},
-	}
-	require.NoError(t, c.Create(ctx, w))
+	_, err := pool.Exec(ctx, "SELECT pg_sleep(1)")
+	require.NoError(t, err)
 
 	lines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
 	require.NotEmpty(t, lines, "expected at least one log line")
@@ -53,86 +49,98 @@ func TestSlowQueryTracer_LogsSlowQuery(t *testing.T) {
 	pid, ok := entry["pg_pid"].(float64)
 	require.True(t, ok, "pg_pid should be a number")
 	assert.Greater(t, pid, float64(0), "pg_pid should be positive")
+
+	sql, ok := entry["sql"].(string)
+	require.True(t, ok)
+	assert.Contains(t, sql, "pg_sleep")
 }
 
 func TestSlowQueryTracer_NoLogBelowThreshold(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-
-	conn := sharedDB.Connect(t)
-	sharedDB.TruncateAll(t, conn)
-	conn.Close(context.Background())
-
-	c, cleanup, err := pgruntime.NewClient(pgruntime.Options{
-		Scheme:             testScheme,
-		DSN:                sharedDB.ConnStr,
-		SlowQueryThreshold: time.Hour,
-		SlowQueryLogger:    logger,
-	})
-	require.NoError(t, err)
-	defer cleanup()
+	pool := newTracedPool(t, 5*time.Second, logger)
 
 	ctx := context.Background()
-	w := &Widget{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "fast-query"},
-		Spec:       WidgetSpec{Color: "green"},
-	}
-	require.NoError(t, c.Create(ctx, w))
+	_, err := pool.Exec(ctx, "SELECT 1")
+	require.NoError(t, err)
 
 	assert.Empty(t, buf.String(), "no log should be emitted for fast queries")
+}
+
+func TestSlowQueryTracer_PIDMatchesBackend(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	config, err := pgxpool.ParseConfig(sharedDB.ConnStr)
+	require.NoError(t, err)
+	config.MaxConns = 1
+	config.ConnConfig.Tracer = pgruntime.NewSlowQueryTracer(500*time.Millisecond, logger)
+
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+
+	ctx := context.Background()
+
+	var backendPID uint32
+	err = pool.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&backendPID)
+	require.NoError(t, err)
+
+	buf.Reset()
+
+	_, err = pool.Exec(ctx, "SELECT pg_sleep(1)")
+	require.NoError(t, err)
+
+	lines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
+	require.NotEmpty(t, lines)
+
+	var entry map[string]any
+	require.NoError(t, json.Unmarshal(lines[0], &entry))
+
+	loggedPID, ok := entry["pg_pid"].(float64)
+	require.True(t, ok)
+	assert.Equal(t, uint32(loggedPID), backendPID, "logged PID should match pg_backend_pid()")
 }
 
 func TestSlowQueryTracer_IncludesErrorOnFailure(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
 
-	conn := sharedDB.Connect(t)
-	sharedDB.TruncateAll(t, conn)
-	conn.Close(context.Background())
-
-	c, cleanup, err := pgruntime.NewClient(pgruntime.Options{
-		Scheme:             testScheme,
-		DSN:                sharedDB.ConnStr,
-		SlowQueryThreshold: time.Nanosecond,
-		SlowQueryLogger:    logger,
-	})
+	config, err := pgxpool.ParseConfig(sharedDB.ConnStr)
 	require.NoError(t, err)
-	defer cleanup()
+	config.ConnConfig.Tracer = pgruntime.NewSlowQueryTracer(500*time.Millisecond, logger)
+	config.ConnConfig.RuntimeParams = map[string]string{
+		"statement_timeout": "1000",
+	}
+
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
 
 	ctx := context.Background()
-	_ = c.Get(ctx, types.NamespacedName{Namespace: "default", Name: "nonexistent"}, &Widget{})
+	_, err = pool.Exec(ctx, "SELECT pg_sleep(2)")
+	require.Error(t, err)
 
 	lines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
 	require.NotEmpty(t, lines)
 
-	for _, line := range lines {
-		var entry map[string]any
-		if err := json.Unmarshal(line, &entry); err != nil {
-			continue
-		}
-		if sql, ok := entry["sql"].(string); ok && len(sql) > 10 {
-			assert.Contains(t, entry, "pg_pid")
-			return
-		}
-	}
+	var entry map[string]any
+	require.NoError(t, json.Unmarshal(lines[0], &entry))
+
+	assert.Equal(t, "slow query", entry["msg"])
+	assert.Contains(t, entry, "pg_pid")
+	assert.Contains(t, entry, "err")
 }
 
 func TestSlowQueryTracer_Disabled(t *testing.T) {
-	conn := sharedDB.Connect(t)
-	sharedDB.TruncateAll(t, conn)
-	conn.Close(context.Background())
-
-	c, cleanup, err := pgruntime.NewClient(pgruntime.Options{
-		Scheme: testScheme,
-		DSN:    sharedDB.ConnStr,
-	})
+	config, err := pgxpool.ParseConfig(sharedDB.ConnStr)
 	require.NoError(t, err)
-	defer cleanup()
+
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
 
 	ctx := context.Background()
-	w := &Widget{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "no-tracer"},
-		Spec:       WidgetSpec{Color: "red"},
-	}
-	require.NoError(t, c.Create(ctx, w))
+	_, err = pool.Exec(ctx, "SELECT 1")
+	require.NoError(t, err)
 }

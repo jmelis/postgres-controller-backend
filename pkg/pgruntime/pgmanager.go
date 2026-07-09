@@ -334,10 +334,7 @@ func createPool(ctx context.Context, opts Options) (*pgxpool.Pool, error) {
 		if logger == nil {
 			logger = slog.Default()
 		}
-		config.ConnConfig.Tracer = &slowQueryTracer{
-			threshold: opts.SlowQueryThreshold,
-			logger:    logger,
-		}
+		config.ConnConfig.Tracer = NewSlowQueryTracer(opts.SlowQueryThreshold, logger)
 	}
 	return pgxpool.NewWithConfig(ctx, config)
 }
