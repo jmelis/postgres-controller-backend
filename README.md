@@ -163,6 +163,7 @@ The [`examples/`](examples/) directory contains the same controller implemented 
 
 ## Documentation
 
+- [COMPATIBILITY.md](COMPATIBILITY.md) — honest inventory of what does not work when migrating a controller-runtime controller: every gap, its current behavior, the fix, and the fix's difficulty
 - [DESIGN.md](DESIGN.md) — full design: invariant catalog (I1–I6), race catalog (R2–R5, R7–R10, R12–R18), sizing, certification plan
 - [WALKTHROUGH.md](WALKTHROUGH.md) — narrative explanation of why each mechanism exists and how the pieces fit together
 - [ARCHITECTURE_COMPARISON.md](ARCHITECTURE_COMPARISON.md) — this direct-to-Postgres design vs. an intermediated REST-API architecture (reliability, consistency, operational surface)
