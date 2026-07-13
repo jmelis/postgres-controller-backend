@@ -22,6 +22,7 @@ layout: default
 </style>
 
 ---
+
 layout: section
 ---
 
@@ -95,11 +96,10 @@ The only reason we hadn't just used Kubernetes was **etcd management**.
 
 So we studied the direct route for a week: **controllers + kube-apiserver + etcd**
 
-
-|  **Challenges**  | |
-| --- | --- |
-| **PITR** | Point-in-time recovery for application state living in etcd |
-| **etcd scalability** | ~8 GB ceiling ⇒ sharding across multiple etcds |
+| **Challenges**       |                                                             |
+| -------------------- | ----------------------------------------------------------- |
+| **PITR**             | Point-in-time recovery for application state living in etcd |
+| **etcd scalability** | ~8 GB ceiling ⇒ sharding across multiple etcds              |
 
 </v-click>
 
@@ -117,7 +117,7 @@ We assumed we **couldn't have kube semantics on Postgres**.
 
 <v-click>
 
-The hard part is the watch contract: a **commit-ordered event stream** per resource type. With naive sequences, a transaction can take seq *N* but commit **after** *N+1* — a watcher advances past *N* and misses it **forever**.
+The hard part is the watch contract: a **commit-ordered event stream** per resource type. With naive sequences, a transaction can take seq _N_ but commit **after** _N+1_ — a watcher advances past _N_ and misses it **forever**.
 
 The watch contract is the **core correctness invariant** of the reconciler pattern, and Postgres doesn't provide it out of the box. Concurrent writes can commit out of order, creating gaps that silently swallow events.
 
@@ -151,6 +151,7 @@ One counter per resource type
 </v-click>
 
 ---
+
 layout: section
 ---
 
@@ -191,11 +192,11 @@ Distributing work across controller replicas is a well-understood pattern — co
 
 AWS RDS Multi-AZ (synchronous commit), stored-procedure write path, 64 buckets:
 
-| Instance | vCPU | Writes/s | p50 | p99 |
-| --- | --- | --- | --- | --- |
-| db.m6g.large | 2 | 2,852 | 20.0 ms | 68.5 ms |
+| Instance           | vCPU  | Writes/s  | p50        | p99         |
+| ------------------ | ----- | --------- | ---------- | ----------- |
+| db.m6g.large       | 2     | 2,852     | 20.0 ms    | 68.5 ms     |
 | **db.m6g.2xlarge** | **8** | **9,622** | **6.1 ms** | **13.2 ms** |
-| db.m6g.8xlarge | 32 | 11,728 | 5.0 ms | 7.7 ms |
+| db.m6g.8xlarge     | 32    | 11,728    | 5.0 ms     | 7.7 ms      |
 
 <v-click>
 
@@ -291,14 +292,14 @@ mgr, _ := pgruntime.NewManager(pgruntime.Options{
 
 # Mapping CLM components
 
-| | |
-| --- | --- |
+|                         |                                                              |
+| ----------------------- | ------------------------------------------------------------ |
 | **Database (Postgres)** | ✅ Retained — scope expanded (stored procedures, write path) |
-| **Adapters** | ➡️ Become `controller-runtime` controllers with PG backend |
-| **CLM API** | ❌ Removed (some functionality absorbed by other components) |
-| **Sentinel** | ❌ Removed — sharding handled by controllers |
-| **Broker** | ❌ Removed |
-| **PG client library** | 🆕 New — manager, client, cache targeting Postgres |
+| **Adapters**            | ➡️ Become `controller-runtime` controllers with PG backend   |
+| **CLM API**             | ❌ Removed (some functionality absorbed by other components) |
+| **Sentinel**            | ❌ Removed — sharding handled by controllers                 |
+| **Broker**              | ❌ Removed                                                   |
+| **PG client library**   | 🆕 New — manager, client, cache targeting Postgres           |
 
 ## Fewer components — but some have grown in scope.
 
@@ -317,7 +318,7 @@ Any system that follows the **reconciler pattern against kube-apiserver + etcd**
 
 <br/>
 
-## ⚠️ Pitfall: this *feels* like Kube, but it is not Kube
+## ⚠️ Pitfall: this _feels_ like Kube, but it is not Kube
 
 <div class="grid grid-cols-2 gap-6 mt-4">
 <div>
@@ -366,6 +367,7 @@ GCP and ROSA implementations align on:
 </v-click>
 
 ---
+
 layout: center
 ---
 
@@ -379,6 +381,7 @@ layout: center
 - **Confidence:** scalable, performant, and correct, with correctness tests and continuous verification
 
 ---
+
 layout: center
 ---
 
@@ -391,6 +394,7 @@ Repo: [postgres-controller-backend](https://github.com/jmelis/postgres-controlle
 [DESIGN.md](https://github.com/jmelis/postgres-controller-backend/blob/main/DESIGN.md) · [WALKTHROUGH.md](https://github.com/jmelis/postgres-controller-backend/blob/main/WALKTHROUGH.md) · [ARCHITECTURE_COMPARISON.md](https://github.com/jmelis/postgres-controller-backend/blob/main/ARCHITECTURE_COMPARISON.md) · [loadtest/README.md](https://github.com/jmelis/postgres-controller-backend/blob/main/loadtest/README.md)
 
 ---
+
 layout: section
 ---
 
@@ -404,25 +408,29 @@ Technical deep dives
 
 <div/>
 
-**Polling is the correctness mechanism; the doorbell only changes *when* a poll happens.**
+**Polling is the correctness mechanism; the doorbell only changes _when_ a poll happens.**
 
 <div class="grid grid-cols-2 gap-6">
 <div>
 
 ### List
-- One `REPEATABLE READ` transaction: read epoch + counters (build the resourceVersion), then the rows
+
+- One `REPEATABLE READ` transaction: read counters (build the resourceVersion), then the rows
 - Snapshot and RV are the same instant — no skew window handing off into Watch
 
 ### resourceVersion
+
 ```
-e7|b2:1044,b5:902,b9:4123
+b2:1044,b5:902,b9:4123
 ```
-Timeline **epoch** + per-bucket high-water-mark **vector**. Failover bumps the epoch ⇒ stale watchers get `410 Gone` and relist — never a silent miss.
+
+Per-bucket high-water-mark **vector**. Failover safety relies on RDS Multi-AZ synchronous replication (no committed-write loss). On restore, restarting pods forces a relist.
 
 </div>
 <div>
 
 ### Watch
+
 - Single-goroutine poll loop per watcher: `SELECT … WHERE seq > hwm ORDER BY seq`
 - **Baseline poll every 5 s** — the sole guarantee
 - `LISTEN/NOTIFY` doorbell requests an early poll (100 ms debounce, leading + trailing edge)
@@ -440,10 +448,12 @@ Timeline **epoch** + per-bucket high-water-mark **vector**. Failover bumps the e
 <div>
 
 ### Client-side partitioning
+
 - A caller-supplied function maps (namespace, name) → bucket; the DB stores the ID and never re-shards
 - Bucket topology is part of the shared writer configuration, fixed for the deployment's life
 
 ### Per-(GVK, bucket) commit-ordered counters
+
 ```sql
 INSERT INTO gvk_bucket_counters …
 ON CONFLICT (bucket_id, gvk)
@@ -454,10 +464,12 @@ DO UPDATE SET current_seq = current_seq + 1
 <div>
 
 ### Why it's correct
+
 - The counter update takes an **exclusive row lock held until COMMIT** ⇒ commit order **=** sequence order, and aborts leave no gaps
 - That lock is also the throughput ceiling **per bucket** — which is exactly why many buckets scale near-linearly
 
 ### Why it's fast
+
 - `fillfactor = 50` keeps the hottest rows HOT-updatable
 - Counters created on first use — no global sequence anywhere
 
@@ -478,12 +490,12 @@ DO UPDATE SET current_seq = current_seq + 1
 
 ### Sizing
 
-| Tier | Steady RPS | Buckets needed |
-| --- | --- | --- |
-| 5,000 clusters | 187 | 1 |
-| 50,000 clusters | 1,870 | 4–8 |
+| Tier            | Steady RPS | Buckets needed |
+| --------------- | ---------- | -------------- |
+| 5,000 clusters  | 187        | 1              |
+| 50,000 clusters | 1,870      | 4–8            |
 
-Recommended default: **16 buckets**. Expanding later = epoch-bump migration — the same mechanism as failover: all watchers get `410`, relist, carry on.
+Recommended default: **16 buckets**. Expanding later = configuration change — all watchers relist on restart.
 
 </v-click>
 
@@ -511,6 +523,6 @@ SELECT pg_notify('resource_changes_b' || bucket, '');
 
 <v-click>
 
-**Why:** 3 round-trips → 1, and `pg_notify` moved outside the txn (its queue lock serializes *all* concurrent commits). Together: **~41% more per-bucket throughput** and near-linear multi-bucket scaling.
+**Why:** 3 round-trips → 1, and `pg_notify` moved outside the txn (its queue lock serializes _all_ concurrent commits). Together: **~41% more per-bucket throughput** and near-linear multi-bucket scaling.
 
 </v-click>

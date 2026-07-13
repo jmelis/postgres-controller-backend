@@ -53,7 +53,7 @@ instrumentation with zero overhead.
 | `pgctl_verifier_violations_total`        | Counter   | `invariant` | Invariant violations detected (I2, I3, I4, I5). Any non-zero value should page.                               |
 | `pgctl_verifier_events_checked_total`    | Counter   | —           | Total events processed by the verifier.                                                                       |
 
-**Invariant label values:** `I2` (non-monotonic sequence), `I3` (duplicate delivery), `I4` (epoch mismatch), `I5` (below-horizon gap).
+**Invariant label values:** `I2` (non-monotonic sequence), `I3` (duplicate delivery), `I5` (below-horizon gap).
 
 ---
 

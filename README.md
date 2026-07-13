@@ -25,7 +25,7 @@ Four ideas carry the whole design:
 - **Buckets.** Resources are partitioned client-side: a caller-supplied function maps each object (namespace, name) to one of N buckets. The database stores whatever bucket ID it's given and never re-shards. The bucket is the unit of write concurrency and event ordering. GVKs listed in `UnshardedGVKs` bypass the assigner and use sentinel bucket `-1`, which every replica watches — useful for cluster-wide configuration resources that all pods need to see.
 - **Commit-ordered sequences.** Each `(GVK, bucket)` pair has its own counter, created on first use — no global sequence bottleneck. Within a bucket, sequence order equals commit order — if seq N is visible, every seq before it is also visible — so watchers get a commit-ordered event stream.
 - **Poll-primary watch.** Watchers _pull_ events from the table; the LISTEN/NOTIFY doorbell is a latency-only optimization. Total notification loss costs latency (bounded by the baseline poll, 5s default), never events.
-- **Timeline epochs.** The resourceVersion is a timeline epoch plus a per-bucket high-water-mark vector. Failover bumps the epoch; watchers with stale positions get `410 Gone` and relist instead of silently missing events.
+- **Failover safety.** RDS Multi-AZ synchronous replication guarantees no committed sequence is ever lost across failover. On database restore from backup, restarting controller pods forces a clean relist.
 
 [WALKTHROUGH.md](WALKTHROUGH.md) develops each of these in narrative form; [DESIGN.md](DESIGN.md) is the full specification.
 
@@ -55,7 +55,7 @@ PostgreSQL 16 is the authoritative store, with:
 - **No-op write suppression** — content-equal writes consume no sequence number, emit no doorbell, and bump no `object_version`, matching Kubernetes API-server semantics where an update that changes nothing does not advance resourceVersion. Default on; `ForceWrite` opts out; `WriteResult.Changed` lets callers skip downstream side-effects
 - **Single-goroutine poll-primary watch** with LISTEN/NOTIFY doorbell as a latency-only optimization; all polling in one goroutine with snapshot-isolated (`REPEATABLE READ`) poll cycles; automatic LISTEN reconnection via `ListenConnFactory` with exponential backoff
 - **Tombstone compaction** via a single CTE (atomic delete + horizon advancement) with finalizer guard — only fully-deleted objects (no active finalizers) are compacted; dying objects with finalizers survive past retention
-- **Timeline epochs** for failover detection
+- **Failover safety** via RDS Multi-AZ synchronous replication (no committed-write loss); on restore, pod restart forces relist
 - **Prometheus instrumentation** across writer, watcher, and verifier paths ([METRICS.md](METRICS.md))
 
 ```mermaid
@@ -101,14 +101,15 @@ flowchart LR
 
 Every mechanism is justified by one of 6 named invariants (I1–I6, DESIGN.md §2) — commit-ordered sequences, no regression across failover, exactly-once watch delivery, resourceVersion monotonicity, compaction safety, optimistic concurrency.
 
-Every invariant has a corresponding race or failure scenario and a **deterministic test that forces the interleaving** — 21 tests in total (R2–R5, R7–R10, R12–R18, RB4a–f; full catalog in DESIGN.md §5):
+Every invariant has a corresponding race or failure scenario and a **deterministic test that forces the interleaving** — 21 tests in total (R2–R5, R7, R10, R12–R13, R15–R21, RB4a–f; full catalog in DESIGN.md §5):
 
-| Theme                 | Tests                      | What they prove                                                                                                                                                   |
-| --------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Sequence integrity    | R4, R5, R10, R12           | Concurrent first writes, ambiguous commits, 409 rollbacks, and concurrent spec/status writes never create duplicates or ordering violations                                      |
-| Watch delivery        | R2, R3, R13, R16, R17, R18 | No event is swallowed by debouncing, doorbell loss, rapid-doorbell coalescing, multi-bucket interleaving, or cancel/resume from the high-water mark               |
-| Compaction & failover | R7, R9, R14, R15           | Watchers behind a compaction horizon or on a stale timeline epoch get `410 Gone` (never a silent skip); mid-poll compaction is invisible under snapshot isolation |
-| No-op suppression     | RB4a–f                     | Suppressed writes consume no sequence and emit no event; real changes after a no-op sequence correctly                                                            |
+| Theme                  | Tests                      | What they prove                                                                                                                                           |
+| ---------------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Sequence integrity     | R4, R5, R10, R12           | Concurrent first writes, ambiguous commits, 409 rollbacks, and concurrent spec/status writes never create duplicates or ordering violations               |
+| Watch delivery         | R2, R3, R13, R16, R17, R18 | No event is swallowed by debouncing, doorbell loss, rapid-doorbell coalescing, multi-bucket interleaving, or cancel/resume from the high-water mark       |
+| Compaction             | R7, R15                    | Watchers behind a compaction horizon get `410 Gone` (never a silent skip); mid-poll compaction is invisible under snapshot isolation                      |
+| Optimistic concurrency | R19, R20, R21              | Concurrent writers to the same object, concurrent spec/status writers, and tombstone revival all respect `object_version` (409 on stale, no lost updates) |
+| No-op suppression      | RB4a–f                     | Suppressed writes consume no sequence and emit no event; real changes after a no-op sequence correctly                                                    |
 
 R3 and R5 additionally have Toxiproxy variants that inject network-level faults (TCP RST), including a test that verifies the doorbell fast path recovers after a connection kill.
 
@@ -144,7 +145,7 @@ Against DESIGN.md §4 sizing tiers:
 | 5,000 clusters  | 187        | 374       | 1                      |
 | 50,000 clusters | 1,870      | 3,740     | 4–8                    |
 
-Bucket count caps the maximum controller replicas. The recommended default is **16 buckets**, expandable via epoch-bump migration (same mechanism as failover — all watchers 410 + relist).
+Bucket count caps the maximum controller replicas. The recommended default is **16 buckets**, expandable by adding new bucket IDs (existing watchers relist on configuration change).
 
 ### Poll cost & delivery latency (Phase 5)
 
@@ -163,7 +164,7 @@ The [`examples/`](examples/) directory contains the same controller implemented 
 
 ## Documentation
 
-- [DESIGN.md](DESIGN.md) — full design: invariant catalog (I1–I6), race catalog (R2–R5, R7–R10, R12–R18), sizing, certification plan
+- [DESIGN.md](DESIGN.md) — full design: invariant catalog (I1–I6), race catalog (R2–R5, R7, R10, R12–R13, R15–R21), sizing, certification plan
 - [WALKTHROUGH.md](WALKTHROUGH.md) — narrative explanation of why each mechanism exists and how the pieces fit together
 - [ARCHITECTURE_COMPARISON.md](ARCHITECTURE_COMPARISON.md) — this direct-to-Postgres design vs. an intermediated REST-API architecture (reliability, consistency, operational surface)
 - [METRICS.md](METRICS.md) — Prometheus metrics reference (all `pgctl_*` metrics, labels, integration guide)
@@ -177,7 +178,7 @@ Requires: Go 1.26+, podman with a running machine (`podman machine start`).
 ```bash
 make test-unit          # Pure unit tests (resourceversion)
 make test-integration   # All DB-backed tests (schema, writer, reader, compaction, verifier)
-make test-race          # Race catalog R2–R5, R7–R10, R12–R18, RB4a–f under -race
+make test-race          # Race catalog R2–R5, R7, R10, R12–R13, R15–R21, RB4a–f under -race
 make test-toxirace      # Toxiproxy-enhanced R3/R5 + doorbell reconnect
 make test-load          # Phase 1 + Phase 5 load tests
 make test               # Unit + integration + race

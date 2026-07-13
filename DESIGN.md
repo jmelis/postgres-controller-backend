@@ -3,7 +3,7 @@
 **Status:** Proposed · **Platform:** AWS RDS PostgreSQL 16+ Multi-AZ (single region) · **Supersedes:** v3
 **Prime directive:** correctness first. Every mechanism in this document is justified by a named invariant, every invariant has a named attack (race/failure), and every attack has a named test. Performance targets are retained but subordinate.
 
-**Change from v3:** the design (§3) is carried forward essentially unchanged — poll-primary watch, doorbell as latency-only optimization, per-(GVK, bucket) commit-ordered counters, timeline epochs, tombstone compaction. v4 adds: a formal invariant catalog (§2), a spec/status split (§3.3b), a race-condition catalog with deterministic tests (§5), a continuous production invariant verifier (§6), and an expanded certification plan (§7). Sizing defaults to the 5,000-cluster tier with an in-place scale-up path to 50,000 (§4).
+**Change from v3:** the design (§3) is carried forward essentially unchanged — poll-primary watch, doorbell as latency-only optimization, per-(GVK, bucket) commit-ordered counters, tombstone compaction. v4 adds: a formal invariant catalog (§2), a spec/status split (§3.3b), a race-condition catalog with deterministic tests (§5), a continuous production invariant verifier (§6), and an expanded certification plan (§7). Sizing defaults to the 5,000-cluster tier with an in-place scale-up path to 50,000 (§4).
 
 ---
 
@@ -22,9 +22,9 @@ The system must deliver commit-ordered event streams per (GVK, bucket); survive 
 These are the properties the system promises. Everything else exists to uphold them.
 
 - **I1 — Commit-ordered sequences.** Within a (GVK, bucket), if seq(A) < seq(B) then A committed before B became visible. No watcher can observe B while A is still invisible. (Aborted transactions leave no hole because the counter increment rolls back with them.)
-- **I2 — No regression.** `current_seq` for any (GVK, bucket) never decreases — across crashes, failovers, promotions, restores. `(timeline_epoch, seq)` is strictly monotonic even in disaster scenarios.
+- **I2 — No regression.** `current_seq` for any (GVK, bucket) never decreases — across crashes, failovers, and promotions. This relies on RDS Multi-AZ synchronous replication: the standby has every committed write before it takes over, so sequence numbers never rewind. On database restore from backup, all controller pods must be restarted so caches relist from the current state.
 - **I3 — Exactly-once delivery per state.** A watcher starting from resourceVersion RV receives every object state-change with seq > RV exactly once (coalescing rapid updates to the latest state per object is permitted — Kubernetes watch semantics), with no duplicates and no losses, regardless of doorbell behavior.
-- **I4 — RV monotonicity.** The composite resourceVersion observed by any client never moves backwards, including across failover.
+- **I4 — RV monotonicity.** The composite resourceVersion observed by any client never moves backwards. Under RDS Multi-AZ synchronous replication, failover preserves all committed sequences. On database restore, restarting controller pods forces a relist from the current state.
 - **I5 — Compaction safety.** A watcher can never silently skip a compacted event: if its RV predates the compaction horizon for any bucket, it receives `410 Gone` and relists; otherwise its stream is complete.
 - **I6 — Optimistic concurrency.** An update presenting a stale `object_version` is rejected (409); no lost updates on a single object.
 
@@ -81,13 +81,7 @@ CREATE INDEX idx_resources_list
 CREATE INDEX idx_resources_watch
     ON kubernetes_resources (gvk, bucket_id, gvk_bucket_seq);  -- Poll: ordered range
 
--- 3. Failover epoch (written by promotion init hook)
-CREATE TABLE cluster_epoch (
-    singleton   BOOL PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-    timeline_id BIGINT NOT NULL
-);
-
--- 4. Compaction horizon per (bucket, GVK)
+-- 3. Compaction horizon per (bucket, GVK)
 CREATE TABLE compaction_horizon (
     bucket_id     INT    NOT NULL,
     gvk           TEXT   NOT NULL,
@@ -99,7 +93,7 @@ CREATE TABLE compaction_horizon (
 
 ### 3.2 Composite resourceVersion
 
-`e7|b2:1044,b5:902,b9:4123` — timeline epoch prefix + per-bucket high-water map. Serialization is canonical (buckets sorted ascending) so equal states compare equal. Upholds **I2/I4**: the epoch increments on every promotion, so `(epoch, seq)` is monotonic even if a sequence were somehow rewound. Stale epoch or sub-horizon seq → `410 Gone` (**I5**).
+`b2:1044,b5:902,b9:4123` — per-bucket high-water map. Serialization is canonical (buckets sorted ascending) so equal states compare equal. Sub-horizon seq → `410 Gone` (**I5**).
 
 ### 3.3 Atomic Write Path — Stored Procedure
 
@@ -174,7 +168,7 @@ Content-equal writes consume no sequence number, emit no doorbell, and bump no `
 
 ### 3.4 List
 
-Single `REPEATABLE READ` transaction: read `cluster_epoch` + counters (build RV), then live and dying resource rows ordered by `(bucket_id, gvk_bucket_seq)`, COMMIT. Fully-deleted tombstones (deletion_timestamp set, no finalizers) are excluded by the query: `AND (deletion_timestamp IS NULL OR metadata->'finalizers' != '[]'::jsonb)`. Dying objects (deletion_timestamp set, has finalizers) are included so controllers can perform cleanup — matching the Kubernetes API server's finalizer contract. Snapshot and RV are the same instant — no skew window (supports I3/I4 handoff into Watch).
+Single `REPEATABLE READ` transaction: read counters (build RV), then live and dying resource rows ordered by `(bucket_id, gvk_bucket_seq)`, COMMIT. Fully-deleted tombstones (deletion_timestamp set, no finalizers) are excluded by the query: `AND (deletion_timestamp IS NULL OR metadata->'finalizers' != '[]'::jsonb)`. Dying objects (deletion_timestamp set, has finalizers) are included so controllers can perform cleanup — matching the Kubernetes API server's finalizer contract. Snapshot and RV are the same instant — no skew window (supports I3/I4 handoff into Watch).
 
 ### 3.4b Read Model: Direct Reads vs. Cached Reads
 
@@ -200,7 +194,7 @@ For conflict resolution and ambiguous-commit read-back, the direct `Get()` (or `
 
 Polling is the correctness mechanism (**I3**); the doorbell only changes _when_ a poll happens.
 
-**Poll cycle** per (GVK, bucket): a single **REPEATABLE READ read-only transaction** per poll cycle covers the epoch check, per-bucket compaction horizon checks, and all row queries. This snapshot isolation means mid-poll compaction is invisible (B3 defense). `SELECT ... WHERE gvk=$1 AND bucket_id=$b AND gvk_bucket_seq > $hwm ORDER BY gvk_bucket_seq ASC` (served by `idx_resources_watch`, no sort). Dispatch Added/Modified/Deleted (`deletion_timestamp` set ⇒ Deleted); advance the high-water mark per row. The client layer (e.g., pgruntime) further classifies Deleted events based on finalizer state: objects with active finalizers dispatch OnUpdate (the object is dying but still visible to controllers), while objects with no finalizers dispatch OnDelete (the object is fully gone). Rapid updates to one object coalesce naturally — the delivered sequence numbers are not contiguous under coalescing, which is correct Kubernetes watch semantics (I3).
+**Poll cycle** per (GVK, bucket): a single **REPEATABLE READ read-only transaction** per poll cycle covers per-bucket compaction horizon checks and all row queries. This snapshot isolation means mid-poll compaction is invisible (B3 defense). `SELECT ... WHERE gvk=$1 AND bucket_id=$b AND gvk_bucket_seq > $hwm ORDER BY gvk_bucket_seq ASC` (served by `idx_resources_watch`, no sort). Dispatch Added/Modified/Deleted (`deletion_timestamp` set ⇒ Deleted); advance the high-water mark per row. The client layer (e.g., pgruntime) further classifies Deleted events based on finalizer state: objects with active finalizers dispatch OnUpdate (the object is dying but still visible to controllers), while objects with no finalizers dispatch OnDelete (the object is fully gone). Rapid updates to one object coalesce naturally — the delivered sequence numbers are not contiguous under coalescing, which is correct Kubernetes watch semantics (I3).
 
 **Single-goroutine scheduler** — one loop owns all polling, one timer, and local state (`lastPoll`, `doorbellPending`). The listen goroutine only forwards notifications into a 1-buffered channel; it uses a child context that is cancelled when the main loop exits, ensuring prompt shutdown on poll errors. The `hwm` map is never accessed concurrently (R13 defense).
 
@@ -208,7 +202,7 @@ Polling is the correctness mechanism (**I3**); the doorbell only changes _when_ 
 
 1. **Baseline timer: 5 s** unconditional (liveness backstop; sole guarantee under doorbell loss).
 2. **Doorbell:** `LISTEN resource_changes_b{N}`; any notification for a bucket requests an early poll.
-3. **Debounce floor 100 ms, leading + trailing edge.** If `time.Since(lastPoll) >= DebounceFloor` → leading edge, poll immediately. Otherwise → trailing edge: set `doorbellPending`, reset timer to `lastPoll + DebounceFloor`. Every poll error (including epoch mismatch) terminates `Run` uniformly — no error is silently swallowed (R14 defense).
+3. **Debounce floor 100 ms, leading + trailing edge.** If `time.Since(lastPoll) >= DebounceFloor` → leading edge, poll immediately. Otherwise → trailing edge: set `doorbellPending`, reset timer to `lastPoll + DebounceFloor`. Every poll error terminates `Run` uniformly — no error is silently swallowed.
 
 **Doorbell loss:** on any LISTEN drop (including failover) reconnect, re-LISTEN; the next baseline poll reconciles. No catch-up/stream ordering hazard exists — there is only the poll.
 
@@ -221,7 +215,7 @@ WITH deleted AS (
     DELETE FROM kubernetes_resources
     WHERE gvk = $1 AND bucket_id = $2
       AND deletion_timestamp IS NOT NULL
-      AND deletion_timestamp < now() - $retention
+      AND GREATEST(deletion_timestamp, updated_at) < now() - $retention
       AND (metadata->'finalizers' IS NULL OR metadata->'finalizers' = '[]'::jsonb)
     RETURNING gvk_bucket_seq
 )
@@ -240,9 +234,10 @@ Default retention: 24 h. Retention must exceed the slowest legitimate watcher re
 
 ### 3.7 Failover
 
-- **Unplanned:** Multi-AZ promotes the sync standby (~60–120 s). No acknowledged commit lost ⇒ I1–I2 hold by construction. All connections drop; writers run tripwires; watchers reconnect and the next baseline poll reconciles; timeline epoch increments (I4).
+- **Unplanned:** Multi-AZ promotes the sync standby (~60–120 s). No acknowledged commit lost ⇒ I1–I2 hold by construction. All connections drop; writers run tripwires; watchers reconnect and the next baseline poll reconciles.
 - **Planned:** orchestrated in a window (quiesce, verify lag 0, fail over, resume) so the reconnect surge is scheduled.
 - Async read replicas are never unplanned-promotion candidates.
+- **Restore from backup:** because a restore can legitimately rewind state, all controller pods must be restarted after a restore so caches relist from the current state. This is an operational runbook item — the restart also happens naturally since DB connections break during a restore.
 
 ## 4. Infrastructure & Sizing
 
@@ -267,11 +262,9 @@ Every entry names the invariant at stake, the interleaving, the defense, and the
 - **R5 — Ambiguous commit (I1/I3).** Connection drops during COMMIT; client doesn't know if the write landed. _Defense:_ read-back protocol (§3.3). _Test:_ proxy drops the connection after COMMIT is sent but before the OK; assert the client's read-back + retry yields exactly one committed state change and no seq is skipped or double-issued.
 - **R7 — Compaction vs. slow watcher (I5).** Watcher resumes with hwm just below a freshly advanced horizon. _Defense:_ horizon advanced transactionally with the delete; boundary check on poll. _Test:_ freeze a watcher, compact past its hwm, resume; assert `410 Gone` (never a silent gap). Also the off-by-one: hwm == horizon exactly must succeed.
 - **R8 — Failover mid-transaction (I1–I2).** Failover strikes between counter increment and COMMIT. _Defense:_ the whole txn aborts atomically; sync standby has all acknowledged commits. _Test:_ Phase 6 drill with writes in flight; assert aborted increment rolls back cleanly and no regression.
-- **R9 — RV backwards exposure (I4).** Client presents an RV from a previous timeline epoch after failover. _Defense:_ epoch comparison → `410 Gone`, relist. _Test:_ replay a pre-failover RV post-failover; assert rejection, never a partial stream.
 - **R10 — 409 handling corrupting the stream (I1).** Buggy client retries the upsert inside the same txn after a version conflict. _Defense:_ client library makes it structurally impossible (txn helper owns BEGIN/COMMIT); assert in code review + a library test that a conflict always rolls back the counter increment.
 - **R12 — Concurrent spec/status writes (I1).** Writer A writes spec, writer B writes status to the same resource. The shared counter must produce a commit-ordered sequence; the watcher must see the correct stream. _Defense:_ shared `gvk_bucket_counters` — the counter's exclusive row lock serializes sequence issuance. _Test:_ interleaved spec and status writes produce consecutive seqs {1,2,3,4}; watcher starting from hwm sees correct state.
 - **R13 — Single-goroutine poll serialization (I3).** Rapid doorbell bursts overlapping with the baseline timer must not produce concurrent poll cycles — the `hwm` map is not safe for concurrent access and concurrent polls could deliver events out of order. _Defense:_ single-goroutine scheduler (§3.5) — only one goroutine reads `hwm`, the listen goroutine only forwards into a buffered channel. _Test:_ fire 10 rapid doorbells while baseline timer is due; assert exactly one poll executes at a time and events arrive in seq order.
-- **R14 — Epoch mismatch on doorbell-triggered poll (I4/I5).** A doorbell triggers a poll after the cluster epoch has been bumped. The watcher must terminate with 410 Gone, not silently swallow the error. _Defense:_ every poll error (including epoch mismatch) causes `Run()` to return, closing the events channel — the watch adapter sees the channel close and propagates (§3.5). The listen goroutine uses a child context that is cancelled when `Run()` exits, ensuring prompt shutdown. _Test:_ start watcher, bump `cluster_epoch`, trigger a doorbell to force a poll; assert the watcher terminates and the events channel closes within 5 s.
 - **R15 — Mid-poll compaction (I5).** Compaction runs and advances the horizon while a watcher is mid-poll. The watcher must not see an inconsistent state (some rows deleted, horizon advanced, within a single poll cycle). _Defense:_ REPEATABLE READ snapshot isolation — the poll transaction sees the database as of its snapshot instant; the compaction's DELETE and horizon UPDATE are invisible within the poll cycle. _Test:_ start a watcher poll (paused via hook), run compaction in a separate session, resume the poll; assert the watcher sees all pre-compaction rows and no unexplained gaps.
 - **RB4 — No-op write suppression (I1/I3).** Content-equal writes must be suppressed without violating any invariant. Six sub-cases:
   - **RB4a** — Identical write suppressed: no seq consumed, no version bump, counter unchanged.
@@ -286,12 +279,12 @@ Every entry names the invariant at stake, the interleaving, the defense, and the
 Correctness that is only tested pre-GA decays. Run a **verifier** as a permanent, low-priority consumer in every environment:
 
 - Subscribes (via the ordinary poll path) to a sample of buckets — including the hottest — and checks per (GVK, bucket):
-  - **I2/I4 — monotonic high-water marks:** `seq > prevHWM` per bucket. Any regression is an invariant violation.
+  - **I2 — monotonic high-water marks:** `seq > prevHWM` per bucket. Any regression is an invariant violation.
   - **I5 — gaps explained by compaction:** all gaps between delivered seq numbers are below the compaction horizon.
 - **No per-event contiguity checking.** Under coalescing (two writes to the same key between polls), the delivered sequence numbers are not contiguous — only the latest seq per object survives. This is correct Kubernetes watch semantics (I3 permits coalescing). Contiguity auditing, if needed, must cross-check the table directly (out of scope for the stream-side verifier).
 - **Duplicate detection** uses monotonicity: `seq <= prevHWM` is reported as an I2 violation. No per-key map is maintained — verifier state is **O(buckets)**, bounded.
 - A second probe writes a synthetic canary object per bucket at low rate and measures write→delivery latency (doorbell health) via a **bounded ring buffer** (1,000 samples) with p99 tracking.
-- Any violation pages; I2 violations additionally trip a write-freeze on the affected bucket (tripwire).
+- Any violation should page. Under RDS Multi-AZ synchronous replication, a sequence regression should be impossible — if the verifier fires, something is deeply wrong.
 - The verifier is also the acceptance oracle for every phase in §7 — the same code judges tests and production.
 
 ## 7. Certification Test Plan
@@ -303,8 +296,8 @@ Correctness that is only tested pre-GA decays. Run a **verifier** as a permanent
 - **Phase 3 — Avalanche & crash recovery.** Kill half the replicas under load. New writers start and race on the same buckets, relying on optimistic concurrency (409 Conflict) to resolve contention. No CPU exhaustion or dropped connections; verifier reports zero dups/gaps; zero stale writes.
 - **Phase 4 — 7-day soak.** Autovacuum sawtooth on dead tuples; table+index ≤1.5× live set; counter HOT ratio ≥90%; `idx_resources_watch` bloat contained; compactor bounded; sub-horizon RVs get `410`.
 - **Phase 5 — Poll & doorbell.** At tier burst with 10/50/200 watchers: baseline poll adds <5% CPU; healthy-doorbell delivery p99 <150 ms; **notify-loss drill:** disable pg_notify mid-run — delivery continues within baseline interval, verifier silent.
-- **Phase 6 — Failover drills.** Unplanned (reboot-with-failover) under load + one orchestrated planned failover, repeated ≥5×. RTO ≤120 s; zero acknowledged-write loss; tripwires silent; epoch increments exactly once per promotion; verifier confirms commit-ordered continuity through every drill. Include R8/R9 assertions.
-- **Phase 7 — Backup/restore regression (new).** Restore a snapshot into a fresh instance (DR path). Because a restore _can_ legitimately rewind state, the runbook must bump the timeline epoch manually before accepting writes; the drill asserts clients relist via `410` and no stale RV is honored (I2/I4 under the one scenario sync replication doesn't cover).
+- **Phase 6 — Failover drills.** Unplanned (reboot-with-failover) under load + one orchestrated planned failover, repeated ≥5×. RTO ≤120 s; zero acknowledged-write loss; tripwires silent; verifier confirms commit-ordered continuity through every drill. Include R8 assertions.
+- **Phase 7 — Backup/restore regression.** Restore a snapshot into a fresh instance (DR path). Because a restore _can_ legitimately rewind state, all controller pods must be restarted after the restore so caches relist from the current state. The drill asserts that after restart, controllers converge to the correct state with no stale data.
 
 ## 8. Open Items
 

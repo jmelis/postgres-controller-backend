@@ -70,12 +70,11 @@ Everything below is the machinery that defeats those three hazards.
 Only three tables carry the core idea; the rest are supporting cast. Full DDL is
 in `internal/schema/migrations/001_initial.sql`.
 
-| Table                  | Its one job                                                              | etcd analogy                |
-| ---------------------- | ------------------------------------------------------------------------ | --------------------------- |
-| `kubernetes_resources` | The object in one of three lifecycle states (live, dying, fully deleted) | the keyspace                |
-| `gvk_bucket_counters`  | The commit-ordered version number, one row per (bucket, GVK)             | the global revision         |
-| `compaction_horizon`   | How far back history has been destroyed                                  | the compaction revision     |
-| `cluster_epoch`        | A generation number bumped on failover                                   | (etcd's built-in guarantee) |
+| Table                  | Its one job                                                              | etcd analogy            |
+| ---------------------- | ------------------------------------------------------------------------ | ----------------------- |
+| `kubernetes_resources` | The object in one of three lifecycle states (live, dying, fully deleted) | the keyspace            |
+| `gvk_bucket_counters`  | The commit-ordered version number, one row per (bucket, GVK)             | the global revision     |
+| `compaction_horizon`   | How far back history has been destroyed                                  | the compaction revision |
 
 The central row, in `kubernetes_resources`, has three columns worth calling out:
 
@@ -97,24 +96,21 @@ The central row, in `kubernetes_resources`, has three columns worth calling out:
 ## 3. The linchpin: the composite resourceVersion
 
 Because there is no single global counter, the bookmark cannot be one number. It
-is a **vector** — one high-water mark per bucket — with a failover generation
-stamped on the front (see `internal/resourceversion/rv.go`):
+is a **vector** — one high-water mark per bucket (see `internal/resourceversion/rv.go`):
 
 ```
-e7|b2:1044,b5:902,b9:4123
-│  └─ bucket 2 is at seq 1044, bucket 5 at 902, bucket 9 at 4123
-└──── timeline epoch 7
+b2:1044,b5:902,b9:4123
+└─ bucket 2 is at seq 1044, bucket 5 at 902, bucket 9 at 4123
 ```
 
-Read it as: _"On generation 7 of the database, I have seen everything up to seq
-1044 in bucket 2, 902 in bucket 5, and 4123 in bucket 9."_
+Read it as: _"I have seen everything up to seq 1044 in bucket 2, 902 in bucket
+5, and 4123 in bucket 9."_
 
-- The **per-bucket map** exists because sequences are per-bucket — a client
-  tracks a position in each bucket it watches.
-- The **epoch prefix** is the failover seatbelt. On every promotion,
-  `cluster_epoch.timeline_id` increments. So even in a disaster where a sequence
-  somehow rewound, `(epoch, seq)` still moves forward, and any client arriving
-  with an old epoch is told to start over. That is invariants I2/I4.
+The **per-bucket map** exists because sequences are per-bucket — a client
+tracks a position in each bucket it watches. Failover safety (I2/I4) relies on
+RDS Multi-AZ synchronous replication, which guarantees no committed sequence is
+ever lost. On database restore from backup, all controller pods must be
+restarted so caches relist from the current state.
 
 The serialization is canonical (buckets sorted) so equal states compare equal.
 
@@ -236,13 +232,12 @@ the watcher's baseline timer fires within 5 s.
 ## 5. The List path (the easy one)
 
 List is a single `REPEATABLE READ` read-only transaction
-(`internal/reader/list.go`) that does three reads in one snapshot:
+(`internal/reader/list.go`) that does two reads in one snapshot:
 
-1. Read `cluster_epoch` → the epoch prefix.
-2. Read `gvk_bucket_counters` for the buckets → the per-bucket high-water marks.
-3. Read live and dying rows (fully-deleted tombstones are excluded by the query).
+1. Read `gvk_bucket_counters` for the buckets → the per-bucket high-water marks.
+2. Read live and dying rows (fully-deleted tombstones are excluded by the query).
 
-Because all three happen in the _same snapshot_, the data and the RV describe the
+Because both happen in the _same snapshot_, the data and the RV describe the
 exact same instant — no skew. The client gets its objects plus a bookmark it can
 hand straight to Watch. The query filters tombstones at the SQL level:
 `AND (deletion_timestamp IS NULL OR metadata->'finalizers' != '[]'::jsonb)` —
@@ -259,7 +254,7 @@ READ`).** A transaction's isolation level controls how much of _other_
 > **`REPEATABLE READ`**, the _entire transaction_ sees one snapshot frozen at its
 > first query; everything committed afterward is invisible to it. The read paths
 > (List here, Watch in Section 6) use `REPEATABLE READ` because they do several
-> reads — epoch, then counters or horizon, then rows — that must all describe the
+> reads — counters or horizon, then rows — that must all describe the
 > **same instant**; under `READ COMMITTED` a compaction could commit between two
 > of those reads and produce a torn view. The write path deliberately uses
 > `READ COMMITTED` instead: a writer _wants_ the latest committed counter value,
@@ -282,10 +277,6 @@ sequenceDiagram
     W->>DB: initial poll (catch up from StartRV)
     loop scheduling: 5s timer OR doorbell, through a 100ms debounce
         W->>DB: BEGIN REPEATABLE READ, READ ONLY
-        W->>DB: SELECT timeline_id FROM cluster_epoch
-        alt epoch != my epoch
-            DB-->>W: 410 Gone → Run() returns, client must relist
-        end
         loop each bucket
             W->>DB: SELECT compacted_seq FROM compaction_horizon
             alt my hwm < compacted_seq
@@ -457,7 +448,7 @@ So compaction does both in a **single CTE** (`internal/compaction/compactor.go`)
 WITH del AS (
     DELETE FROM kubernetes_resources
     WHERE deletion_timestamp IS NOT NULL
-      AND deletion_timestamp < now() - $1::interval   -- retention
+      AND GREATEST(deletion_timestamp, updated_at) < now() - $1::interval   -- retention
       AND (metadata->'finalizers' IS NULL              -- finalizer guard
            OR metadata->'finalizers' = '[]'::jsonb)
     RETURNING bucket_id, gvk, gvk_bucket_seq
@@ -475,10 +466,12 @@ SELECT count(*) FROM del;
 
 Top to bottom:
 
-- `del` deletes fully-deleted tombstones (no finalizers) older than
-  **retention** and returns the seqs it killed. The finalizer guard ensures
-  dying objects — those still being cleaned up by controllers — are never
-  compacted, even if their `deletion_timestamp` is past the retention window.
+- `del` deletes fully-deleted tombstones (no finalizers) whose retention window
+  has elapsed and returns the seqs it killed. The retention clock starts from
+  `GREATEST(deletion_timestamp, updated_at)` — whichever is later — so a dying
+  object that received controller updates during cleanup doesn't get compacted
+  prematurely. The finalizer guard ensures dying objects are never compacted,
+  even if their `deletion_timestamp` is past the retention window.
 - `horizon` advances the horizon to the highest seq just deleted, per
   (bucket, GVK).
 - `GREATEST(...)` guarantees the horizon **never moves backward**, even if two
@@ -593,14 +586,14 @@ makes sense, the rest of the system is variations on it.
 
 ## 9. How it all ties back to the one sentence
 
-| Mechanism                      | Which piece of "a commit-ordered version" it defends                                                                                                |
-| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Counter row + exclusive lock   | Commit-ordered sequences: commit-order = seq-order (I1)                                                                                             |
-| `object_version` check         | No lost updates on one object (I6)                                                                                                                  |
-| Composite RV + `cluster_epoch` | Version never goes backward, even across failover (I2, I4)                                                                                          |
-| Tombstones + finalizers        | Deletes are visible events; dying objects (with finalizers) stay visible for cleanup, fully-deleted tombstones (no finalizers) signal deletion (I3) |
-| Compaction horizon + 410       | A watcher that fell too far behind is told loudly, never silently skipped; compaction only removes finalizer-free tombstones (I5)                   |
-| Poll loop                      | The delivery guarantee — the doorbell is only latency (I3)                                                                                          |
+| Mechanism                    | Which piece of "a commit-ordered version" it defends                                                                                                |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Counter row + exclusive lock | Commit-ordered sequences: commit-order = seq-order (I1)                                                                                             |
+| `object_version` check       | No lost updates on one object (I6)                                                                                                                  |
+| RDS synchronous replication  | Version never goes backward across failover (I2, I4); on restore, restarting pods forces a relist                                                   |
+| Tombstones + finalizers      | Deletes are visible events; dying objects (with finalizers) stay visible for cleanup, fully-deleted tombstones (no finalizers) signal deletion (I3) |
+| Compaction horizon + 410     | A watcher that fell too far behind is told loudly, never silently skipped; compaction only removes finalizer-free tombstones (I5)                   |
+| Poll loop                    | The delivery guarantee — the doorbell is only latency (I3)                                                                                          |
 
 Every mechanism is one repair to the gap between "what a Kubernetes client
 expects" and "what a plain SQL table gives you."
@@ -623,11 +616,10 @@ It exercises the machinery it is auditing.
 
 What it checks per (GVK, bucket):
 
-- **Monotonic high-water marks (I2/I4).** Every delivered event's seq must be
+- **Monotonic high-water marks (I2).** Every delivered event's seq must be
   strictly greater than the previous high-water mark for its bucket. One rule
-  catches two failure classes: a _regression_ (the sequence went backwards —
-  e.g., a failover lost a commit) and a _duplicate delivery_ (I4) both manifest
-  as `seq <= previous hwm`. That single comparison is the whole check, which is
+  catches two failure classes: a _regression_ (the sequence went backwards)
+  and a _duplicate delivery_ both manifest as `seq <= previous hwm`. That single comparison is the whole check, which is
   why verifier state is tiny — **O(buckets)**, one number per bucket, no per-key
   maps that grow with fleet size.
 - **Compaction consistency (I5)** comes free from the poll path itself: if the
@@ -644,7 +636,7 @@ of the invariants doing real work: I3 _permits_ coalescing, so the verifier must
 tolerate it.)
 
 The second probe is a **canary**: at a low rate, the verifier writes a synthetic
-object per sampled bucket through the real write path and measures
+object to one of its sampled buckets through the real write path and measures
 write-to-delivery latency — the wall-clock time from `Write` returning to the
 event appearing on the watcher channel. This times the full pipeline: commit
 visibility, `pg_notify` doorbell, poll scheduling, and channel delivery. Latency
@@ -655,10 +647,9 @@ _silently_ if nobody measured latency — events would still arrive, just up to
 5 s late. The canary is what turns "doorbell quietly broken" from an invisible
 degradation into a metric.
 
-Operationally: any violation pages a human; a sequence regression additionally
-trips a **write-freeze** on the affected bucket (with synchronous replication it
-should be impossible, so if it fires, something is deeply wrong — stop writes
-first, debug second). The same verifier code is also the acceptance oracle for
+Operationally: any violation should page a human. With synchronous replication a
+sequence regression should be impossible — if the verifier fires, something is
+deeply wrong. The same verifier code is also the acceptance oracle for
 every certification phase in `DESIGN.md` — the judge in the load tests and the
 judge in production are the same program, so passing the tests means something.
 
