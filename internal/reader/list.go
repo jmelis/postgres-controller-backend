@@ -14,6 +14,13 @@ type ListResult struct {
 	ResourceVersion resourceversion.RV
 }
 
+type ListFilter struct {
+	WhereClauses []string
+	WhereArgs    []interface{}
+	Limit        int64
+	Offset       int64
+}
+
 // List performs a REPEATABLE READ snapshot read of all live and dying resources
 // matching the given GVK across the specified buckets. Fully-deleted tombstones
 // (deletion_timestamp set, no finalizers) are excluded by the query. Dying
@@ -21,7 +28,7 @@ type ListResult struct {
 // can perform cleanup before removing their finalizers. The returned RV is
 // built from per-bucket counters within the same snapshot, so there is no
 // skew between the data and the version (I4/I5 handoff into Watch).
-func List(ctx context.Context, conn *pgx.Conn, gvk string, bucketIDs []int) (*ListResult, error) {
+func List(ctx context.Context, conn *pgx.Conn, gvk string, bucketIDs []int, filter ...*ListFilter) (*ListResult, error) {
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel:   pgx.RepeatableRead,
 		AccessMode: pgx.ReadOnly,
@@ -61,14 +68,36 @@ func List(ctx context.Context, conn *pgx.Conn, gvk string, bucketIDs []int) (*Li
 		}
 	}
 
-	resourceRows, err := tx.Query(ctx, `
+	query := `
 		SELECT gvk, namespace, name, uid, bucket_id, gvk_bucket_seq,
 		       object_version, spec, status, metadata,
 		       deletion_timestamp, created_at, updated_at
 		FROM kubernetes_resources
 		WHERE gvk = $1 AND bucket_id = ANY($2)
-		  AND (deletion_timestamp IS NULL OR metadata->'finalizers' != '[]'::jsonb) -- tombstone filter: also in compactor.go, 001_initial.sql, writer.go
-		ORDER BY bucket_id, gvk_bucket_seq`, gvk, bucketIDs)
+		  AND (deletion_timestamp IS NULL OR metadata->'finalizers' != '[]'::jsonb)` // tombstone filter: also in compactor.go, 001_initial.sql, writer.go
+	args := []interface{}{gvk, bucketIDs}
+
+	var f *ListFilter
+	if len(filter) > 0 && filter[0] != nil {
+		f = filter[0]
+	}
+	if f != nil {
+		for _, clause := range f.WhereClauses {
+			query += " AND " + clause
+		}
+		args = append(args, f.WhereArgs...)
+	}
+	query += " ORDER BY bucket_id, gvk_bucket_seq"
+	if f != nil && f.Limit > 0 {
+		args = append(args, f.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+		if f.Offset > 0 {
+			args = append(args, f.Offset)
+			query += fmt.Sprintf(" OFFSET $%d", len(args))
+		}
+	}
+
+	resourceRows, err := tx.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list resources: %w", err)
 	}

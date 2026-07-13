@@ -166,6 +166,7 @@ The [`examples/`](examples/) directory contains the same controller implemented 
 
 - [DESIGN.md](DESIGN.md) — full design: invariant catalog (I1–I6), race catalog (R2–R5, R7, R10, R12–R13, R15–R21), sizing, certification plan
 - [WALKTHROUGH.md](WALKTHROUGH.md) — narrative explanation of why each mechanism exists and how the pieces fit together
+- [COMPATIBILITY.md](COMPATIBILITY.md) — controller-runtime compatibility matrix: what works, what doesn't, what silently differs
 - [ARCHITECTURE_COMPARISON.md](ARCHITECTURE_COMPARISON.md) — this direct-to-Postgres design vs. an intermediated REST-API architecture (reliability, consistency, operational surface)
 - [METRICS.md](METRICS.md) — Prometheus metrics reference (all `pgctl_*` metrics, labels, integration guide)
 - [loadtest/README.md](loadtest/README.md) — RDS perfscale suite: ceiling hunt, Phase 0–7 certification, Terraform infrastructure, scaling analysis

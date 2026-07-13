@@ -2,6 +2,7 @@ package pgruntime_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -464,6 +466,103 @@ func TestClient_DeleteWithoutRV_NotFound(t *testing.T) {
 	assert.True(t, apierrors.IsNotFound(err), "delete of nonexistent object should return NotFound, got: %v", err)
 }
 
+func TestClient_ListWithFieldSelector(t *testing.T) {
+	mgr := newManager(t)
+	c := mgr.GetClient()
+	ctx := context.Background()
+
+	for _, w := range []Widget{
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "red-0"}, Spec: WidgetSpec{Color: "red"}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "blue-0"}, Spec: WidgetSpec{Color: "blue"}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "blue-1"}, Spec: WidgetSpec{Color: "blue"}},
+	} {
+		require.NoError(t, c.Create(ctx, w.DeepCopyObject().(*Widget)))
+	}
+
+	t.Run("by spec field", func(t *testing.T) {
+		list := &WidgetList{}
+		require.NoError(t, c.List(ctx, list, client.MatchingFields{"spec.color": "blue"}))
+		assert.Len(t, list.Items, 2)
+	})
+
+	t.Run("by metadata.name", func(t *testing.T) {
+		list := &WidgetList{}
+		require.NoError(t, c.List(ctx, list, client.MatchingFields{"metadata.name": "red-0"}))
+		assert.Len(t, list.Items, 1)
+		assert.Equal(t, "red-0", list.Items[0].Name)
+	})
+
+	t.Run("no matches", func(t *testing.T) {
+		list := &WidgetList{}
+		require.NoError(t, c.List(ctx, list, client.MatchingFields{"spec.color": "nonexistent"}))
+		assert.Empty(t, list.Items)
+	})
+
+	t.Run("not equals", func(t *testing.T) {
+		sel, err := fields.ParseSelector("spec.color!=red")
+		require.NoError(t, err)
+		list := &WidgetList{}
+		require.NoError(t, c.List(ctx, list, client.MatchingFieldsSelector{Selector: sel}))
+		assert.Len(t, list.Items, 2)
+		for _, item := range list.Items {
+			assert.Equal(t, "blue", item.Spec.Color)
+		}
+	})
+
+	t.Run("invalid field errors", func(t *testing.T) {
+		err := c.List(ctx, &WidgetList{}, client.MatchingFields{"invalid": "value"})
+		assert.ErrorContains(t, err, "invalid field selector")
+	})
+
+	t.Run("combined with limit", func(t *testing.T) {
+		list := &WidgetList{}
+		require.NoError(t, c.List(ctx, list, client.MatchingFields{"spec.color": "blue"}, client.Limit(1)))
+		assert.Len(t, list.Items, 1)
+		assert.NotEmpty(t, list.Continue)
+	})
+}
+
+func TestClient_ListWithLimit(t *testing.T) {
+	mgr := newManager(t)
+	c := mgr.GetClient()
+	ctx := context.Background()
+
+	for i := 0; i < 5; i++ {
+		w := &Widget{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: fmt.Sprintf("w-%d", i)},
+			Spec:       WidgetSpec{Color: "blue"},
+		}
+		require.NoError(t, c.Create(ctx, w))
+	}
+
+	t.Run("paginates through all items", func(t *testing.T) {
+		seen := map[string]bool{}
+		token := ""
+		for page := 0; ; page++ {
+			list := &WidgetList{}
+			opts := []client.ListOption{client.Limit(2)}
+			if token != "" {
+				opts = append(opts, client.Continue(token))
+			}
+			require.NoError(t, c.List(ctx, list, opts...))
+			for _, item := range list.Items {
+				seen[item.Name] = true
+			}
+			token = list.Continue
+			if token == "" {
+				break
+			}
+			require.Less(t, page, 10, "pagination should terminate")
+		}
+		assert.Len(t, seen, 5)
+	})
+
+	t.Run("invalid continue token", func(t *testing.T) {
+		err := c.List(ctx, &WidgetList{}, client.Limit(10), client.Continue("bad!!!"))
+		assert.ErrorContains(t, err, "invalid continue token")
+	})
+}
+
 func TestManager_FullReconcileLoop(t *testing.T) {
 	mgr := newManager(t)
 	c := mgr.GetClient()
@@ -502,5 +601,63 @@ func TestManager_FullReconcileLoop(t *testing.T) {
 		assert.Equal(t, "trigger", req.Name)
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for reconcile")
+	}
+}
+
+func TestClient_UnsupportedOptions(t *testing.T) {
+	mgr := newManager(t)
+	c := mgr.GetClient()
+	ctx := context.Background()
+	key := types.NamespacedName{Namespace: "default", Name: "opts-test"}
+
+	require.NoError(t, c.Create(ctx, &Widget{
+		ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name},
+		Spec:       WidgetSpec{Color: "blue"},
+	}))
+
+	fresh := func() *Widget {
+		w := &Widget{}
+		require.NoError(t, c.Get(ctx, key, w))
+		return w
+	}
+
+	tests := []struct {
+		name, errContains string
+		fn                func() error
+	}{
+		{"Create DryRun", "DryRun not supported", func() error {
+			return c.Create(ctx, &Widget{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "dry"},
+				Spec:       WidgetSpec{Color: "blue"},
+			}, client.DryRunAll)
+		}},
+		{"Create GenerateName", "GenerateName not supported", func() error {
+			return c.Create(ctx, &Widget{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", GenerateName: "widget-"},
+				Spec:       WidgetSpec{Color: "blue"},
+			})
+		}},
+		{"Update DryRun", "DryRun not supported", func() error {
+			return c.Update(ctx, fresh(), client.DryRunAll)
+		}},
+		{"Delete DryRun", "DryRun not supported", func() error {
+			return c.Delete(ctx, fresh(), client.DryRunAll)
+		}},
+		{"Delete GracePeriod", "GracePeriodSeconds not supported", func() error {
+			return c.Delete(ctx, fresh(), client.GracePeriodSeconds(30))
+		}},
+		{"Delete PropagationPolicy", "PropagationPolicy not supported", func() error {
+			return c.Delete(ctx, fresh(), client.PropagationPolicy(metav1.DeletePropagationForeground))
+		}},
+		{"Status Update DryRun", "DryRun not supported", func() error {
+			return c.Status().Update(ctx, fresh(), &client.SubResourceUpdateOptions{
+				UpdateOptions: client.UpdateOptions{DryRun: []string{metav1.DryRunAll}},
+			})
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.ErrorContains(t, tt.fn(), tt.errContains)
+		})
 	}
 }

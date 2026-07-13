@@ -11,7 +11,39 @@ import (
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+var (
+	errDryRunNotSupported            = fmt.Errorf("pgruntime: DryRun not supported")
+	errPropagationPolicyNotSupported = fmt.Errorf("pgruntime: PropagationPolicy not supported — use finalizers for cleanup")
+	errPreconditionsNotSupported     = fmt.Errorf("pgruntime: Preconditions not supported — use ResourceVersion on the object")
+	errGracePeriodNotSupported       = fmt.Errorf("pgruntime: GracePeriodSeconds not supported — handle graceful shutdown in your reconciler")
+	errGenerateNameNotSupported      = fmt.Errorf("pgruntime: GenerateName not supported — set Name explicitly before Create()")
+)
+
+func rejectDryRun(dryRun []string) error {
+	if len(dryRun) > 0 {
+		return errDryRunNotSupported
+	}
+	return nil
+}
+
+func rejectUnsupportedDeleteOpts(opts client.DeleteOptions) error {
+	if err := rejectDryRun(opts.DryRun); err != nil {
+		return err
+	}
+	if opts.PropagationPolicy != nil {
+		return errPropagationPolicyNotSupported
+	}
+	if opts.Preconditions != nil {
+		return errPreconditionsNotSupported
+	}
+	if opts.GracePeriodSeconds != nil {
+		return errGracePeriodNotSupported
+	}
+	return nil
+}
 
 func groupResource(gvk schema.GroupVersionKind) schema.GroupResource {
 	return schema.GroupResource{
