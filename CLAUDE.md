@@ -5,6 +5,7 @@
 Before working on this codebase, read these docs to understand the architecture, design decisions, and operational context:
 
 - ARCHITECTURE_COMPARISON.md
+- COMPATIBILITY.md
 - DESIGN.md
 - METRICS.md
 - README.md

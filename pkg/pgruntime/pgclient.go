@@ -2,6 +2,7 @@ package pgruntime
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -100,7 +101,12 @@ func (c *pgClient) List(ctx context.Context, list client.ObjectList, opts ...cli
 		buckets = []int{UnshardedBucket}
 	}
 
-	result, err := reader.List(ctx, conn, gvkStr, buckets)
+	filter, err := buildListFilter(listOpts)
+	if err != nil {
+		return err
+	}
+
+	result, err := reader.List(ctx, conn, gvkStr, buckets, filter)
 	if err != nil {
 		return err
 	}
@@ -110,9 +116,6 @@ func (c *pgClient) List(ctx context.Context, list client.ObjectList, opts ...cli
 		obj, err := resourceToObject(r, c.scheme)
 		if err != nil {
 			return err
-		}
-		if listOpts.Namespace != "" && obj.GetNamespace() != listOpts.Namespace {
-			continue
 		}
 		if listOpts.LabelSelector != nil && !listOpts.LabelSelector.Matches(labelSet(obj.GetLabels())) {
 			continue
@@ -125,10 +128,25 @@ func (c *pgClient) List(ctx context.Context, list client.ObjectList, opts ...cli
 	}
 
 	list.SetResourceVersion(result.ResourceVersion.String())
+	if listOpts.Limit > 0 && int64(len(result.Resources)) == listOpts.Limit {
+		offset, _ := decodeContinue(listOpts.Continue)
+		list.SetContinue(encodeContinue(offset + listOpts.Limit))
+	}
 	return nil
 }
 
 func (c *pgClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	createOpts := client.CreateOptions{}
+	for _, o := range opts {
+		o.ApplyToCreate(&createOpts)
+	}
+	if err := rejectDryRun(createOpts.DryRun); err != nil {
+		return err
+	}
+	if obj.GetName() == "" && obj.GetGenerateName() != "" {
+		return errGenerateNameNotSupported
+	}
+
 	gvk, err := resolveGVK(c.scheme, obj)
 	if err != nil {
 		return err
@@ -186,6 +204,14 @@ func (c *pgClient) Create(ctx context.Context, obj client.Object, opts ...client
 }
 
 func (c *pgClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	updateOpts := client.UpdateOptions{}
+	for _, o := range opts {
+		o.ApplyToUpdate(&updateOpts)
+	}
+	if err := rejectDryRun(updateOpts.DryRun); err != nil {
+		return err
+	}
+
 	gvk, err := resolveGVK(c.scheme, obj)
 	if err != nil {
 		return err
@@ -257,6 +283,14 @@ func (c *pgClient) Update(ctx context.Context, obj client.Object, opts ...client
 }
 
 func (c *pgClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	deleteOpts := client.DeleteOptions{}
+	for _, o := range opts {
+		o.ApplyToDelete(&deleteOpts)
+	}
+	if err := rejectUnsupportedDeleteOpts(deleteOpts); err != nil {
+		return err
+	}
+
 	gvk, err := resolveGVK(c.scheme, obj)
 	if err != nil {
 		return err
@@ -388,6 +422,14 @@ func (sw *pgStatusWriter) Create(ctx context.Context, obj client.Object, subReso
 }
 
 func (sw *pgStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	updateOpts := client.SubResourceUpdateOptions{}
+	for _, o := range opts {
+		o.ApplyToSubResourceUpdate(&updateOpts)
+	}
+	if err := rejectDryRun(updateOpts.DryRun); err != nil {
+		return err
+	}
+
 	gvk, err := resolveGVK(sw.c.scheme, obj)
 	if err != nil {
 		return err
@@ -541,6 +583,66 @@ func (ls labelSet) Get(key string) string {
 func (ls labelSet) Lookup(label string) (value string, exists bool) {
 	value, exists = ls[label]
 	return
+}
+
+type continueToken struct {
+	Offset int64 `json:"offset"`
+}
+
+func decodeContinue(token string) (int64, error) {
+	if token == "" {
+		return 0, nil
+	}
+	data, err := base64.StdEncoding.DecodeString(token)
+	if err != nil {
+		return 0, fmt.Errorf("pgruntime: invalid continue token: %w", err)
+	}
+	var ct continueToken
+	if err := json.Unmarshal(data, &ct); err != nil {
+		return 0, fmt.Errorf("pgruntime: invalid continue token: %w", err)
+	}
+	return ct.Offset, nil
+}
+
+func encodeContinue(offset int64) string {
+	data, _ := json.Marshal(continueToken{Offset: offset})
+	return base64.StdEncoding.EncodeToString(data)
+}
+
+func buildListFilter(listOpts client.ListOptions) (*reader.ListFilter, error) {
+	var f reader.ListFilter
+
+	// $1 = gvk, $2 = bucketIDs, so extra params start at $3
+	paramIdx := 3
+
+	if listOpts.Namespace != "" {
+		f.WhereClauses = append(f.WhereClauses, fmt.Sprintf("namespace = $%d", paramIdx))
+		f.WhereArgs = append(f.WhereArgs, listOpts.Namespace)
+		paramIdx++
+	}
+
+	if listOpts.FieldSelector != nil && !listOpts.FieldSelector.Empty() {
+		clauses, args, err := buildFieldSelectorFilter(listOpts.FieldSelector, paramIdx)
+		if err != nil {
+			return nil, err
+		}
+		f.WhereClauses = append(f.WhereClauses, clauses...)
+		f.WhereArgs = append(f.WhereArgs, args...)
+	}
+
+	if listOpts.Limit > 0 {
+		f.Limit = listOpts.Limit
+		offset, err := decodeContinue(listOpts.Continue)
+		if err != nil {
+			return nil, err
+		}
+		f.Offset = offset
+	}
+
+	if f.Limit == 0 && len(f.WhereClauses) == 0 {
+		return nil, nil
+	}
+	return &f, nil
 }
 
 var _ client.Client = (*pgClient)(nil)

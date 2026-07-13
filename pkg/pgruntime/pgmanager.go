@@ -151,8 +151,12 @@ type pgManager struct {
 
 // --- cluster.Cluster ---
 
-func (m *pgManager) GetHTTPClient() *http.Client          { return nil }
-func (m *pgManager) GetConfig() *rest.Config               { return nil }
+func (m *pgManager) GetHTTPClient() *http.Client {
+	panic("pgruntime: no HTTP client — postgres backend has no kube-apiserver")
+}
+func (m *pgManager) GetConfig() *rest.Config {
+	panic("pgruntime: no rest.Config — postgres backend has no kube-apiserver")
+}
 func (m *pgManager) GetCache() cache.Cache                 { return m.cache }
 func (m *pgManager) GetScheme() *runtime.Scheme            { return m.scheme }
 func (m *pgManager) GetClient() client.Client              { return m.client }

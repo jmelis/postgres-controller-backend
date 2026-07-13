@@ -100,7 +100,12 @@ func (c *pgCache) List(ctx context.Context, list client.ObjectList, opts ...clie
 		buckets = []int{UnshardedBucket}
 	}
 
-	result, err := reader.List(ctx, poolConn.Conn(), gvkStr, buckets)
+	filter, err := buildListFilter(listOpts)
+	if err != nil {
+		return err
+	}
+
+	result, err := reader.List(ctx, poolConn.Conn(), gvkStr, buckets, filter)
 	if err != nil {
 		return err
 	}
@@ -110,9 +115,6 @@ func (c *pgCache) List(ctx context.Context, list client.ObjectList, opts ...clie
 		obj, err := resourceToObject(r, c.scheme)
 		if err != nil {
 			return err
-		}
-		if listOpts.Namespace != "" && obj.GetNamespace() != listOpts.Namespace {
-			continue
 		}
 		if listOpts.LabelSelector != nil && !listOpts.LabelSelector.Matches(labelSet(obj.GetLabels())) {
 			continue
@@ -124,6 +126,10 @@ func (c *pgCache) List(ctx context.Context, list client.ObjectList, opts ...clie
 		return err
 	}
 	list.SetResourceVersion(result.ResourceVersion.String())
+	if listOpts.Limit > 0 && int64(len(result.Resources)) == listOpts.Limit {
+		offset, _ := decodeContinue(listOpts.Continue)
+		list.SetContinue(encodeContinue(offset + listOpts.Limit))
+	}
 	return nil
 }
 
