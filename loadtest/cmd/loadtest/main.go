@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jmelis/postgres-controller-backend/internal/compaction"
+	"github.com/jmelis/postgres-controller-backend/pkg/compaction"
 	"github.com/jmelis/postgres-controller-backend/internal/schema"
 )
 
