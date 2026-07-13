@@ -215,7 +215,7 @@ WITH deleted AS (
     DELETE FROM kubernetes_resources
     WHERE gvk = $1 AND bucket_id = $2
       AND deletion_timestamp IS NOT NULL
-      AND deletion_timestamp < now() - $retention
+      AND GREATEST(deletion_timestamp, updated_at) < now() - $retention
       AND (metadata->'finalizers' IS NULL OR metadata->'finalizers' = '[]'::jsonb)
     RETURNING gvk_bucket_seq
 )
@@ -284,7 +284,7 @@ Correctness that is only tested pre-GA decays. Run a **verifier** as a permanent
 - **No per-event contiguity checking.** Under coalescing (two writes to the same key between polls), the delivered sequence numbers are not contiguous — only the latest seq per object survives. This is correct Kubernetes watch semantics (I3 permits coalescing). Contiguity auditing, if needed, must cross-check the table directly (out of scope for the stream-side verifier).
 - **Duplicate detection** uses monotonicity: `seq <= prevHWM` is reported as an I2 violation. No per-key map is maintained — verifier state is **O(buckets)**, bounded.
 - A second probe writes a synthetic canary object per bucket at low rate and measures write→delivery latency (doorbell health) via a **bounded ring buffer** (1,000 samples) with p99 tracking.
-- Any violation pages; I2 violations additionally trip a write-freeze on the affected bucket (tripwire). Under RDS Multi-AZ synchronous replication, a sequence regression should be impossible — if it fires, something is deeply wrong.
+- Any violation should page. Under RDS Multi-AZ synchronous replication, a sequence regression should be impossible — if the verifier fires, something is deeply wrong.
 - The verifier is also the acceptance oracle for every phase in §7 — the same code judges tests and production.
 
 ## 7. Certification Test Plan

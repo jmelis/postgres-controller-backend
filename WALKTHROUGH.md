@@ -448,7 +448,7 @@ So compaction does both in a **single CTE** (`internal/compaction/compactor.go`)
 WITH del AS (
     DELETE FROM kubernetes_resources
     WHERE deletion_timestamp IS NOT NULL
-      AND deletion_timestamp < now() - $1::interval   -- retention
+      AND GREATEST(deletion_timestamp, updated_at) < now() - $1::interval   -- retention
       AND (metadata->'finalizers' IS NULL              -- finalizer guard
            OR metadata->'finalizers' = '[]'::jsonb)
     RETURNING bucket_id, gvk, gvk_bucket_seq
@@ -466,10 +466,12 @@ SELECT count(*) FROM del;
 
 Top to bottom:
 
-- `del` deletes fully-deleted tombstones (no finalizers) older than
-  **retention** and returns the seqs it killed. The finalizer guard ensures
-  dying objects — those still being cleaned up by controllers — are never
-  compacted, even if their `deletion_timestamp` is past the retention window.
+- `del` deletes fully-deleted tombstones (no finalizers) whose retention window
+  has elapsed and returns the seqs it killed. The retention clock starts from
+  `GREATEST(deletion_timestamp, updated_at)` — whichever is later — so a dying
+  object that received controller updates during cleanup doesn't get compacted
+  prematurely. The finalizer guard ensures dying objects are never compacted,
+  even if their `deletion_timestamp` is past the retention window.
 - `horizon` advances the horizon to the highest seq just deleted, per
   (bucket, GVK).
 - `GREATEST(...)` guarantees the horizon **never moves backward**, even if two
@@ -634,7 +636,7 @@ of the invariants doing real work: I3 _permits_ coalescing, so the verifier must
 tolerate it.)
 
 The second probe is a **canary**: at a low rate, the verifier writes a synthetic
-object per sampled bucket through the real write path and measures
+object to one of its sampled buckets through the real write path and measures
 write-to-delivery latency — the wall-clock time from `Write` returning to the
 event appearing on the watcher channel. This times the full pipeline: commit
 visibility, `pg_notify` doorbell, poll scheduling, and channel delivery. Latency
@@ -645,10 +647,9 @@ _silently_ if nobody measured latency — events would still arrive, just up to
 5 s late. The canary is what turns "doorbell quietly broken" from an invisible
 degradation into a metric.
 
-Operationally: any violation pages a human; a sequence regression additionally
-trips a **write-freeze** on the affected bucket (with synchronous replication it
-should be impossible, so if it fires, something is deeply wrong — stop writes
-first, debug second). The same verifier code is also the acceptance oracle for
+Operationally: any violation should page a human. With synchronous replication a
+sequence regression should be impossible — if the verifier fires, something is
+deeply wrong. The same verifier code is also the acceptance oracle for
 every certification phase in `DESIGN.md` — the judge in the load tests and the
 judge in production are the same program, so passing the tests means something.
 
