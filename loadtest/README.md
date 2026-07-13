@@ -6,14 +6,14 @@ This harness tests the **Go library packages** that implement Postgres-backed Ku
 
 ### Packages under test
 
-| Package               | What it does                                                                                                                                                                                                                                                                                         | How the harness uses it                                                                                                                                              |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Package               | What it does                                                                                                                                                                                                                                                                | How the harness uses it                                                                                                                                              |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `internal/writer`     | Atomic writes via `pgctl_write()` stored procedure: no-op suppression &rarr; counter increment &rarr; UPSERT, all in one server-side call. `pg_notify` doorbell fires after commit, outside the transaction. Enforces commit ordering (I1) and optimistic concurrency (I6). | Every phase creates `writer.New(conn, nil).WithMetrics(m)` instances and calls `Write()` at varying rates, concurrency, and bucket distributions.                    |
-| `internal/reader`     | Poll-primary watcher with optional doorbell (LISTEN/NOTIFY). Delivers commit-ordered event streams per (GVK, bucket) regardless of doorbell health. Single-goroutine scheduler with debounce.                                                                                                              | Phase 5 creates `reader.NewWatcher(...)` instances to measure idle poll cost, doorbell delivery latency, and baseline-only fallback.                                 |
-| `internal/verifier`   | Continuous invariant checker — subscribes to the poll stream and verifies monotonic high-water marks (I2/I4), gap-vs-compaction-horizon checks (I5), and canary write-to-delivery latency.                                                                                                           | Runs alongside every write phase. Any violation fails the test. Same code used in production.                                                                        |
-| `internal/compaction` | Tombstone compaction: deletes fully-deleted tombstones (deletion_timestamp set, no active finalizers) and advances the compaction horizon atomically in a single CTE (I5). Dying objects with finalizers are preserved.                                                                              | Background goroutine runs `compaction.Compact()` every 5 minutes during long tests to keep table size bounded.                                                       |
-| `internal/schema`     | DDL migration — creates all tables and indexes.                                                                                                                                                                                                                                                      | Runs once at startup before seeding.                                                                                                                                 |
-| `internal/metrics`    | Prometheus metrics for all of the above: write duration/count, poll duration, delivery latency, verifier violations.                                                                                                                                                                                 | All library instances are wired with `.WithMetrics(...)`. Metrics are scraped by CloudWatch Agent and pushed to a CloudWatch dashboard alongside native RDS metrics. |
+| `internal/reader`     | Poll-primary watcher with optional doorbell (LISTEN/NOTIFY). Delivers commit-ordered event streams per (GVK, bucket) regardless of doorbell health. Single-goroutine scheduler with debounce.                                                                               | Phase 5 creates `reader.NewWatcher(...)` instances to measure idle poll cost, doorbell delivery latency, and baseline-only fallback.                                 |
+| `internal/verifier`   | Continuous invariant checker — subscribes to the poll stream and verifies monotonic high-water marks (I2/I4), gap-vs-compaction-horizon checks (I5), and canary write-to-delivery latency.                                                                                  | Runs alongside every write phase. Any violation fails the test. Same code used in production.                                                                        |
+| `internal/compaction` | Tombstone compaction: deletes fully-deleted tombstones (deletion_timestamp set, no active finalizers) and advances the compaction horizon atomically in a single CTE (I5). Dying objects with finalizers are preserved.                                                     | Background goroutine runs `compaction.Compact()` every 5 minutes during long tests to keep table size bounded.                                                       |
+| `internal/schema`     | DDL migration — creates all tables and indexes.                                                                                                                                                                                                                             | Runs once at startup before seeding.                                                                                                                                 |
+| `internal/metrics`    | Prometheus metrics for all of the above: write duration/count, poll duration, delivery latency, verifier violations.                                                                                                                                                        | All library instances are wired with `.WithMetrics(...)`. Metrics are scraped by CloudWatch Agent and pushed to a CloudWatch dashboard alongside native RDS metrics. |
 
 ### Invariants validated
 
@@ -36,7 +36,7 @@ The harness validates the correctness invariants from [DESIGN.md §2](../DESIGN.
 | **Autovacuum under load** | Sustained write load generates dead tuples; autovacuum must keep up or the counter table bloats and HOT updates degrade. Only visible over hours of sustained load.                      |
 | **WAL volume**            | Large JSONB payloads (8-20KB) generate significant WAL. Only measurable with real gp3 throughput limits.                                                                                 |
 | **Connection behavior**   | Real network between the harness and RDS exercises connection drops, latency jitter, and TCP keepalive — none of which exist with localhost.                                             |
-| **Failover**              | RDS Multi-AZ failover (timeline epoch bump, connection drop, promotion) can only be tested on a real cluster.                                                                            |
+| **Failover**              | RDS Multi-AZ failover (connection drop, promotion) can only be tested on a real cluster.                                                                                                 |
 
 ## Certification phases
 
@@ -88,11 +88,11 @@ Three sub-phases:
 
 ### Phase 6 — Failover drills (manual trigger)
 
-Force an RDS failover under load. Measure RTO, verify zero event loss, confirm timeline epoch bump.
+Force an RDS failover under load. Measure RTO, verify zero event loss.
 
 ### Phase 7 — Backup/restore (manual trigger)
 
-Restore from snapshot, verify epoch bump forces client relist.
+Restore from snapshot, restart controller pods, verify clients relist and converge to correct state.
 
 ## Data seeding
 
@@ -269,7 +269,7 @@ The 2xlarge is the sweet spot — the 50k-cluster tier requires 3,740 burst w/s,
 
 ### Remaining optimization lever: async commit
 
-`synchronous_commit = off` would remove the WAL sync bottleneck entirely. The tradeoff is durability: a crash-and-restart-in-place can lose the WAL tail, rewinding committed state without an epoch bump. Level-triggered controllers re-converge, but non-idempotent side effects keyed on acknowledged writes would be silently wrong. `remote_write` is a middle ground (standby durability without local fsync). See [DESIGN.md §3.7](../DESIGN.md) for the full analysis.
+`synchronous_commit = off` would remove the WAL sync bottleneck entirely. The tradeoff is durability: a crash-and-restart-in-place can lose the WAL tail, rewinding committed state. Level-triggered controllers re-converge, but non-idempotent side effects keyed on acknowledged writes would be silently wrong. `remote_write` is a middle ground (standby durability without local fsync). See [DESIGN.md §3.7](../DESIGN.md) for the full analysis.
 
 ## Directory structure
 
