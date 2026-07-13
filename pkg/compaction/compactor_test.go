@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jmelis/postgres-controller-backend/internal/compaction"
+	"github.com/jmelis/postgres-controller-backend/pkg/compaction"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
 	"github.com/jmelis/postgres-controller-backend/test/testinfra"
