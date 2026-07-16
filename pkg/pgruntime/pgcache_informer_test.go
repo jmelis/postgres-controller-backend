@@ -6,12 +6,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
+	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
+	"github.com/jmelis/postgres-controller-backend/pkg/pgruntime"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	toolscache "k8s.io/client-go/tools/cache"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -114,6 +117,32 @@ func startCacheAndClient(t *testing.T) (cache.Cache, client.Client, context.Cont
 
 	t.Cleanup(func() { cancel() })
 	return ch, c, ctx, cancel
+}
+
+func newMultiBucketManager(t *testing.T, bucketIDs []int) ctrl.Manager {
+	t.Helper()
+	conn := sharedDB.Connect(t)
+	sharedDB.TruncateAll(t, conn)
+	conn.Close(context.Background())
+
+	mgr, err := pgruntime.NewManager(pgruntime.Options{
+		Scheme:    testScheme,
+		DSN:       sharedDB.ConnStr,
+		BucketIDs: bucketIDs,
+		BucketAssigner: func(_, name string) int {
+			h := 0
+			for _, c := range name {
+				h = h*31 + int(c)
+			}
+			if h < 0 {
+				h = -h
+			}
+			return bucketIDs[h%len(bucketIDs)]
+		},
+		Logger: logr.Discard(),
+	})
+	require.NoError(t, err)
+	return mgr
 }
 
 func createWidget(t *testing.T, c client.Client, ctx context.Context, name, color string) {
@@ -444,6 +473,179 @@ func TestInformer_EventObjectUsableForWrites(t *testing.T) {
 	fromUpdate := upd.Obj.DeepCopyObject().(*Widget)
 	require.NoError(t, c.Delete(ctx, fromUpdate),
 		"object taken from a watch event must be usable for Delete")
+}
+
+// Status().Update() on an object taken directly from a watch event.
+func TestInformer_StatusUpdateFromEventObject(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres")
+	}
+
+	ch, c, ctx, _ := startCacheAndClient(t)
+
+	inf, err := ch.GetInformer(ctx, &Widget{})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return inf.HasSynced() },
+		10*time.Second, 50*time.Millisecond, "widget informer never synced")
+
+	rec := newEventRecorder(20)
+	_, err = inf.AddEventHandler(rec)
+	require.NoError(t, err)
+
+	createWidget(t, c, ctx, "status-event", "red")
+	ev := rec.waitForType(t, "add", 10*time.Second)
+
+	fromEvent := ev.Obj.DeepCopyObject().(*Widget)
+	fromEvent.Status.Phase = "Running"
+	require.NoError(t, c.Status().Update(ctx, fromEvent),
+		"Status().Update() must work with composite RV from watch event")
+
+	upd := rec.waitForType(t, "update", 10*time.Second)
+	assert.Equal(t, "Running", upd.Obj.(*Widget).Status.Phase)
+	assert.Equal(t, "red", upd.Obj.(*Widget).Spec.Color, "spec must not be clobbered by status update")
+}
+
+// Informer watches multiple buckets and delivers events from all of them.
+func TestInformer_MultiBucket(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres")
+	}
+
+	bucketIDs := []int{0, 1, 2}
+	mgr := newMultiBucketManager(t, bucketIDs)
+	c := mgr.GetClient()
+	ch := mgr.GetCache()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	inf, err := ch.GetInformer(ctx, &Widget{})
+	require.NoError(t, err)
+
+	rec := newEventRecorder(20)
+	_, err = inf.AddEventHandler(rec)
+	require.NoError(t, err)
+
+	go func() {
+		if err := mgr.Start(ctx); err != nil {
+			t.Logf("manager exited: %v", err)
+		}
+	}()
+
+	require.Eventually(t, func() bool {
+		return ch.WaitForCacheSync(ctx)
+	}, 10*time.Second, 100*time.Millisecond, "cache never synced")
+
+	// Create widgets that will land in different buckets (name hash mod 3).
+	// The exact bucket assignment isn't important — what matters is that
+	// events arrive for objects in all buckets.
+	names := []string{"alpha", "beta", "gamma", "delta", "epsilon"}
+	for _, name := range names {
+		createWidget(t, c, ctx, name, "multi")
+	}
+
+	events := rec.waitFor(t, len(names), 15*time.Second)
+	seen := map[string]bool{}
+	for _, ev := range events {
+		seen[ev.Obj.GetName()] = true
+		rv := ev.Obj.GetResourceVersion()
+		_, parseErr := resourceversion.Parse(rv)
+		require.NoError(t, parseErr,
+			"event RV %q for %s must be a valid composite RV", rv, ev.Obj.GetName())
+	}
+	for _, name := range names {
+		assert.True(t, seen[name], "expected event for widget %q", name)
+	}
+
+	// Update one widget and verify delivery continues.
+	w := &Widget{}
+	require.NoError(t, c.Get(ctx, client.ObjectKey{Namespace: "default", Name: names[0]}, w))
+	w.Spec.Color = "updated"
+	require.NoError(t, c.Update(ctx, w))
+
+	upd := rec.waitForType(t, "update", 10*time.Second)
+	assert.Equal(t, names[0], upd.Obj.GetName())
+}
+
+// All watch event RVs are composite so the Reflector can reconnect with them.
+func TestInformer_WatchReconnection(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres")
+	}
+
+	ch, c, ctx, _ := startCacheAndClient(t)
+
+	inf, err := ch.GetInformer(ctx, &Widget{})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return inf.HasSynced() },
+		10*time.Second, 50*time.Millisecond, "widget informer never synced")
+
+	rec := newEventRecorder(50)
+	_, err = inf.AddEventHandler(rec)
+	require.NoError(t, err)
+
+	// Phase 1: create some objects and verify events.
+	for i := range 3 {
+		createWidget(t, c, ctx, fmt.Sprintf("reconnect-%d", i), "red")
+	}
+	phase1 := rec.waitFor(t, 3, 10*time.Second)
+	for _, ev := range phase1 {
+		rv := ev.Obj.GetResourceVersion()
+		_, parseErr := resourceversion.Parse(rv)
+		require.NoError(t, parseErr,
+			"phase 1 event RV %q must be composite", rv)
+	}
+
+	// Phase 2: create more objects after the initial batch. If the Reflector
+	// internally rotates the watch, it will use the last event's RV to
+	// reconnect. The bug would cause a parse failure here.
+	for i := range 3 {
+		createWidget(t, c, ctx, fmt.Sprintf("reconnect-late-%d", i), "blue")
+	}
+	phase2 := rec.waitFor(t, 3, 15*time.Second)
+	for _, ev := range phase2 {
+		rv := ev.Obj.GetResourceVersion()
+		_, parseErr := resourceversion.Parse(rv)
+		require.NoError(t, parseErr,
+			"phase 2 event RV %q must be composite", rv)
+	}
+}
+
+// Delete then recreate with the same name produces a new UID.
+func TestInformer_DeleteAndRecreate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres")
+	}
+
+	ch, c, ctx, _ := startCacheAndClient(t)
+
+	inf, err := ch.GetInformer(ctx, &Widget{})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return inf.HasSynced() },
+		10*time.Second, 50*time.Millisecond, "widget informer never synced")
+
+	rec := newEventRecorder(20)
+	_, err = inf.AddEventHandler(rec)
+	require.NoError(t, err)
+
+	// Create
+	createWidget(t, c, ctx, "phoenix", "red")
+	addEv := rec.waitForType(t, "add", 10*time.Second)
+	originalUID := addEv.Obj.GetUID()
+	assert.NotEmpty(t, originalUID)
+
+	// Delete
+	w := &Widget{}
+	require.NoError(t, c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "phoenix"}, w))
+	require.NoError(t, c.Delete(ctx, w))
+	rec.waitForType(t, "delete", 10*time.Second)
+
+	// Recreate with same name
+	createWidget(t, c, ctx, "phoenix", "blue")
+	readdEv := rec.waitForType(t, "add", 10*time.Second)
+	assert.NotEqual(t, originalUID, readdEv.Obj.GetUID(),
+		"recreated object must have a different UID")
+	assert.Equal(t, "blue", readdEv.Obj.(*Widget).Spec.Color)
 }
 
 // compile-time check
