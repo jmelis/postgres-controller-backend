@@ -152,11 +152,6 @@ func (w *Writer) writeObjectStoredProc(ctx context.Context, req model.ObjectWrit
 
 func (w *Writer) callStoredProc(ctx context.Context, p writeParams) (model.WriteResult, error) {
 	t0 := time.Now()
-	tx, err := w.conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-	if err != nil {
-		return model.WriteResult{}, fmt.Errorf("begin: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var uid uuid.UUID
 	var version int64
@@ -164,7 +159,7 @@ func (w *Writer) callStoredProc(ctx context.Context, p writeParams) (model.Write
 	var changed bool
 	var suppressUs, upsertUs int64
 
-	err = tx.QueryRow(ctx, pgctlWriteSQL,
+	err := w.conn.QueryRow(ctx, pgctlWriteSQL,
 		p.statusOnly, p.gvk, p.namespace, p.name,
 		p.expectedVersion, p.forceWrite,
 		p.spec, p.status, p.metadata, p.deletionTimestamp,
@@ -172,28 +167,21 @@ func (w *Writer) callStoredProc(ctx context.Context, p writeParams) (model.Write
 	w.observeStep("stored_proc", time.Since(t0))
 
 	if err != nil {
-		return model.WriteResult{}, mapStoredProcError(err)
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			return model.WriteResult{}, mapStoredProcError(err)
+		}
+		return model.WriteResult{}, &AmbiguousCommitError{
+			Cause: err, GVK: p.gvk, Namespace: p.namespace, Name: p.name, Txid: 0,
+		}
 	}
 
 	w.observeStep("suppression_check", time.Duration(suppressUs)*time.Microsecond)
 	w.observeStep("upsert", time.Duration(upsertUs)*time.Microsecond)
 
 	if !changed {
-		t0 = time.Now()
-		if err := tx.Commit(ctx); err != nil {
-			return model.WriteResult{}, fmt.Errorf("commit (suppressed): %w", err)
-		}
-		w.observeStep("commit", time.Since(t0))
 		return model.WriteResult{ObjectVersion: version, UID: uid, Changed: false}, nil
 	}
-
-	t0 = time.Now()
-	if err := tx.Commit(ctx); err != nil {
-		return model.WriteResult{}, &AmbiguousCommitError{
-			Cause: err, GVK: p.gvk, Namespace: p.namespace, Name: p.name, Txid: txid,
-		}
-	}
-	w.observeStep("commit", time.Since(t0))
 
 	if w.doorbell != nil {
 		w.doorbell.Ring(p.gvk)
