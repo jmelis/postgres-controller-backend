@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -12,10 +11,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/reader"
+	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	toolscache "k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -34,6 +35,7 @@ type pgCache struct {
 	informers map[schema.GroupVersionKind]*pgInformer
 	started   bool
 	ctx       context.Context
+	stopCh    chan struct{}
 }
 
 // --- cache.Reader (Get/List delegate directly to postgres) ---
@@ -50,10 +52,9 @@ func (c *pgCache) Get(ctx context.Context, key client.ObjectKey, obj client.Obje
 		return err
 	}
 	defer poolConn.Release()
-	conn := poolConn.Conn()
 
 	var r model.Resource
-	err = conn.QueryRow(ctx, `
+	err = poolConn.Conn().QueryRow(ctx, `
 		SELECT gvk, namespace, name, uid, bucket_id, gvk_bucket_seq,
 		       object_version, spec, status, metadata,
 		       deletion_timestamp, created_at, updated_at
@@ -155,6 +156,7 @@ func (c *pgCache) Start(ctx context.Context) error {
 	c.mu.Lock()
 	c.started = true
 	c.ctx = ctx
+	c.stopCh = make(chan struct{})
 	informers := make([]*pgInformer, 0, len(c.informers))
 	for _, inf := range c.informers {
 		informers = append(informers, inf)
@@ -166,40 +168,25 @@ func (c *pgCache) Start(ctx context.Context) error {
 		wg.Add(1)
 		go func(inf *pgInformer) {
 			defer wg.Done()
-			inf.run(ctx)
+			inf.inner.Run(c.stopCh)
 		}(inf)
 	}
 
 	<-ctx.Done()
+	close(c.stopCh)
 	wg.Wait()
 	return nil
 }
 
 func (c *pgCache) WaitForCacheSync(ctx context.Context) bool {
 	c.mu.Lock()
-	informers := make([]*pgInformer, 0, len(c.informers))
+	syncFuncs := make([]toolscache.InformerSynced, 0, len(c.informers))
 	for _, inf := range c.informers {
-		informers = append(informers, inf)
+		syncFuncs = append(syncFuncs, inf.inner.HasSynced)
 	}
 	c.mu.Unlock()
 
-	for {
-		allSynced := true
-		for _, inf := range informers {
-			if !inf.HasSynced() {
-				allSynced = false
-				break
-			}
-		}
-		if allSynced {
-			return true
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
+	return toolscache.WaitForCacheSync(c.stopCh, syncFuncs...)
 }
 
 func (c *pgCache) IndexField(ctx context.Context, obj client.Object, field string, extractValue client.IndexerFunc) error {
@@ -219,305 +206,149 @@ func (c *pgCache) getOrCreateInformer(gvk schema.GroupVersionKind) (*pgInformer,
 		buckets = []int{UnshardedBucket}
 	}
 
-	inf := &pgInformer{
-		gvk:         gvk,
-		gvkStr:      gvkToString(gvk),
-		scheme:      c.scheme,
-		pool:      c.pool,
-		bucketIDs: buckets,
-		logger:      c.logger.WithValues("gvk", gvk.String()),
-		store:       make(map[types.NamespacedName]storedObject),
+	gvkStr := gvkToString(gvk)
+	listGVK := schema.GroupVersionKind{
+		Group:   gvk.Group,
+		Version: gvk.Version,
+		Kind:    gvk.Kind + "List",
 	}
+
+	lw := &listWatchWithoutWatchListSemantics{&toolscache.ListWatch{
+		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
+			poolConn, err := c.pool.Acquire(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("list connect: %w", err)
+			}
+			defer poolConn.Release()
+
+			result, err := reader.List(ctx, poolConn.Conn(), gvkStr, buckets)
+			if err != nil {
+				return nil, fmt.Errorf("list: %w", err)
+			}
+
+			listObj, err := c.scheme.New(listGVK)
+			if err != nil {
+				return nil, fmt.Errorf("scheme.New(%v): %w", listGVK, err)
+			}
+
+			var items []client.Object
+			for _, r := range result.Resources {
+				obj, err := resourceToObject(r, c.scheme)
+				if err != nil {
+					return nil, err
+				}
+				items = append(items, obj)
+			}
+
+			oList, ok := listObj.(client.ObjectList)
+			if !ok {
+				return nil, fmt.Errorf("type %T does not implement client.ObjectList", listObj)
+			}
+			if err := setListItems(oList, items); err != nil {
+				return nil, err
+			}
+			oList.SetResourceVersion(result.ResourceVersion.String())
+
+			return listObj, nil
+		},
+		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			startRV := resourceversion.RV{Buckets: make(map[int]int64)}
+			if opts.ResourceVersion != "" {
+				rv, err := resourceversion.Parse(opts.ResourceVersion)
+				if err != nil {
+					return nil, fmt.Errorf("parse resourceVersion %q: %w", opts.ResourceVersion, err)
+				}
+				startRV = rv
+			}
+
+			pollPoolConn, err := c.pool.Acquire(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("watch poll connect: %w", err)
+			}
+			pollConn := pollPoolConn.Hijack()
+
+			listenPoolConn, err := c.pool.Acquire(ctx)
+			if err != nil {
+				pollConn.Close(ctx)
+				return nil, fmt.Errorf("watch listen connect: %w", err)
+			}
+			listenConn := listenPoolConn.Hijack()
+
+			w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
+				GVK:       gvkStr,
+				BucketIDs: buckets,
+				StartRV:   startRV,
+			}, nil)
+
+			watchCtx, watchCancel := context.WithCancel(ctx)
+			go func() {
+				_ = w.Run(watchCtx)
+				pollConn.Close(context.Background())
+				listenConn.Close(context.Background())
+				watchCancel()
+			}()
+
+			return newPgWatcher(watchCtx, w, c.scheme), nil
+		},
+	}}
+
+	exampleObj, err := c.scheme.New(gvk)
+	if err != nil {
+		return nil, fmt.Errorf("scheme.New(%v): %w", gvk, err)
+	}
+
+	si := toolscache.NewSharedIndexInformerWithOptions(lw, exampleObj, toolscache.SharedIndexInformerOptions{
+		ObjectDescription: gvk.Kind,
+	})
+
+	inf := &pgInformer{inner: si}
 	c.informers[gvk] = inf
 
-	if c.started && c.ctx != nil {
-		go inf.run(c.ctx)
+	if c.started && c.stopCh != nil {
+		go si.Run(c.stopCh)
 	}
 
 	return inf, nil
 }
 
-// --- pgInformer implements cache.Informer ---
-
-type storedObject struct {
-	resourceVersion string
-	obj             client.Object
-}
+// --- pgInformer delegates to toolscache.SharedIndexInformer ---
 
 type pgInformer struct {
-	gvk       schema.GroupVersionKind
-	gvkStr    string
-	scheme    *runtime.Scheme
-	pool      *pgxpool.Pool
-	bucketIDs []int
-	logger    logr.Logger
-
-	handlerMu sync.RWMutex
-	handlers  []handlerEntry
-	synced    atomic.Bool
-	stopped   atomic.Bool
-
-	storeMu sync.RWMutex
-	store   map[types.NamespacedName]storedObject
-}
-
-type handlerEntry struct {
-	handler toolscache.ResourceEventHandler
-	reg     *pgHandlerRegistration
-}
-
-type pgHandlerRegistration struct {
-	synced atomic.Bool
-}
-
-func (r *pgHandlerRegistration) HasSynced() bool { return r.synced.Load() }
-func (r *pgHandlerRegistration) HasSyncedChecker() toolscache.DoneChecker {
-	return syncedDoneChecker("pgHandlerRegistration", &r.synced)
+	inner toolscache.SharedIndexInformer
 }
 
 func (inf *pgInformer) AddEventHandler(handler toolscache.ResourceEventHandler) (toolscache.ResourceEventHandlerRegistration, error) {
-	return inf.AddEventHandlerWithResyncPeriod(handler, 0)
+	return inf.inner.AddEventHandler(handler)
 }
 
-func (inf *pgInformer) AddEventHandlerWithResyncPeriod(handler toolscache.ResourceEventHandler, _ time.Duration) (toolscache.ResourceEventHandlerRegistration, error) {
-	reg := &pgHandlerRegistration{}
-
-	inf.handlerMu.Lock()
-	inf.handlers = append(inf.handlers, handlerEntry{handler: handler, reg: reg})
-	alreadySynced := inf.synced.Load()
-	inf.handlerMu.Unlock()
-
-	if alreadySynced {
-		reg.synced.Store(true)
-		inf.storeMu.RLock()
-		for _, so := range inf.store {
-			handler.OnAdd(so.obj, true)
-		}
-		inf.storeMu.RUnlock()
-	}
-
-	return reg, nil
+func (inf *pgInformer) AddEventHandlerWithResyncPeriod(handler toolscache.ResourceEventHandler, resyncPeriod time.Duration) (toolscache.ResourceEventHandlerRegistration, error) {
+	return inf.inner.AddEventHandlerWithResyncPeriod(handler, resyncPeriod)
 }
 
-// AddEventHandlerWithOptions delegates to AddEventHandlerWithResyncPeriod; options are ignored.
 func (inf *pgInformer) AddEventHandlerWithOptions(handler toolscache.ResourceEventHandler, opts toolscache.HandlerOptions) (toolscache.ResourceEventHandlerRegistration, error) {
-	return inf.AddEventHandlerWithResyncPeriod(handler, 0)
+	return inf.inner.AddEventHandlerWithOptions(handler, opts)
 }
 
 func (inf *pgInformer) RemoveEventHandler(handle toolscache.ResourceEventHandlerRegistration) error {
-	return nil
+	return inf.inner.RemoveEventHandler(handle)
 }
 
 func (inf *pgInformer) AddIndexers(indexers toolscache.Indexers) error {
-	return nil
+	return inf.inner.AddIndexers(indexers)
 }
 
 func (inf *pgInformer) HasSynced() bool {
-	return inf.synced.Load()
+	return inf.inner.HasSynced()
 }
 
 func (inf *pgInformer) HasSyncedChecker() toolscache.DoneChecker {
-	return syncedDoneChecker("pgInformer:"+inf.gvkStr, &inf.synced)
+	return inf.inner.HasSyncedChecker()
 }
 
 func (inf *pgInformer) IsStopped() bool {
-	return inf.stopped.Load()
-}
-
-func (inf *pgInformer) run(ctx context.Context) {
-	defer inf.stopped.Store(true)
-
-	for ctx.Err() == nil {
-		if err := inf.listAndWatch(ctx); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			inf.logger.Error(err, "list-watch cycle failed")
-			time.Sleep(time.Second)
-		}
-	}
-}
-
-func (inf *pgInformer) listAndWatch(ctx context.Context) error {
-	listConn, err := inf.pool.Acquire(ctx)
-	if err != nil {
-		return fmt.Errorf("list connect: %w", err)
-	}
-
-	result, err := reader.List(ctx, listConn.Conn(), inf.gvkStr, inf.bucketIDs)
-	listConn.Release()
-	if err != nil {
-		return fmt.Errorf("list: %w", err)
-	}
-
-	inf.processListResult(result.Resources, !inf.synced.Load())
-
-	if !inf.synced.Load() {
-		inf.synced.Store(true)
-		inf.handlerMu.RLock()
-		for _, h := range inf.handlers {
-			h.reg.synced.Store(true)
-		}
-		inf.handlerMu.RUnlock()
-	}
-
-	inf.logger.V(1).Info("watching", "rv", result.ResourceVersion.String())
-
-	pollPoolConn, err := inf.pool.Acquire(ctx)
-	if err != nil {
-		return fmt.Errorf("watch poll connect: %w", err)
-	}
-	pollConn := pollPoolConn.Hijack()
-
-	listenPoolConn, err := inf.pool.Acquire(ctx)
-	if err != nil {
-		pollConn.Close(ctx)
-		return fmt.Errorf("watch listen connect: %w", err)
-	}
-	listenConn := listenPoolConn.Hijack()
-
-	watcher := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
-		GVK:       inf.gvkStr,
-		BucketIDs: inf.bucketIDs,
-		StartRV:   result.ResourceVersion,
-	}, nil)
-
-	go func() {
-		_ = watcher.Run(ctx)
-		pollConn.Close(context.Background())
-		listenConn.Close(context.Background())
-	}()
-
-	for ev := range watcher.Events() {
-		inf.processEvent(ev)
-	}
-
-	return nil
-}
-
-func (inf *pgInformer) processListResult(resources []model.Resource, isInitialList bool) {
-	inf.storeMu.Lock()
-	defer inf.storeMu.Unlock()
-
-	seen := make(map[types.NamespacedName]bool, len(resources))
-
-	for _, r := range resources {
-		key := types.NamespacedName{Namespace: r.Namespace, Name: r.Name}
-		seen[key] = true
-
-		obj, err := resourceToObject(r, inf.scheme)
-		if err != nil {
-			inf.logger.Error(err, "convert resource", "ns", r.Namespace, "name", r.Name)
-			continue
-		}
-		rv := obj.GetResourceVersion()
-
-		existing, exists := inf.store[key]
-		inf.store[key] = storedObject{resourceVersion: rv, obj: obj}
-
-		if !exists {
-			inf.dispatchAdd(obj, isInitialList)
-		} else if existing.resourceVersion != rv {
-			inf.dispatchUpdate(existing.obj, obj)
-		}
-	}
-
-	for key, so := range inf.store {
-		if !seen[key] {
-			delete(inf.store, key)
-			inf.dispatchDelete(so.obj)
-		}
-	}
-}
-
-func (inf *pgInformer) processEvent(ev reader.Event) {
-	obj, err := resourceToObject(ev.Resource, inf.scheme)
-	if err != nil {
-		inf.logger.Error(err, "convert event resource")
-		return
-	}
-	key := types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}
-
-	inf.storeMu.Lock()
-	defer inf.storeMu.Unlock()
-
-	switch ev.Type {
-	case reader.EventAdded:
-		old, exists := inf.store[key]
-		inf.store[key] = storedObject{resourceVersion: obj.GetResourceVersion(), obj: obj}
-		if exists {
-			inf.dispatchUpdate(old.obj, obj)
-		} else {
-			inf.dispatchAdd(obj, false)
-		}
-	case reader.EventModified:
-		old, exists := inf.store[key]
-		inf.store[key] = storedObject{resourceVersion: obj.GetResourceVersion(), obj: obj}
-		if exists {
-			inf.dispatchUpdate(old.obj, obj)
-		} else {
-			inf.dispatchAdd(obj, false)
-		}
-	case reader.EventDeleted:
-		if hasFinalizers(ev.Resource) {
-			old, exists := inf.store[key]
-			inf.store[key] = storedObject{resourceVersion: obj.GetResourceVersion(), obj: obj}
-			if exists {
-				inf.dispatchUpdate(old.obj, obj)
-			} else {
-				inf.dispatchAdd(obj, false)
-			}
-		} else if so, exists := inf.store[key]; exists {
-			delete(inf.store, key)
-			inf.dispatchDelete(so.obj)
-		}
-	}
-}
-
-func (inf *pgInformer) dispatchAdd(obj client.Object, isInitialList bool) {
-	inf.handlerMu.RLock()
-	defer inf.handlerMu.RUnlock()
-	for _, h := range inf.handlers {
-		h.handler.OnAdd(obj, isInitialList)
-	}
-}
-
-func (inf *pgInformer) dispatchUpdate(oldObj, newObj client.Object) {
-	inf.handlerMu.RLock()
-	defer inf.handlerMu.RUnlock()
-	for _, h := range inf.handlers {
-		h.handler.OnUpdate(oldObj, newObj)
-	}
-}
-
-func (inf *pgInformer) dispatchDelete(obj client.Object) {
-	inf.handlerMu.RLock()
-	defer inf.handlerMu.RUnlock()
-	for _, h := range inf.handlers {
-		h.handler.OnDelete(obj)
-	}
-}
-
-// syncedDoneChecker wraps an atomic.Bool as a toolscache.DoneChecker (snapshot, not live).
-func syncedDoneChecker(name string, flag *atomic.Bool) toolscache.DoneChecker {
-	return &doneChecker{n: name, flag: flag}
-}
-
-type doneChecker struct {
-	n    string
-	flag *atomic.Bool
-}
-
-func (d *doneChecker) Name() string { return d.n }
-func (d *doneChecker) Done() <-chan struct{} {
-	ch := make(chan struct{})
-	if d.flag.Load() {
-		close(ch)
-	}
-	return ch
+	return inf.inner.IsStopped()
 }
 
 // compile-time interface checks
 var _ cache.Cache = (*pgCache)(nil)
 var _ cache.Informer = (*pgInformer)(nil)
-var _ toolscache.ResourceEventHandlerRegistration = (*pgHandlerRegistration)(nil)
