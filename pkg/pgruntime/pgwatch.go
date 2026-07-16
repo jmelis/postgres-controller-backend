@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/jmelis/postgres-controller-backend/internal/reader"
+	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	toolscache "k8s.io/client-go/tools/cache"
@@ -13,14 +14,20 @@ import (
 // client-go Reflector. It converts reader.Event values into watch.Event values
 // and forwards them on ResultChan.
 type pgWatcher struct {
-	result chan watch.Event
-	done   chan struct{}
+	result    chan watch.Event
+	done      chan struct{}
+	currentRV resourceversion.RV
 }
 
-func newPgWatcher(ctx context.Context, w *reader.Watcher, scheme *runtime.Scheme) *pgWatcher {
+func newPgWatcher(ctx context.Context, w *reader.Watcher, scheme *runtime.Scheme, startRV resourceversion.RV) *pgWatcher {
+	buckets := make(map[int]int64, len(startRV.Buckets))
+	for k, v := range startRV.Buckets {
+		buckets[k] = v
+	}
 	pw := &pgWatcher{
-		result: make(chan watch.Event),
-		done:   make(chan struct{}),
+		result:    make(chan watch.Event),
+		done:      make(chan struct{}),
+		currentRV: resourceversion.RV{Buckets: buckets},
 	}
 	go pw.relay(ctx, w, scheme)
 	return pw
@@ -44,6 +51,11 @@ func (pw *pgWatcher) relay(ctx context.Context, w *reader.Watcher, scheme *runti
 			if err != nil {
 				continue
 			}
+			// Advance the composite RV and stamp it on the object so the
+			// Reflector's lastSyncResourceVersion stays in composite format.
+			pw.currentRV.Buckets[ev.Resource.BucketID] = ev.Resource.GVKBucketSeq
+			obj.SetResourceVersion(pw.currentRV.String())
+
 			var eventType watch.EventType
 			switch ev.Type {
 			case reader.EventAdded:

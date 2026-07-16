@@ -288,7 +288,7 @@ func (c *pgCache) getOrCreateInformer(gvk schema.GroupVersionKind) (*pgInformer,
 				watchCancel()
 			}()
 
-			return newPgWatcher(watchCtx, w, c.scheme), nil
+			return newPgWatcher(watchCtx, w, c.scheme, startRV), nil
 		},
 	}}
 

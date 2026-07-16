@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	toolscache "k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -339,6 +340,38 @@ func TestInformer_MultipleHandlers(t *testing.T) {
 	ev2 := rec2.waitForType(t, "add", 10*time.Second)
 	assert.Equal(t, "multi-handler", ev1.Obj.GetName())
 	assert.Equal(t, "multi-handler", ev2.Obj.GetName())
+}
+
+func TestInformer_WatchEventResourceVersionFormat(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres")
+	}
+
+	ch, c, ctx, _ := startCacheAndClient(t)
+
+	inf, err := ch.GetInformer(ctx, &Widget{})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return inf.HasSynced() },
+		10*time.Second, 50*time.Millisecond, "widget informer never synced")
+
+	rec := newEventRecorder(20)
+	_, err = inf.AddEventHandler(rec)
+	require.NoError(t, err)
+
+	createWidget(t, c, ctx, "rv-format", "red")
+
+	ev := rec.waitForType(t, "add", 10*time.Second)
+	rv := ev.Obj.GetResourceVersion()
+
+	// The Reflector stores each watch event's ResourceVersion as
+	// lastSyncResourceVersion and passes it back to WatchFunc on reconnect.
+	// If watch events carry a bare ObjectVersion (e.g. "3"), the next
+	// WatchFunc call would fail to parse it as a composite RV, causing the
+	// informer to error-loop on every watch reconnect.
+	_, parseErr := resourceversion.Parse(rv)
+	require.NoError(t, parseErr,
+		"watch event ResourceVersion %q must be a valid composite RV; "+
+			"a bare ObjectVersion would break Reflector reconnection", rv)
 }
 
 // compile-time check
