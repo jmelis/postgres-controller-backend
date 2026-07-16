@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jmelis/postgres-controller-backend/internal/doorbell"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
 	"github.com/jmelis/postgres-controller-backend/test/testinfra"
@@ -46,7 +48,10 @@ func makeWriteReq(gvk, ns, name string) model.WriteRequest {
 
 func newWriter(t *testing.T, hooks writer.TxHooks) *writer.Writer {
 	t.Helper()
-	return writer.New(freshConn(t), hooks)
+	dbConn := freshConn(t)
+	db := doorbell.NewDebouncer(dbConn, 50*time.Millisecond)
+	t.Cleanup(func() { db.Close() })
+	return writer.New(freshConn(t), hooks).WithDoorbell(db)
 }
 
 // blockingHook implements TxHooks to pause at BeforeCommit.
