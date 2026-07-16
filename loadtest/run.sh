@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TF_DIR="$SCRIPT_DIR/terraform"
+TF_DIR="${PGCTL_TF_DIR:-$SCRIPT_DIR/terraform}"
 
 COMMANDS="setup|run|check|status|results|ssh|teardown|all|help"
 
