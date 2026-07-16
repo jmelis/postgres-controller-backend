@@ -121,6 +121,38 @@ func TestParity_OwnerReferences(t *testing.T) {
 	})
 }
 
+// Modifying an owned child triggers re-reconciliation of the parent.
+func TestParity_OwnsTriggersReconcile(t *testing.T) {
+	runOnBothBackends(t, func(t *testing.T, b *Backend) {
+		ctx := context.Background()
+
+		g := &greeting.Greeting{
+			ObjectMeta: metav1.ObjectMeta{Name: "frank", Namespace: b.Namespace},
+			Spec:       greeting.GreetingSpec{Name: "Frank"},
+		}
+		require.NoError(t, b.Client.Create(ctx, g))
+
+		// Wait for the reconciler to create the card and set status.
+		card := &greeting.GreetingCard{}
+		cardKey := types.NamespacedName{Namespace: b.Namespace, Name: "frank-card"}
+		eventuallyGet(t, b.Client, cardKey, card, reconcileTimeout)
+		assert.Equal(t, "Hello, Frank!", card.Spec.Message)
+
+		fetched := &greeting.Greeting{}
+		eventuallyCondition(t, b.Client, types.NamespacedName{Namespace: b.Namespace, Name: "frank"}, fetched, reconcileTimeout,
+			"status Ready", func() bool { return fetched.Status.Phase == "Ready" })
+
+		// Externally tamper with the card's message.
+		require.NoError(t, b.Client.Get(ctx, cardKey, card))
+		card.Spec.Message = "TAMPERED"
+		require.NoError(t, b.Client.Update(ctx, card))
+
+		// The Owns() watch should trigger re-reconciliation and restore the message.
+		eventuallyCondition(t, b.Client, cardKey, card, reconcileTimeout,
+			"card restored", func() bool { return card.Spec.Message == "Hello, Frank!" })
+	})
+}
+
 func TestParity_StatusSubresource(t *testing.T) {
 	runOnBothBackends(t, func(t *testing.T, b *Backend) {
 		ctx := context.Background()
