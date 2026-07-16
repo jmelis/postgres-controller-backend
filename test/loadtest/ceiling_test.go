@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jmelis/postgres-controller-backend/internal/doorbell"
 	"github.com/jmelis/postgres-controller-backend/internal/metrics"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/verifier"
@@ -252,6 +253,12 @@ func TestCeiling_MultiGVK(t *testing.T) {
 				}
 			}
 
+			// Create debounced doorbell (one per sweep, own connection)
+			dbConn := manualConn(t)
+			defer dbConn.Close(context.Background())
+			db := doorbell.NewDebouncer(dbConn, 50*time.Millisecond)
+			defer db.Close()
+
 			// Run writers
 			type workerResult struct {
 				latencies   []time.Duration
@@ -280,7 +287,7 @@ func TestCeiling_MultiGVK(t *testing.T) {
 					defer conn.Close(context.Background())
 
 					gs := testGVKs[gvkIdx]
-					wr := writer.New(conn, nil).WithMetrics(writerMetrics)
+					wr := writer.New(conn, nil).WithMetrics(writerMetrics).WithDoorbell(db)
 					var writeNum int
 
 					for time.Now().Before(deadline) {

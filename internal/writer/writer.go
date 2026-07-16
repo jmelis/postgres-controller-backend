@@ -15,10 +15,17 @@ import (
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 )
 
+// Doorbell coalesces write notifications so watchers wake up without
+// paying a pg_notify round-trip on every single write.
+type Doorbell interface {
+	Ring(gvk string)
+}
+
 type Writer struct {
-	conn    *pgx.Conn
-	hooks   TxHooks
-	metrics *metrics.WriterMetrics
+	conn     *pgx.Conn
+	hooks    TxHooks
+	metrics  *metrics.WriterMetrics
+	doorbell Doorbell
 }
 
 func New(conn *pgx.Conn, hooks TxHooks) *Writer {
@@ -28,6 +35,12 @@ func New(conn *pgx.Conn, hooks TxHooks) *Writer {
 // WithMetrics attaches Prometheus metrics to the writer.
 func (w *Writer) WithMetrics(m *metrics.WriterMetrics) *Writer {
 	w.metrics = m
+	return w
+}
+
+// WithDoorbell attaches a debounced doorbell that coalesces pg_notify calls.
+func (w *Writer) WithDoorbell(d Doorbell) *Writer {
+	w.doorbell = d
 	return w
 }
 
@@ -182,7 +195,9 @@ func (w *Writer) callStoredProc(ctx context.Context, p writeParams) (model.Write
 	}
 	w.observeStep("commit", time.Since(t0))
 
-	w.fireDoorbell(ctx, p.gvk)
+	if w.doorbell != nil {
+		w.doorbell.Ring(p.gvk)
+	}
 
 	return model.WriteResult{Txid: txid, ObjectVersion: version, UID: uid, Changed: true}, nil
 }
@@ -200,19 +215,6 @@ func mapStoredProcError(err error) error {
 		}
 	}
 	return fmt.Errorf("stored proc: %w", err)
-}
-
-func (w *Writer) fireDoorbell(ctx context.Context, gvk string) {
-	channel := model.DoorbellChannel(gvk)
-	t0 := time.Now()
-	_, err := w.conn.Exec(ctx, `SELECT pg_notify($1, '')`, channel)
-	w.observeStep("doorbell_external", time.Since(t0))
-	if err != nil {
-		log.Printf("doorbell send failed (non-fatal): %v", err)
-		if w.metrics != nil {
-			w.metrics.DoorbellErrorsTotal.Inc()
-		}
-	}
 }
 
 // --- Multi-statement path (test hooks, hooks!=nil) ---
@@ -538,7 +540,9 @@ func (w *Writer) execWriteInner(ctx context.Context, p writeParams, isContentEqu
 	}
 	w.observeStep("commit", time.Since(t0))
 
-	w.fireDoorbell(ctx, p.gvk)
+	if w.doorbell != nil {
+		w.doorbell.Ring(p.gvk)
+	}
 
 	return model.WriteResult{Txid: txid, ObjectVersion: version, UID: uid, Changed: true}, nil
 }

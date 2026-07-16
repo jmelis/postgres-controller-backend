@@ -34,8 +34,8 @@ CREATE TABLE IF NOT EXISTS compaction_horizon (
 -- Write stored procedure.
 -- Performs optional no-op suppression and upsert in a single server-side call.
 -- Uses pg_current_xact_id() as the ordering stamp — no shared counter, no lock
--- contention. Does NOT issue pg_notify — the caller fires the doorbell after
--- commit to avoid the global notification-queue lock.
+-- contention. Does NOT issue pg_notify — the caller's doorbell debouncer
+-- coalesces notifications to avoid per-write round-trip overhead.
 -- Returns per-step timings (microseconds) so the caller can emit them as
 -- Prometheus histograms without additional round-trips.
 DROP FUNCTION IF EXISTS pgctl_write;
