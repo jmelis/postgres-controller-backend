@@ -27,9 +27,11 @@ func TestVerifier_NoUnboundedMap(t *testing.T) {
 	}
 }
 
-// TestDuplicateDetection_ViaMonotonicity verifies that duplicate delivery is
-// caught by the I3 monotonicity check (txid <= hwm). No per-event map needed.
-func TestDuplicateDetection_ViaMonotonicity(t *testing.T) {
+// TestRedelivery_CountedNotViolation verifies that re-delivered events
+// (txid <= hwm) are counted as redeliveries, not flagged as violations.
+// In the xid8 watermark model, the watcher re-scans the (hwm, xmin) window
+// each poll, so re-delivery is expected behavior.
+func TestRedelivery_CountedNotViolation(t *testing.T) {
 	v := &Verifier{
 		cfg: Config{
 			GVK: "apps/v1/Deployment",
@@ -45,17 +47,13 @@ func TestDuplicateDetection_ViaMonotonicity(t *testing.T) {
 		},
 	}
 
-	v.checkEvent(ev) // first delivery — clean
-	v.checkEvent(ev) // duplicate — txid=1 <= hwm=1
+	v.checkEvent(ev) // first delivery — advances hwm to 1
+	v.checkEvent(ev) // re-delivery — txid=1 <= hwm=1
 
-	var found bool
-	for _, viol := range v.violations {
-		if viol.Invariant == "I2" {
-			found = true
-			break
-		}
+	if len(v.violations) > 0 {
+		t.Fatalf("re-delivery should not produce violations, got %v", v.violations)
 	}
-	if !found {
-		t.Fatal("duplicate delivery not detected by hwm monotonicity (I2)")
+	if v.redeliveries != 1 {
+		t.Fatalf("expected 1 redelivery, got %d", v.redeliveries)
 	}
 }

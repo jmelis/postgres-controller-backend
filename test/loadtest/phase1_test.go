@@ -50,13 +50,12 @@ func truncateAll(t *testing.T) {
 	conn.Close(context.Background())
 }
 
-// Phase 1 — Counter ceiling (§7).
+// Phase 1 — Write ceiling (§7).
 // 50 workers, one GVK, single Postgres instance.
 // Criteria:
 //   - ≥200 commits/s sustained
 //   - p99 ≤ 10ms
 //   - Zero serialization failures
-//   - Zero fencing false-positives
 //   - Verifier silent (no invariant violations)
 func TestPhase1_CounterCeiling(t *testing.T) {
 	if testing.Short() {

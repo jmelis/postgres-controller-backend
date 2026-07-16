@@ -203,7 +203,7 @@ func mapStoredProcError(err error) error {
 }
 
 func (w *Writer) fireDoorbell(ctx context.Context, gvk string) {
-	channel := fmt.Sprintf("resource_changes_%s", gvk)
+	channel := model.DoorbellChannel(gvk)
 	t0 := time.Now()
 	_, err := w.conn.Exec(ctx, `SELECT pg_notify($1, '')`, channel)
 	w.observeStep("doorbell_external", time.Since(t0))
@@ -447,6 +447,12 @@ func (w *Writer) observeResult(start time.Time, gvk string, result model.WriteRe
 	}
 	w.metrics.WriteDuration.WithLabelValues(gvk, resultLabel).Observe(dur.Seconds())
 	w.metrics.WritesTotal.WithLabelValues(gvk, resultLabel).Inc()
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "57014" {
+		w.metrics.StatementTimeoutsTotal.Inc()
+		log.Printf("CRITICAL: write transaction hit statement_timeout (%.1fs) for gvk=%s — xmin is pinned, watcher HWM frozen", dur.Seconds(), gvk)
+	}
 }
 
 func (w *Writer) observeStep(step string, d time.Duration) {

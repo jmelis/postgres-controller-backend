@@ -1,11 +1,25 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// DoorbellChannel returns the LISTEN/NOTIFY channel name for a GVK.
+// PostgreSQL limits identifiers to 63 bytes, so we hash long GVK strings.
+func DoorbellChannel(gvk string) string {
+	raw := fmt.Sprintf("resource_changes_%s", gvk)
+	if len(raw) <= 63 {
+		return raw
+	}
+	h := sha256.Sum256([]byte(gvk))
+	return fmt.Sprintf("rc_%s", hex.EncodeToString(h[:12]))
+}
 
 type Resource struct {
 	GVK               string

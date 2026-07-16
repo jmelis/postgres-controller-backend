@@ -300,6 +300,10 @@ func createPool(ctx context.Context, opts Options) (*pgxpool.Pool, error) {
 	if opts.MinPoolConns > 0 {
 		config.MinConns = opts.MinPoolConns
 	}
+	if config.ConnConfig.RuntimeParams == nil {
+		config.ConnConfig.RuntimeParams = make(map[string]string)
+	}
+	config.ConnConfig.RuntimeParams["statement_timeout"] = "30000"
 	if opts.SlowQueryThreshold > 0 {
 		logger := opts.SlowQueryLogger
 		if logger == nil {

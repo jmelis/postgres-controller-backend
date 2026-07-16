@@ -330,7 +330,7 @@ func (w *Watcher) listenLoop(ctx context.Context, notify chan<- struct{}) {
 
 // listenAll issues LISTEN for the GVK channel on the given conn.
 func (w *Watcher) listenAll(ctx context.Context, conn *pgx.Conn) error {
-	channel := fmt.Sprintf("resource_changes_%s", w.cfg.GVK)
+	channel := model.DoorbellChannel(w.cfg.GVK)
 	if _, err := conn.Exec(ctx, fmt.Sprintf(`LISTEN "%s"`, channel)); err != nil {
 		return fmt.Errorf("listen %s: %w", channel, err)
 	}
