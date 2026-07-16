@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/jmelis/postgres-controller-backend/internal/model"
+	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -129,7 +130,16 @@ func parseResourceVersion(obj client.Object) (int64, error) {
 	if rv == "" {
 		return 0, nil
 	}
-	return strconv.ParseInt(rv, 10, 64)
+	if v, err := strconv.ParseInt(rv, 10, 64); err == nil {
+		return v, nil
+	}
+	// Objects delivered by watch events carry a composite RV with the object
+	// version as an "o<n>;" prefix (see pgWatcher.relay).
+	composite, err := resourceversion.Parse(rv)
+	if err != nil || composite.ObjectVersion == 0 {
+		return 0, fmt.Errorf("resource version %q carries no object version", rv)
+	}
+	return composite.ObjectVersion, nil
 }
 
 func resourceToObject(r model.Resource, scheme *runtime.Scheme) (client.Object, error) {

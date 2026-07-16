@@ -114,6 +114,13 @@ restarted so caches relist from the current state.
 
 The serialization is canonical (buckets sorted) so equal states compare equal.
 
+One wrinkle: when the pgruntime layer stamps this composite RV on a single
+object delivered by a watch event (the informer machinery stores each event
+object's RV as its reconnect bookmark), the object's own version rides along as
+an `o<version>;` prefix — `o5;b2:1044,b5:902` — so that the object remains
+usable for optimistic-concurrency writes. Watch resumption ignores the prefix
+(DESIGN.md §3.2).
+
 ---
 
 ## 4. The write path

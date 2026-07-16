@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	toolscache "k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -372,6 +373,77 @@ func TestInformer_WatchEventResourceVersionFormat(t *testing.T) {
 	require.NoError(t, parseErr,
 		"watch event ResourceVersion %q must be a valid composite RV; "+
 			"a bare ObjectVersion would break Reflector reconnection", rv)
+}
+
+// WaitForCacheSync must honor its context: a cancelled context has to unblock
+// the wait and return false, even if the cache was never started. Waiting on
+// the Start stop-channel instead (nil before Start) hangs forever.
+func TestCache_WaitForCacheSyncHonorsContext(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres")
+	}
+
+	mgr := newManager(t)
+	_, err := mgr.GetCache().GetInformer(context.Background(), &Widget{})
+	require.NoError(t, err)
+
+	// The cache is never started, so the informer can never sync.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan bool, 1)
+	go func() { done <- mgr.GetCache().WaitForCacheSync(ctx) }()
+
+	select {
+	case synced := <-done:
+		assert.False(t, synced, "WaitForCacheSync should report failure on cancelled context")
+	case <-time.After(5 * time.Second):
+		t.Fatal("WaitForCacheSync did not return after context cancellation")
+	}
+}
+
+// Objects delivered by watch events carry a composite ResourceVersion (for
+// Reflector reconnects). They must still be usable for writes: taking an
+// object from an event handler (or the informer store) and passing it to
+// client.Update/Delete is the standard controller pattern, and optimistic
+// concurrency must keep working.
+func TestInformer_EventObjectUsableForWrites(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires postgres")
+	}
+
+	ch, c, ctx, _ := startCacheAndClient(t)
+
+	inf, err := ch.GetInformer(ctx, &Widget{})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return inf.HasSynced() },
+		10*time.Second, 50*time.Millisecond, "widget informer never synced")
+
+	rec := newEventRecorder(20)
+	_, err = inf.AddEventHandler(rec)
+	require.NoError(t, err)
+
+	createWidget(t, c, ctx, "event-write", "red")
+	ev := rec.waitForType(t, "add", 10*time.Second)
+
+	// Update using the watch-delivered object (composite RV).
+	fromEvent := ev.Obj.DeepCopyObject().(*Widget)
+	fromEvent.Spec.Color = "blue"
+	require.NoError(t, c.Update(ctx, fromEvent),
+		"object taken from a watch event must be usable for Update")
+
+	// Optimistic concurrency must still hold: the event object is now stale.
+	stale := ev.Obj.DeepCopyObject().(*Widget)
+	stale.Spec.Color = "green"
+	err = c.Update(ctx, stale)
+	assert.True(t, apierrors.IsConflict(err),
+		"stale event object should produce a Conflict, got: %v", err)
+
+	// Delete using a watch-delivered object as well.
+	upd := rec.waitForType(t, "update", 10*time.Second)
+	fromUpdate := upd.Obj.DeepCopyObject().(*Widget)
+	require.NoError(t, c.Delete(ctx, fromUpdate),
+		"object taken from a watch event must be usable for Delete")
 }
 
 // compile-time check
