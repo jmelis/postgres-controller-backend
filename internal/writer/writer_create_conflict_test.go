@@ -27,7 +27,7 @@ func TestCreateConflict_ReturnsAlreadyExists(t *testing.T) {
 
 	req := model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "dup-create",
-		BucketID: 1, Spec: json.RawMessage(`{"replicas":1}`),
+		Spec: json.RawMessage(`{"replicas":1}`),
 		Status: json.RawMessage(`{}`), Metadata: json.RawMessage(`{}`),
 	}
 
@@ -49,14 +49,14 @@ func TestCreateConflict_ReturnsAlreadyExists(t *testing.T) {
 	assert.ErrorIs(t, err, writer.ErrAlreadyExists,
 		"B6: duplicate create with different content must return ErrAlreadyExists, got: %v", err)
 
-	// Counter must have rolled back — next write gets seq=2 (not 3)
+	// Txid is assigned from xid8 — next write should get a new txid > previous
 	req2 := model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "dup-create-other",
-		BucketID: 1, Spec: json.RawMessage(`{"replicas":1}`),
+		Spec: json.RawMessage(`{"replicas":1}`),
 		Status: json.RawMessage(`{}`), Metadata: json.RawMessage(`{}`),
 	}
 	result, err := w.Write(ctx, req2)
 	require.NoError(t, err)
-	assert.Equal(t, int64(2), result.Seq,
-		"counter must roll back after failed create — next seq should be 2")
+	assert.Greater(t, result.Txid, r1.Txid,
+		"next write after failed create should get a txid greater than previous")
 }

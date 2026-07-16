@@ -27,7 +27,7 @@ var (
 			Name:      "writes_total",
 			Help:      "Total writes performed during load test",
 		},
-		[]string{"phase", "gvk", "bucket_id"},
+		[]string{"phase", "gvk"},
 	)
 
 	errorsTotal = prometheus.NewCounterVec(

@@ -2,6 +2,7 @@ package race_test
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -51,7 +52,7 @@ func TestR5_AmbiguousCommit(t *testing.T) {
 	hook := &commitCutHook{cutSignal: &cutSignal}
 	w := writer.New(faultyConn, hook)
 
-	req := makeWriteReq("apps/v1/Deployment", "default", "ambiguous", 1)
+	req := makeWriteReq("apps/v1/Deployment", "default", "ambiguous")
 	result, writeErr := w.Write(ctx, req)
 
 	// The write might succeed (if COMMIT response made it through before the cut)
@@ -63,34 +64,32 @@ func TestR5_AmbiguousCommit(t *testing.T) {
 		cleanConn := freshConn(t)
 		cleanWriter := writer.New(cleanConn, nil)
 
-		// Read back: check if seq 1 landed
-		resource, err := cleanWriter.ReadBack(ctx, req.GVK, req.Namespace, req.Name, 1)
+		// Read back: check if the write landed using the txid from the ambiguous error
+		var ambErr *writer.AmbiguousCommitError
+		var readBackTxid uint64
+		if errors.As(writeErr, &ambErr) {
+			readBackTxid = ambErr.Txid
+		}
+
+		resource, err := cleanWriter.ReadBack(ctx, req.GVK, req.Namespace, req.Name, readBackTxid)
 		require.NoError(t, err)
 
 		if resource != nil {
 			// Write actually landed despite the error
 			t.Log("read-back: write landed, treating as success")
-			assert.Equal(t, int64(1), resource.GVKBucketSeq)
+			assert.Greater(t, resource.TxidStamp, uint64(0))
 		} else {
 			// Write did not land — retry
 			t.Log("read-back: write did not land, retrying")
 			retryResult, err := cleanWriter.Write(ctx, req)
 			require.NoError(t, err)
-			assert.Equal(t, int64(1), retryResult.Seq)
+			assert.Greater(t, retryResult.Txid, uint64(0))
 		}
-
-		// Verify: counter is exactly 1, no gap, no double
-		var counterVal int64
-		err = cleanConn.QueryRow(ctx,
-			`SELECT current_seq FROM gvk_bucket_counters WHERE bucket_id = 1 AND gvk = 'apps/v1/Deployment'`,
-		).Scan(&counterVal)
-		require.NoError(t, err)
-		assert.Equal(t, int64(1), counterVal, "exactly one seq must be issued")
 
 	} else {
 		// Clean success despite the fault (timing — cut happened after full response)
-		t.Logf("write succeeded cleanly: seq=%d", result.Seq)
-		assert.Equal(t, int64(1), result.Seq)
+		t.Logf("write succeeded cleanly: txid=%d", result.Txid)
+		assert.Greater(t, result.Txid, uint64(0))
 	}
 
 	// Final invariant: exactly one resource row exists
@@ -122,8 +121,8 @@ type commitCutHook struct {
 	cutSignal *atomic.Bool
 }
 
-func (h *commitCutHook) AfterSuppressionCheck(_ context.Context, _ pgx.Tx, _ bool) error { return nil }
-func (h *commitCutHook) AfterCounter(_ context.Context, _ pgx.Tx, _ int64) error         { return nil }
+func (h *commitCutHook) AfterSuppressionCheck(_ context.Context, _ pgx.Tx, _ bool) error   { return nil }
+func (h *commitCutHook) AfterTxidAcquire(_ context.Context, _ pgx.Tx, _ uint64) error      { return nil }
 
 func (h *commitCutHook) BeforeCommit(_ context.Context, _ pgx.Tx) error {
 	// Cut reads immediately — the COMMIT will be sent by pgx but the

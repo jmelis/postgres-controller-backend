@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -41,8 +40,8 @@ func (w *Writer) Write(ctx context.Context, req model.WriteRequest) (model.Write
 
 // WriteStatus updates only the status sub-resource. The object must already
 // exist (ExpectedVersion > 0). Spec, metadata, and deletion_timestamp are not
-// touched. The shared gvk_bucket_seq counter and object_version are bumped so
-// watchers see status changes in the same ordered stream as spec changes.
+// touched. The txid_stamp and object_version are bumped so watchers see status
+// changes in the same ordered stream as spec changes.
 func (w *Writer) WriteStatus(ctx context.Context, req model.StatusWriteRequest) (model.WriteResult, error) {
 	if req.ExpectedVersion == 0 {
 		return model.WriteResult{}, fmt.Errorf("WriteStatus requires ExpectedVersion > 0: object must exist")
@@ -55,9 +54,8 @@ func (w *Writer) WriteStatus(ctx context.Context, req model.StatusWriteRequest) 
 }
 
 // WriteObject updates spec, metadata, and deletion_timestamp without touching
-// status. The object must already exist (ExpectedVersion > 0). The shared
-// gvk_bucket_seq counter and object_version are bumped so watchers see changes
-// in the ordered stream.
+// status. The object must already exist (ExpectedVersion > 0). The txid_stamp
+// and object_version are bumped so watchers see changes in the ordered stream.
 func (w *Writer) WriteObject(ctx context.Context, req model.ObjectWriteRequest) (model.WriteResult, error) {
 	if req.ExpectedVersion == 0 {
 		return model.WriteResult{}, fmt.Errorf("WriteObject requires ExpectedVersion > 0: object must exist")
@@ -70,19 +68,19 @@ func (w *Writer) WriteObject(ctx context.Context, req model.ObjectWriteRequest) 
 }
 
 // ReadBack resolves an ambiguous commit by checking if the write actually landed.
-// Returns the resource if found at the expected seq, nil if not.
-func (w *Writer) ReadBack(ctx context.Context, gvk, namespace, name string, seq int64) (*model.Resource, error) {
+// Returns the resource if found at the expected txid, nil if not.
+func (w *Writer) ReadBack(ctx context.Context, gvk, namespace, name string, txid uint64) (*model.Resource, error) {
 	r := &model.Resource{}
 	err := w.conn.QueryRow(ctx, `
-		SELECT gvk, namespace, name, uid, bucket_id, gvk_bucket_seq,
+		SELECT gvk, namespace, name, uid, txid_stamp::text::bigint,
 		       object_version, spec, status, metadata, deletion_timestamp,
 		       created_at, updated_at
 		FROM kubernetes_resources
 		WHERE gvk = $1 AND namespace = $2 AND name = $3
-		  AND gvk_bucket_seq = $4`,
-		gvk, namespace, name, seq,
-	).Scan(&r.GVK, &r.Namespace, &r.Name, &r.UID, &r.BucketID,
-		&r.GVKBucketSeq, &r.ObjectVersion, &r.Spec, &r.Status,
+		  AND txid_stamp::text::bigint = $4`,
+		gvk, namespace, name, txid,
+	).Scan(&r.GVK, &r.Namespace, &r.Name, &r.UID,
+		&r.TxidStamp, &r.ObjectVersion, &r.Spec, &r.Status,
 		&r.Metadata, &r.DeletionTimestamp, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -95,20 +93,19 @@ func (w *Writer) ReadBack(ctx context.Context, gvk, namespace, name string, seq 
 
 // --- Stored procedure path (production, hooks==nil) ---
 
-const pgctlWriteSQL = `SELECT * FROM pgctl_write($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`
+const pgctlWriteSQL = `SELECT * FROM pgctl_write($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`
 
 func (w *Writer) writeStoredProc(ctx context.Context, req model.WriteRequest) (model.WriteResult, error) {
 	start := time.Now()
 
 	result, err := w.callStoredProc(ctx, writeParams{
 		statusOnly: false, gvk: req.GVK, namespace: req.Namespace, name: req.Name,
-		bucketID: req.BucketID,
 		expectedVersion: req.ExpectedVersion, forceWrite: req.ForceWrite,
 		spec: req.Spec, status: req.Status, metadata: req.Metadata,
 		deletionTimestamp: req.DeletionTimestamp,
 	})
 
-	w.observeResult(start, req.GVK, req.BucketID, result, err)
+	w.observeResult(start, req.GVK, result, err)
 	return result, err
 }
 
@@ -117,13 +114,12 @@ func (w *Writer) writeStatusStoredProc(ctx context.Context, req model.StatusWrit
 
 	result, err := w.callStoredProc(ctx, writeParams{
 		statusOnly: true, gvk: req.GVK, namespace: req.Namespace, name: req.Name,
-		bucketID: req.BucketID,
 		expectedVersion: req.ExpectedVersion, forceWrite: req.ForceWrite,
 		spec: nil, status: req.Status, metadata: nil,
 		deletionTimestamp: nil,
 	})
 
-	w.observeResult(start, req.GVK, req.BucketID, result, err)
+	w.observeResult(start, req.GVK, result, err)
 	return result, err
 }
 
@@ -132,13 +128,12 @@ func (w *Writer) writeObjectStoredProc(ctx context.Context, req model.ObjectWrit
 
 	result, err := w.callStoredProc(ctx, writeParams{
 		statusOnly: false, gvk: req.GVK, namespace: req.Namespace, name: req.Name,
-		bucketID: req.BucketID,
 		expectedVersion: req.ExpectedVersion, forceWrite: req.ForceWrite,
 		spec: req.Spec, status: nil, metadata: req.Metadata,
 		deletionTimestamp: req.DeletionTimestamp,
 	})
 
-	w.observeResult(start, req.GVK, req.BucketID, result, err)
+	w.observeResult(start, req.GVK, result, err)
 	return result, err
 }
 
@@ -151,15 +146,16 @@ func (w *Writer) callStoredProc(ctx context.Context, p writeParams) (model.Write
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var uid uuid.UUID
-	var version, seq int64
+	var version int64
+	var txid uint64
 	var changed bool
-	var suppressUs, counterUs, upsertUs int64
+	var suppressUs, upsertUs int64
 
 	err = tx.QueryRow(ctx, pgctlWriteSQL,
-		p.statusOnly, p.gvk, p.namespace, p.name, p.bucketID,
+		p.statusOnly, p.gvk, p.namespace, p.name,
 		p.expectedVersion, p.forceWrite,
 		p.spec, p.status, p.metadata, p.deletionTimestamp,
-	).Scan(&uid, &version, &seq, &changed, &suppressUs, &counterUs, &upsertUs)
+	).Scan(&uid, &version, &txid, &changed, &suppressUs, &upsertUs)
 	w.observeStep("stored_proc", time.Since(t0))
 
 	if err != nil {
@@ -167,7 +163,6 @@ func (w *Writer) callStoredProc(ctx context.Context, p writeParams) (model.Write
 	}
 
 	w.observeStep("suppression_check", time.Duration(suppressUs)*time.Microsecond)
-	w.observeStep("counter_increment", time.Duration(counterUs)*time.Microsecond)
 	w.observeStep("upsert", time.Duration(upsertUs)*time.Microsecond)
 
 	if !changed {
@@ -182,14 +177,14 @@ func (w *Writer) callStoredProc(ctx context.Context, p writeParams) (model.Write
 	t0 = time.Now()
 	if err := tx.Commit(ctx); err != nil {
 		return model.WriteResult{}, &AmbiguousCommitError{
-			Cause: err, GVK: p.gvk, Namespace: p.namespace, Name: p.name, Seq: seq,
+			Cause: err, GVK: p.gvk, Namespace: p.namespace, Name: p.name, Txid: txid,
 		}
 	}
 	w.observeStep("commit", time.Since(t0))
 
-	w.fireDoorbell(ctx, p.bucketID)
+	w.fireDoorbell(ctx, p.gvk)
 
-	return model.WriteResult{Seq: seq, ObjectVersion: version, UID: uid, Changed: true}, nil
+	return model.WriteResult{Txid: txid, ObjectVersion: version, UID: uid, Changed: true}, nil
 }
 
 func mapStoredProcError(err error) error {
@@ -207,8 +202,8 @@ func mapStoredProcError(err error) error {
 	return fmt.Errorf("stored proc: %w", err)
 }
 
-func (w *Writer) fireDoorbell(ctx context.Context, bucketID int) {
-	channel := fmt.Sprintf("resource_changes_b%d", bucketID)
+func (w *Writer) fireDoorbell(ctx context.Context, gvk string) {
+	channel := fmt.Sprintf("resource_changes_%s", gvk)
 	t0 := time.Now()
 	_, err := w.conn.Exec(ctx, `SELECT pg_notify($1, '')`, channel)
 	w.observeStep("doorbell_external", time.Since(t0))
@@ -226,7 +221,6 @@ func (w *Writer) writeMultiStatement(ctx context.Context, req model.WriteRequest
 	p := writeParams{
 		statusOnly: false,
 		gvk: req.GVK, namespace: req.Namespace, name: req.Name,
-		bucketID: req.BucketID,
 		forceWrite: req.ForceWrite,
 	}
 
@@ -237,7 +231,7 @@ func (w *Writer) writeMultiStatement(ctx context.Context, req model.WriteRequest
 			timeEqual(existing.deletionTimestamp, req.DeletionTimestamp)
 	}
 
-	return w.execWrite(ctx, p, checker, func(ctx context.Context, tx pgx.Tx, seq int64) (uuid.UUID, int64, error) {
+	return w.execWrite(ctx, p, checker, func(ctx context.Context, tx pgx.Tx, txid uint64) (uuid.UUID, int64, error) {
 		var uid uuid.UUID
 		var version int64
 
@@ -247,11 +241,11 @@ func (w *Writer) writeMultiStatement(ctx context.Context, req model.WriteRequest
 			}
 			err := tx.QueryRow(ctx, `
 				INSERT INTO kubernetes_resources
-					(gvk, namespace, name, bucket_id, gvk_bucket_seq,
+					(gvk, namespace, name, txid_stamp,
 					 object_version, spec, status, metadata, deletion_timestamp)
-				VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9)
+				VALUES ($1, $2, $3, $4::xid8, 1, $5, $6, $7, $8)
 				RETURNING uid, object_version`,
-				req.GVK, req.Namespace, req.Name, req.BucketID, seq,
+				req.GVK, req.Namespace, req.Name, txid,
 				req.Spec, req.Status, req.Metadata, req.DeletionTimestamp,
 			).Scan(&uid, &version)
 			if err != nil {
@@ -263,21 +257,20 @@ func (w *Writer) writeMultiStatement(ctx context.Context, req model.WriteRequest
 					err = tx.QueryRow(ctx, `
 						UPDATE kubernetes_resources
 						   SET uid                = gen_random_uuid(),
-						       bucket_id          = $4,
-						       gvk_bucket_seq     = $5,
+						       txid_stamp         = $3::xid8,
 						       object_version     = 1,
-						       spec               = $6,
-						       status             = COALESCE($7, '{}'::jsonb),
-						       metadata           = $8,
+						       spec               = $4,
+						       status             = COALESCE($5, '{}'::jsonb),
+						       metadata           = $6,
 						       deletion_timestamp = NULL,
 						       created_at         = now(),
 						       updated_at         = now()
-						 WHERE gvk = $1 AND namespace = $2 AND name = $3
+						 WHERE gvk = $1 AND namespace = $2 AND name = $7
 						   AND deletion_timestamp IS NOT NULL
 						   AND (metadata->'finalizers' IS NULL OR metadata->'finalizers' = '[]'::jsonb) -- tombstone filter: also in list.go, compactor.go, 001_initial.sql
 						RETURNING uid, object_version`,
-						req.GVK, req.Namespace, req.Name, req.BucketID, seq,
-						req.Spec, req.Status, req.Metadata,
+						req.GVK, req.Namespace, txid,
+						req.Spec, req.Status, req.Metadata, req.Name,
 					).Scan(&uid, &version)
 					if err != nil {
 						if errors.Is(err, pgx.ErrNoRows) {
@@ -292,14 +285,14 @@ func (w *Writer) writeMultiStatement(ctx context.Context, req model.WriteRequest
 		} else {
 			err := tx.QueryRow(ctx, `
 				UPDATE kubernetes_resources
-				SET gvk_bucket_seq = $1,
+				SET txid_stamp = $1::xid8,
 				    object_version = object_version + 1,
 				    spec = $2, status = COALESCE($3, status), metadata = $4,
 				    deletion_timestamp = $5, updated_at = now()
 				WHERE gvk = $6 AND namespace = $7 AND name = $8
 				  AND object_version = $9
 				RETURNING uid, object_version`,
-				seq, req.Spec, req.Status, req.Metadata, req.DeletionTimestamp,
+				txid, req.Spec, req.Status, req.Metadata, req.DeletionTimestamp,
 				req.GVK, req.Namespace, req.Name, req.ExpectedVersion,
 			).Scan(&uid, &version)
 			if err != nil {
@@ -318,7 +311,6 @@ func (w *Writer) writeStatusMultiStatement(ctx context.Context, req model.Status
 	p := writeParams{
 		statusOnly: true,
 		gvk: req.GVK, namespace: req.Namespace, name: req.Name,
-		bucketID: req.BucketID,
 		forceWrite: req.ForceWrite,
 	}
 
@@ -326,19 +318,19 @@ func (w *Writer) writeStatusMultiStatement(ctx context.Context, req model.Status
 		return JSONEqual(existing.status, req.Status)
 	}
 
-	return w.execWrite(ctx, p, checker, func(ctx context.Context, tx pgx.Tx, seq int64) (uuid.UUID, int64, error) {
+	return w.execWrite(ctx, p, checker, func(ctx context.Context, tx pgx.Tx, txid uint64) (uuid.UUID, int64, error) {
 		var uid uuid.UUID
 		var version int64
 
 		err := tx.QueryRow(ctx, `
 			UPDATE kubernetes_resources
-			SET gvk_bucket_seq = $1,
+			SET txid_stamp = $1::xid8,
 			    object_version = object_version + 1,
 			    status = $2, updated_at = now()
 			WHERE gvk = $3 AND namespace = $4 AND name = $5
 			  AND object_version = $6
 			RETURNING uid, object_version`,
-			seq, req.Status,
+			txid, req.Status,
 			req.GVK, req.Namespace, req.Name, req.ExpectedVersion,
 		).Scan(&uid, &version)
 		if err != nil {
@@ -356,7 +348,6 @@ func (w *Writer) writeObjectMultiStatement(ctx context.Context, req model.Object
 	p := writeParams{
 		statusOnly: false,
 		gvk: req.GVK, namespace: req.Namespace, name: req.Name,
-		bucketID: req.BucketID,
 		forceWrite: req.ForceWrite,
 	}
 
@@ -366,20 +357,20 @@ func (w *Writer) writeObjectMultiStatement(ctx context.Context, req model.Object
 			timeEqual(existing.deletionTimestamp, req.DeletionTimestamp)
 	}
 
-	return w.execWrite(ctx, p, checker, func(ctx context.Context, tx pgx.Tx, seq int64) (uuid.UUID, int64, error) {
+	return w.execWrite(ctx, p, checker, func(ctx context.Context, tx pgx.Tx, txid uint64) (uuid.UUID, int64, error) {
 		var uid uuid.UUID
 		var version int64
 
 		err := tx.QueryRow(ctx, `
 			UPDATE kubernetes_resources
-			SET gvk_bucket_seq = $1,
+			SET txid_stamp = $1::xid8,
 			    object_version = object_version + 1,
 			    spec = $2, metadata = $3, deletion_timestamp = $4,
 			    updated_at = now()
 			WHERE gvk = $5 AND namespace = $6 AND name = $7
 			  AND object_version = $8
 			RETURNING uid, object_version`,
-			seq, req.Spec, req.Metadata, req.DeletionTimestamp,
+			txid, req.Spec, req.Metadata, req.DeletionTimestamp,
 			req.GVK, req.Namespace, req.Name, req.ExpectedVersion,
 		).Scan(&uid, &version)
 		if err != nil {
@@ -393,7 +384,7 @@ func (w *Writer) writeObjectMultiStatement(ctx context.Context, req model.Object
 	})
 }
 
-type upsertFunc func(ctx context.Context, tx pgx.Tx, seq int64) (uuid.UUID, int64, error)
+type upsertFunc func(ctx context.Context, tx pgx.Tx, txid uint64) (uuid.UUID, int64, error)
 
 // contentChecker returns true if the existing row's content matches the request
 // (i.e., the write is a no-op). Only called when suppression is active and the
@@ -414,7 +405,6 @@ type writeParams struct {
 	gvk               string
 	namespace         string
 	name              string
-	bucketID          int
 	expectedVersion   int64
 	forceWrite        bool
 	spec              json.RawMessage
@@ -427,16 +417,15 @@ func (w *Writer) execWrite(ctx context.Context, p writeParams, isContentEqual co
 	start := time.Now()
 	result, err := w.execWriteInner(ctx, p, isContentEqual, upsert)
 
-	w.observeResult(start, p.gvk, p.bucketID, result, err)
+	w.observeResult(start, p.gvk, result, err)
 	return result, err
 }
 
-func (w *Writer) observeResult(start time.Time, gvk string, bucketID int, result model.WriteResult, err error) {
+func (w *Writer) observeResult(start time.Time, gvk string, result model.WriteResult, err error) {
 	if w.metrics == nil {
 		return
 	}
 	dur := time.Since(start)
-	bucketStr := strconv.Itoa(bucketID)
 	var resultLabel string
 	switch {
 	case err == nil && !result.Changed:
@@ -456,8 +445,8 @@ func (w *Writer) observeResult(start time.Time, gvk string, bucketID int, result
 			resultLabel = "error"
 		}
 	}
-	w.metrics.WriteDuration.WithLabelValues(gvk, bucketStr, resultLabel).Observe(dur.Seconds())
-	w.metrics.WritesTotal.WithLabelValues(gvk, bucketStr, resultLabel).Inc()
+	w.metrics.WriteDuration.WithLabelValues(gvk, resultLabel).Observe(dur.Seconds())
+	w.metrics.WritesTotal.WithLabelValues(gvk, resultLabel).Inc()
 }
 
 func (w *Writer) observeStep(step string, d time.Duration) {
@@ -509,25 +498,19 @@ func (w *Writer) execWriteInner(ctx context.Context, p writeParams, isContentEqu
 	}
 
 	t0 = time.Now()
-	var seq int64
-	err = tx.QueryRow(ctx, `
-		INSERT INTO gvk_bucket_counters (bucket_id, gvk, current_seq)
-		VALUES ($1, $2, 1)
-		ON CONFLICT (bucket_id, gvk)
-		DO UPDATE SET current_seq = gvk_bucket_counters.current_seq + 1
-		RETURNING current_seq`,
-		p.bucketID, p.gvk).Scan(&seq)
-	w.observeStep("counter_increment", time.Since(t0))
+	var txid uint64
+	err = tx.QueryRow(ctx, `SELECT pg_current_xact_id()::text::bigint`).Scan(&txid)
+	w.observeStep("txid_acquire", time.Since(t0))
 	if err != nil {
-		return model.WriteResult{}, fmt.Errorf("counter: %w", err)
+		return model.WriteResult{}, fmt.Errorf("txid acquire: %w", err)
 	}
 
-	if err := w.hooks.AfterCounter(ctx, tx, seq); err != nil {
+	if err := w.hooks.AfterTxidAcquire(ctx, tx, txid); err != nil {
 		return model.WriteResult{}, err
 	}
 
 	t0 = time.Now()
-	uid, version, err := upsert(ctx, tx, seq)
+	uid, version, err := upsert(ctx, tx, txid)
 	w.observeStep("upsert", time.Since(t0))
 	if err != nil {
 		return model.WriteResult{}, err
@@ -544,14 +527,14 @@ func (w *Writer) execWriteInner(ctx context.Context, p writeParams, isContentEqu
 			GVK:       p.gvk,
 			Namespace: p.namespace,
 			Name:      p.name,
-			Seq:       seq,
+			Txid:      txid,
 		}
 	}
 	w.observeStep("commit", time.Since(t0))
 
-	w.fireDoorbell(ctx, p.bucketID)
+	w.fireDoorbell(ctx, p.gvk)
 
-	return model.WriteResult{Seq: seq, ObjectVersion: version, UID: uid, Changed: true}, nil
+	return model.WriteResult{Txid: txid, ObjectVersion: version, UID: uid, Changed: true}, nil
 }
 
 func readExisting(ctx context.Context, tx pgx.Tx, gvk, namespace, name string) (*existingRow, error) {

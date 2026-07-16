@@ -10,7 +10,6 @@ import (
 // Production code passes nil.
 type TxHooks interface {
 	AfterSuppressionCheck(ctx context.Context, tx pgx.Tx, suppressed bool) error
-	AfterCounter(ctx context.Context, tx pgx.Tx, seq int64) error
+	AfterTxidAcquire(ctx context.Context, tx pgx.Tx, txid uint64) error
 	BeforeCommit(ctx context.Context, tx pgx.Tx) error
 }
-

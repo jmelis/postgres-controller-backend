@@ -27,8 +27,7 @@ func TestR18_WatcherResume(t *testing.T) {
 
 	watcherA := reader.NewWatcher(pollConnA, listenConnA, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
-		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Watermark: 0},
 		BaselineInterval: 300 * time.Millisecond,
 	}, nil)
 
@@ -40,7 +39,7 @@ func TestR18_WatcherResume(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		wr := newWriter(t, nil)
 		req := makeWriteReq("apps/v1/Deployment", "default",
-			fmt.Sprintf("resume-%d", i), 1)
+			fmt.Sprintf("resume-%d", i))
 		_, err := wr.Write(ctx, req)
 		require.NoError(t, err)
 	}
@@ -67,7 +66,7 @@ func TestR18_WatcherResume(t *testing.T) {
 	cancelA()
 	<-doneA
 
-	// Capture A's high-water marks before closing connections.
+	// Capture A's high-water mark before closing connections.
 	hwmA := watcherA.HWM()
 
 	pollConnA.Close(context.Background())
@@ -77,7 +76,7 @@ func TestR18_WatcherResume(t *testing.T) {
 	for i := 5; i < 10; i++ {
 		wr := newWriter(t, nil)
 		req := makeWriteReq("apps/v1/Deployment", "default",
-			fmt.Sprintf("resume-%d", i), 1)
+			fmt.Sprintf("resume-%d", i))
 		_, err := wr.Write(ctx, req)
 		require.NoError(t, err)
 	}
@@ -87,10 +86,9 @@ func TestR18_WatcherResume(t *testing.T) {
 	listenConnB := connectManualShared(t)
 
 	watcherB := reader.NewWatcher(pollConnB, listenConnB, reader.WatcherConfig{
-		GVK:       "apps/v1/Deployment",
-		BucketIDs: []int{1},
+		GVK: "apps/v1/Deployment",
 		StartRV: resourceversion.RV{
-			Buckets: hwmA, // resume from A's high-water marks
+			Watermark: hwmA, // resume from A's high-water mark
 		},
 		BaselineInterval: 300 * time.Millisecond,
 	}, nil)
@@ -119,28 +117,23 @@ func TestR18_WatcherResume(t *testing.T) {
 
 	require.Len(t, eventsB, 5, "watcher B must receive exactly 5 new events")
 
-	// Verify B received only seqs 6-10 (the gap writes).
+	// Verify B received only txids greater than A's hwm (the gap writes).
 	for _, ev := range eventsB {
-		assert.GreaterOrEqual(t, ev.Resource.GVKBucketSeq, int64(6),
+		assert.Greater(t, ev.Resource.TxidStamp, hwmA,
 			"watcher B must not replay A's events")
-		assert.LessOrEqual(t, ev.Resource.GVKBucketSeq, int64(10),
-			"unexpected seq beyond 10")
 	}
 
-	// Verify the union of A and B covers exactly {1..10} with no duplicates.
-	seenSeqs := make(map[int64]bool)
+	// Verify the union of A and B covers exactly 10 unique txids with no duplicates.
+	seenTxids := make(map[uint64]bool)
 	for _, ev := range eventsA {
-		assert.False(t, seenSeqs[ev.Resource.GVKBucketSeq],
-			"duplicate seq %d in watcher A", ev.Resource.GVKBucketSeq)
-		seenSeqs[ev.Resource.GVKBucketSeq] = true
+		assert.False(t, seenTxids[ev.Resource.TxidStamp],
+			"duplicate txid %d in watcher A", ev.Resource.TxidStamp)
+		seenTxids[ev.Resource.TxidStamp] = true
 	}
 	for _, ev := range eventsB {
-		assert.False(t, seenSeqs[ev.Resource.GVKBucketSeq],
-			"duplicate seq %d across A and B", ev.Resource.GVKBucketSeq)
-		seenSeqs[ev.Resource.GVKBucketSeq] = true
+		assert.False(t, seenTxids[ev.Resource.TxidStamp],
+			"duplicate txid %d across A and B", ev.Resource.TxidStamp)
+		seenTxids[ev.Resource.TxidStamp] = true
 	}
-	for seq := int64(1); seq <= 10; seq++ {
-		assert.True(t, seenSeqs[seq],
-			"seq %d missing from union of A + B events", seq)
-	}
+	assert.Len(t, seenTxids, 10, "union of A + B must cover exactly 10 unique txids")
 }

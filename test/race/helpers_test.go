@@ -33,12 +33,11 @@ func truncateAll(t *testing.T) {
 	conn.Close(context.Background())
 }
 
-func makeWriteReq(gvk, ns, name string, bucketID int) model.WriteRequest {
+func makeWriteReq(gvk, ns, name string) model.WriteRequest {
 	return model.WriteRequest{
 		GVK:       gvk,
 		Namespace: ns,
 		Name:      name,
-		BucketID:  bucketID,
 		Spec:      json.RawMessage(`{"replicas":1}`),
 		Status:    json.RawMessage(`{}`),
 		Metadata:  json.RawMessage(`{}`),
@@ -63,8 +62,8 @@ func newBlockingHook() *blockingHook {
 	}
 }
 
-func (h *blockingHook) AfterSuppressionCheck(_ context.Context, _ pgx.Tx, _ bool) error { return nil }
-func (h *blockingHook) AfterCounter(_ context.Context, _ pgx.Tx, _ int64) error         { return nil }
+func (h *blockingHook) AfterSuppressionCheck(_ context.Context, _ pgx.Tx, _ bool) error   { return nil }
+func (h *blockingHook) AfterTxidAcquire(_ context.Context, _ pgx.Tx, _ uint64) error      { return nil }
 
 func (h *blockingHook) BeforeCommit(ctx context.Context, _ pgx.Tx) error {
 	close(h.ready)

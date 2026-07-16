@@ -162,10 +162,10 @@ resource "aws_cloudwatch_dashboard" "loadtest" {
           width  = 12
           height = 6
           properties = {
-            title  = "pgctl Write RPS (by bucket)"
+            title  = "pgctl Write RPS"
             region = var.region
             metrics = [
-              [{ expression = "SEARCH('{pgctl-loadtest,bucket_id} MetricName=\"pgctl_writer_writes_total\"', 'Sum', 60)", id = "writes", label = "" }]
+              [{ expression = "SEARCH('{pgctl-loadtest,phase,gvk} MetricName=\"pgctl_writer_writes_total\"', 'Sum', 60)", id = "writes", label = "" }]
             ]
           }
         },

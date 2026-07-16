@@ -12,8 +12,7 @@ type Resource struct {
 	Namespace         string
 	Name              string
 	UID               uuid.UUID
-	BucketID          int
-	GVKBucketSeq      int64
+	TxidStamp         uint64
 	ObjectVersion     int64
 	Spec              json.RawMessage
 	Status            json.RawMessage
@@ -27,7 +26,6 @@ type WriteRequest struct {
 	GVK               string
 	Namespace         string
 	Name              string
-	BucketID          int
 	Spec              json.RawMessage
 	Status            json.RawMessage
 	Metadata          json.RawMessage
@@ -40,7 +38,6 @@ type StatusWriteRequest struct {
 	GVK             string
 	Namespace       string
 	Name            string
-	BucketID        int
 	Status          json.RawMessage
 	ExpectedVersion int64
 	ForceWrite      bool // skip no-op suppression; default false = suppress content-equal writes
@@ -50,7 +47,6 @@ type ObjectWriteRequest struct {
 	GVK               string
 	Namespace         string
 	Name              string
-	BucketID          int
 	Spec              json.RawMessage
 	Metadata          json.RawMessage
 	DeletionTimestamp *time.Time
@@ -59,7 +55,7 @@ type ObjectWriteRequest struct {
 }
 
 type WriteResult struct {
-	Seq           int64
+	Txid          uint64
 	ObjectVersion int64
 	UID           uuid.UUID
 	Changed       bool // false when suppressed (content-equal write)

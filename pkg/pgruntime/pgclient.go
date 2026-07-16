@@ -25,17 +25,7 @@ import (
 type pgClient struct {
 	scheme     *runtime.Scheme
 	pool       *pgxpool.Pool
-	assign     func(ns, name string) int
-	bucketIDs  []int
-	unsharded  map[schema.GroupVersionKind]bool
 	restMapper meta.RESTMapper
-}
-
-func (c *pgClient) bucketFor(gvk schema.GroupVersionKind, ns, name string) int {
-	if c.unsharded[gvk] {
-		return UnshardedBucket
-	}
-	return c.assign(ns, name)
 }
 
 func (c *pgClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
@@ -54,15 +44,15 @@ func (c *pgClient) Get(ctx context.Context, key client.ObjectKey, obj client.Obj
 
 	var r model.Resource
 	err = conn.QueryRow(ctx, `
-		SELECT gvk, namespace, name, uid, bucket_id, gvk_bucket_seq,
+		SELECT gvk, namespace, name, uid, txid_stamp::text::bigint,
 		       object_version, spec, status, metadata,
 		       deletion_timestamp, created_at, updated_at
 		FROM kubernetes_resources
 		WHERE gvk = $1 AND namespace = $2 AND name = $3`,
 		gvkStr, key.Namespace, key.Name,
 	).Scan(
-		&r.GVK, &r.Namespace, &r.Name, &r.UID, &r.BucketID,
-		&r.GVKBucketSeq, &r.ObjectVersion, &r.Spec, &r.Status,
+		&r.GVK, &r.Namespace, &r.Name, &r.UID,
+		&r.TxidStamp, &r.ObjectVersion, &r.Spec, &r.Status,
 		&r.Metadata, &r.DeletionTimestamp, &r.CreatedAt, &r.UpdatedAt,
 	)
 	if err != nil {
@@ -96,17 +86,12 @@ func (c *pgClient) List(ctx context.Context, list client.ObjectList, opts ...cli
 	defer poolConn.Release()
 	conn := poolConn.Conn()
 
-	buckets := c.bucketIDs
-	if c.unsharded[itemGVK] {
-		buckets = []int{UnshardedBucket}
-	}
-
 	filter, err := buildListFilter(listOpts)
 	if err != nil {
 		return err
 	}
 
-	result, err := reader.List(ctx, conn, gvkStr, buckets, filter)
+	result, err := reader.List(ctx, conn, gvkStr, filter)
 	if err != nil {
 		return err
 	}
@@ -165,7 +150,6 @@ func (c *pgClient) Create(ctx context.Context, obj client.Object, opts ...client
 	}
 
 	ns, name := obj.GetNamespace(), obj.GetName()
-	bucketID := c.bucketFor(gvk, ns, name)
 
 	poolConn, err := c.pool.Acquire(ctx)
 	if err != nil {
@@ -179,7 +163,6 @@ func (c *pgClient) Create(ctx context.Context, obj client.Object, opts ...client
 		GVK:             gvkStr,
 		Namespace:       ns,
 		Name:            name,
-		BucketID:        bucketID,
 		Spec:            spec,
 		Status:          status,
 		Metadata:        metadata,
@@ -224,7 +207,6 @@ func (c *pgClient) Update(ctx context.Context, obj client.Object, opts ...client
 	}
 
 	ns, name := obj.GetNamespace(), obj.GetName()
-	bucketID := c.bucketFor(gvk, ns, name)
 
 	poolConn, err := c.pool.Acquire(ctx)
 	if err != nil {
@@ -261,7 +243,6 @@ func (c *pgClient) Update(ctx context.Context, obj client.Object, opts ...client
 		GVK:               gvkStr,
 		Namespace:          ns,
 		Name:               name,
-		BucketID:           bucketID,
 		Spec:               newSpec,
 		Metadata:           metadata,
 		DeletionTimestamp:  current.DeletionTimestamp,
@@ -298,7 +279,6 @@ func (c *pgClient) Delete(ctx context.Context, obj client.Object, opts ...client
 	gvkStr := gvkToString(gvk)
 
 	ns, name := obj.GetNamespace(), obj.GetName()
-	bucketID := c.bucketFor(gvk, ns, name)
 
 	poolConn, err := c.pool.Acquire(ctx)
 	if err != nil {
@@ -349,7 +329,6 @@ func (c *pgClient) Delete(ctx context.Context, obj client.Object, opts ...client
 		GVK:               gvkStr,
 		Namespace:          ns,
 		Name:               name,
-		BucketID:           bucketID,
 		Spec:               spec,
 		Status:             status,
 		Metadata:           metadata,
@@ -447,7 +426,6 @@ func (sw *pgStatusWriter) Update(ctx context.Context, obj client.Object, opts ..
 	}
 
 	ns, name := obj.GetNamespace(), obj.GetName()
-	bucketID := sw.c.bucketFor(gvk, ns, name)
 
 	poolConn, err := sw.c.pool.Acquire(ctx)
 	if err != nil {
@@ -461,7 +439,6 @@ func (sw *pgStatusWriter) Update(ctx context.Context, obj client.Object, opts ..
 		GVK:             gvkStr,
 		Namespace:       ns,
 		Name:            name,
-		BucketID:        bucketID,
 		Status:          status,
 		ExpectedVersion: expectedVersion,
 	})
@@ -530,7 +507,7 @@ func (src *pgSubResourceClient) Patch(ctx context.Context, obj client.Object, pa
 func readCurrentResource(ctx context.Context, conn *pgx.Conn, gvk, ns, name string) (*model.Resource, error) {
 	var r model.Resource
 	err := conn.QueryRow(ctx, `
-		SELECT gvk, namespace, name, uid, bucket_id, gvk_bucket_seq,
+		SELECT gvk, namespace, name, uid, txid_stamp::text::bigint,
 		       object_version, spec, status, metadata,
 		       deletion_timestamp, created_at, updated_at
 		FROM kubernetes_resources
@@ -540,8 +517,8 @@ func readCurrentResource(ctx context.Context, conn *pgx.Conn, gvk, ns, name stri
 		           AND metadata->'finalizers' != '[]'::jsonb))`,
 		gvk, ns, name,
 	).Scan(
-		&r.GVK, &r.Namespace, &r.Name, &r.UID, &r.BucketID,
-		&r.GVKBucketSeq, &r.ObjectVersion, &r.Spec, &r.Status,
+		&r.GVK, &r.Namespace, &r.Name, &r.UID,
+		&r.TxidStamp, &r.ObjectVersion, &r.Spec, &r.Status,
 		&r.Metadata, &r.DeletionTimestamp, &r.CreatedAt, &r.UpdatedAt,
 	)
 	if err != nil {
@@ -612,8 +589,8 @@ func encodeContinue(offset int64) string {
 func buildListFilter(listOpts client.ListOptions) (*reader.ListFilter, error) {
 	var f reader.ListFilter
 
-	// $1 = gvk, $2 = bucketIDs, so extra params start at $3
-	paramIdx := 3
+	// $1 = gvk, so extra params start at $2
+	paramIdx := 2
 
 	if listOpts.Namespace != "" {
 		f.WhereClauses = append(f.WhereClauses, fmt.Sprintf("namespace = $%d", paramIdx))

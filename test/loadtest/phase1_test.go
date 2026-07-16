@@ -51,7 +51,7 @@ func truncateAll(t *testing.T) {
 }
 
 // Phase 1 — Counter ceiling (§7).
-// 50 workers, one (bucket, GVK), single Postgres instance.
+// 50 workers, one GVK, single Postgres instance.
 // Criteria:
 //   - ≥200 commits/s sustained
 //   - p99 ≤ 10ms
@@ -69,7 +69,6 @@ func TestPhase1_CounterCeiling(t *testing.T) {
 
 	const (
 		numWorkers   = 50
-		bucketID     = 1
 		gvk          = "apps/v1/Deployment"
 		testDuration = 10 * time.Second
 	)
@@ -78,7 +77,6 @@ func TestPhase1_CounterCeiling(t *testing.T) {
 	verifyConn := manualConn(t)
 	ver := verifier.New(verifyConn, nil, verifier.Config{
 		GVK:          gvk,
-		BucketIDs:    []int{bucketID},
 		PollInterval: 200 * time.Millisecond,
 	})
 	verCtx, verCancel := context.WithCancel(ctx)
@@ -120,7 +118,7 @@ func TestPhase1_CounterCeiling(t *testing.T) {
 				name := fmt.Sprintf("w%d-r%d", workerID, writeNum)
 				req := model.WriteRequest{
 					GVK: gvk, Namespace: "loadtest", Name: name,
-					BucketID: bucketID, Spec: json.RawMessage(`{"w":` + fmt.Sprintf("%d", workerID) + `}`),
+					Spec: json.RawMessage(`{"w":` + fmt.Sprintf("%d", workerID) + `}`),
 					Status: json.RawMessage(`{}`), Metadata: json.RawMessage(`{}`),
 				}
 

@@ -22,13 +22,12 @@ type ListFilter struct {
 }
 
 // List performs a REPEATABLE READ snapshot read of all live and dying resources
-// matching the given GVK across the specified buckets. Fully-deleted tombstones
-// (deletion_timestamp set, no finalizers) are excluded by the query. Dying
-// objects (deletion_timestamp set, has finalizers) are included so controllers
-// can perform cleanup before removing their finalizers. The returned RV is
-// built from per-bucket counters within the same snapshot, so there is no
-// skew between the data and the version (I4/I5 handoff into Watch).
-func List(ctx context.Context, conn *pgx.Conn, gvk string, bucketIDs []int, filter ...*ListFilter) (*ListResult, error) {
+// matching the given GVK. Fully-deleted tombstones (deletion_timestamp set, no
+// finalizers) are excluded by the query. Dying objects (deletion_timestamp set,
+// has finalizers) are included so controllers can perform cleanup before
+// removing their finalizers. The returned RV uses the xmin watermark from the
+// same snapshot, so there is no skew between the data and the version.
+func List(ctx context.Context, conn *pgx.Conn, gvk string, filter ...*ListFilter) (*ListResult, error) {
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel:   pgx.RepeatableRead,
 		AccessMode: pgx.ReadOnly,
@@ -38,44 +37,26 @@ func List(ctx context.Context, conn *pgx.Conn, gvk string, bucketIDs []int, filt
 	}
 	defer tx.Rollback(ctx)
 
-	// Read per-bucket counters (build RV)
-	rv := resourceversion.RV{Buckets: make(map[int]int64, len(bucketIDs))}
-
-	counterRows, err := tx.Query(ctx, `
-		SELECT bucket_id, current_seq FROM gvk_bucket_counters
-		WHERE gvk = $1 AND bucket_id = ANY($2)`, gvk, bucketIDs)
+	var xmin uint64
+	err = tx.QueryRow(ctx, `SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint`).Scan(&xmin)
 	if err != nil {
-		return nil, fmt.Errorf("list counters: %w", err)
-	}
-	defer counterRows.Close()
-
-	for counterRows.Next() {
-		var bid int
-		var seq int64
-		if err := counterRows.Scan(&bid, &seq); err != nil {
-			return nil, fmt.Errorf("list counter scan: %w", err)
-		}
-		rv.Buckets[bid] = seq
-	}
-	if err := counterRows.Err(); err != nil {
-		return nil, fmt.Errorf("list counter rows: %w", err)
+		return nil, fmt.Errorf("list xmin: %w", err)
 	}
 
-	// Buckets with no counter row yet have hwm 0 (no writes ever)
-	for _, bid := range bucketIDs {
-		if _, ok := rv.Buckets[bid]; !ok {
-			rv.Buckets[bid] = 0
-		}
+	var watermark uint64
+	if xmin > 0 {
+		watermark = xmin - 1
 	}
+	rv := resourceversion.RV{Watermark: watermark}
 
 	query := `
-		SELECT gvk, namespace, name, uid, bucket_id, gvk_bucket_seq,
+		SELECT gvk, namespace, name, uid, txid_stamp::text::bigint,
 		       object_version, spec, status, metadata,
 		       deletion_timestamp, created_at, updated_at
 		FROM kubernetes_resources
-		WHERE gvk = $1 AND bucket_id = ANY($2)
+		WHERE gvk = $1
 		  AND (deletion_timestamp IS NULL OR metadata->'finalizers' != '[]'::jsonb)` // tombstone filter: also in compactor.go, 001_initial.sql, writer.go
-	args := []interface{}{gvk, bucketIDs}
+	args := []interface{}{gvk}
 
 	var f *ListFilter
 	if len(filter) > 0 && filter[0] != nil {
@@ -87,7 +68,7 @@ func List(ctx context.Context, conn *pgx.Conn, gvk string, bucketIDs []int, filt
 		}
 		args = append(args, f.WhereArgs...)
 	}
-	query += " ORDER BY bucket_id, gvk_bucket_seq"
+	query += " ORDER BY txid_stamp"
 	if f != nil && f.Limit > 0 {
 		args = append(args, f.Limit)
 		query += fmt.Sprintf(" LIMIT $%d", len(args))
@@ -107,8 +88,8 @@ func List(ctx context.Context, conn *pgx.Conn, gvk string, bucketIDs []int, filt
 	for resourceRows.Next() {
 		var r model.Resource
 		if err := resourceRows.Scan(
-			&r.GVK, &r.Namespace, &r.Name, &r.UID, &r.BucketID,
-			&r.GVKBucketSeq, &r.ObjectVersion, &r.Spec, &r.Status,
+			&r.GVK, &r.Namespace, &r.Name, &r.UID,
+			&r.TxidStamp, &r.ObjectVersion, &r.Spec, &r.Status,
 			&r.Metadata, &r.DeletionTimestamp, &r.CreatedAt, &r.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("list resource scan: %w", err)

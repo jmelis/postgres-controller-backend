@@ -10,7 +10,7 @@
             {
               "source_labels": ["job"],
               "label_matcher": ".*",
-              "dimensions": [["bucket_id"], ["phase"], ["phase", "gvk"], ["phase", "error_type"]],
+              "dimensions": [["phase"], ["phase", "gvk"], ["phase", "error_type"]],
               "metric_selectors": [
                 "^pgctl_writer_",
                 "^pgctl_watcher_",

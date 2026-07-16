@@ -40,7 +40,6 @@ func main() {
 	}
 
 	log.Printf("load test: %s — %s", cfg.Metadata.Name, cfg.Metadata.Description)
-	log.Printf("cluster: %d buckets", cfg.Cluster.Buckets)
 	log.Printf("seed: %d total objects", cfg.ComputeTotalObjects())
 	log.Printf("checkpoint interval: %v", cfg.CheckpointInterval)
 
@@ -63,7 +62,7 @@ func main() {
 	// Clear previous run data and seed fresh.
 	if len(cfg.Seed.GVKs) > 0 && cfg.ComputeTotalObjects() > 0 {
 		log.Printf("clearing previous data...")
-		if _, err := conn.Exec(ctx, "TRUNCATE kubernetes_resources, gvk_bucket_counters, compaction_horizon"); err != nil {
+		if _, err := conn.Exec(ctx, "TRUNCATE kubernetes_resources, compaction_horizon"); err != nil {
 			log.Fatalf("truncate failed: %v", err)
 		}
 		log.Printf("seeding data...")

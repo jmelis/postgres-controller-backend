@@ -22,11 +22,10 @@ func TestListEmpty(t *testing.T) {
 	db := testinfra.StartPostgres(t)
 	conn := db.Connect(t)
 
-	result, err := reader.List(context.Background(), conn, "apps/v1/Deployment", []int{1, 2})
+	result, err := reader.List(context.Background(), conn, "apps/v1/Deployment")
 	require.NoError(t, err)
 	assert.Empty(t, result.Resources)
-	assert.Equal(t, int64(0), result.ResourceVersion.Buckets[1])
-	assert.Equal(t, int64(0), result.ResourceVersion.Buckets[2])
+	assert.Equal(t, uint64(0), result.ResourceVersion.Watermark)
 }
 
 func TestListReturnsLiveResources(t *testing.T) {
@@ -42,8 +41,9 @@ func TestListReturnsLiveResources(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		req := model.WriteRequest{
 			GVK: "apps/v1/Deployment", Namespace: "default",
-			Name: fmt.Sprintf("deploy-%d", i), BucketID: 1,
-			Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+			Name:     fmt.Sprintf("deploy-%d", i),
+			Spec:     json.RawMessage(`{}`),
+			Status:   json.RawMessage(`{}`),
 			Metadata: json.RawMessage(`{}`),
 		}
 		_, err := w.Write(ctx, req)
@@ -51,14 +51,14 @@ func TestListReturnsLiveResources(t *testing.T) {
 	}
 
 	listConn := db.Connect(t)
-	result, err := reader.List(ctx, listConn, "apps/v1/Deployment", []int{1})
+	result, err := reader.List(ctx, listConn, "apps/v1/Deployment")
 	require.NoError(t, err)
 	assert.Len(t, result.Resources, 3)
-	assert.Equal(t, int64(3), result.ResourceVersion.Buckets[1])
+	assert.Greater(t, result.ResourceVersion.Watermark, uint64(0))
 
-	// Resources come back ordered by seq
-	for i, r := range result.Resources {
-		assert.Equal(t, int64(i+1), r.GVKBucketSeq)
+	// Resources come back ordered by txid_stamp; verify monotonically increasing
+	for i := 1; i < len(result.Resources); i++ {
+		assert.Greater(t, result.Resources[i].TxidStamp, result.Resources[i-1].TxidStamp)
 	}
 }
 
@@ -75,7 +75,7 @@ func TestListExcludesTombstones(t *testing.T) {
 	// Create a live resource
 	_, err := w.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "live",
-		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`),
 	})
 	require.NoError(t, err)
@@ -84,17 +84,17 @@ func TestListExcludesTombstones(t *testing.T) {
 	now := time.Now()
 	_, err = w.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "deleted",
-		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`), DeletionTimestamp: &now,
 	})
 	require.NoError(t, err)
 
 	listConn := db.Connect(t)
-	result, err := reader.List(ctx, listConn, "apps/v1/Deployment", []int{1})
+	result, err := reader.List(ctx, listConn, "apps/v1/Deployment")
 	require.NoError(t, err)
 	assert.Len(t, result.Resources, 1)
 	assert.Equal(t, "live", result.Resources[0].Name)
-	assert.Equal(t, int64(2), result.ResourceVersion.Buckets[1])
+	assert.Greater(t, result.ResourceVersion.Watermark, uint64(0))
 }
 
 func TestListIncludesDyingWithFinalizers(t *testing.T) {
@@ -110,7 +110,7 @@ func TestListIncludesDyingWithFinalizers(t *testing.T) {
 	// Create a live resource
 	_, err := w.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "live",
-		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`),
 	})
 	require.NoError(t, err)
@@ -119,7 +119,7 @@ func TestListIncludesDyingWithFinalizers(t *testing.T) {
 	now := time.Now()
 	_, err = w.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "dying",
-		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata:          json.RawMessage(`{"finalizers":["cleanup.example.com"]}`),
 		DeletionTimestamp: &now,
 	})
@@ -128,50 +128,18 @@ func TestListIncludesDyingWithFinalizers(t *testing.T) {
 	// Create a tombstone (deletion_timestamp set, no finalizers)
 	_, err = w.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "tombstone",
-		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata:          json.RawMessage(`{}`),
 		DeletionTimestamp: &now,
 	})
 	require.NoError(t, err)
 
 	listConn := db.Connect(t)
-	result, err := reader.List(ctx, listConn, "apps/v1/Deployment", []int{1})
+	result, err := reader.List(ctx, listConn, "apps/v1/Deployment")
 	require.NoError(t, err)
 	assert.Len(t, result.Resources, 2)
 	names := []string{result.Resources[0].Name, result.Resources[1].Name}
 	assert.Contains(t, names, "live")
 	assert.Contains(t, names, "dying")
-	assert.Equal(t, int64(3), result.ResourceVersion.Buckets[1])
-}
-
-func TestListMultipleBuckets(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires postgres")
-	}
-	db := testinfra.StartPostgres(t)
-	ctx := context.Background()
-
-	writerConn := db.Connect(t)
-	w := writer.New(writerConn, nil)
-
-	_, err := w.Write(ctx, model.WriteRequest{
-		GVK: "apps/v1/Deployment", Namespace: "ns1", Name: "a",
-		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
-		Metadata: json.RawMessage(`{}`),
-	})
-	require.NoError(t, err)
-
-	_, err = w.Write(ctx, model.WriteRequest{
-		GVK: "apps/v1/Deployment", Namespace: "ns2", Name: "b",
-		BucketID: 2, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
-		Metadata: json.RawMessage(`{}`),
-	})
-	require.NoError(t, err)
-
-	listConn := db.Connect(t)
-	result, err := reader.List(ctx, listConn, "apps/v1/Deployment", []int{1, 2})
-	require.NoError(t, err)
-	assert.Len(t, result.Resources, 2)
-	assert.Equal(t, int64(1), result.ResourceVersion.Buckets[1])
-	assert.Equal(t, int64(1), result.ResourceVersion.Buckets[2])
+	assert.Greater(t, result.ResourceVersion.Watermark, uint64(0))
 }

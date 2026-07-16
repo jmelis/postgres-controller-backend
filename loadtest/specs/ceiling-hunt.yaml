@@ -1,13 +1,12 @@
 metadata:
   name: "ceiling-hunt"
-  description: "Maximum RPS discovery — bucket count sweep on db.m6g.xlarge Multi-AZ"
+  description: "Maximum RPS discovery — worker count sweep on db.m6g.xlarge Multi-AZ"
 
 rds:
   instance_class: "db.m6g.2xlarge"
   engine_version: "16.14"
 
 cluster:
-  buckets: 16
   baseline_poll_interval: 5s
   debounce_floor: 100ms
 
@@ -17,7 +16,7 @@ seed:
       spec_size_bytes: 8192
       status_size_bytes: 12288
       metadata_size_bytes: 2048
-      objects_per_bucket: 50
+      objects: 800
 
 phases:
   phase0_baseline:
@@ -31,7 +30,7 @@ phases:
     runs: 1
     target_rps: 0
     target_p99_ms: 0
-    bucket_sweep: [64, 32, 16, 8, 4, 1]
+    worker_sweep: [64, 32, 16, 8, 4, 1]
 
   phase2_steady:
     enabled: false
@@ -55,6 +54,5 @@ verifier:
   enabled: true
   poll_interval: 200ms
   canary_interval: 1s
-  sample_buckets: 4
 
 checkpoint_interval: 1m

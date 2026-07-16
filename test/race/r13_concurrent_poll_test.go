@@ -35,8 +35,7 @@ func TestR13_ConcurrentPollRace(t *testing.T) {
 
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
-		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Watermark: 0},
 		BaselineInterval: 200 * time.Millisecond,
 		DebounceFloor:    50 * time.Millisecond,
 	}, hooks)
@@ -50,7 +49,7 @@ func TestR13_ConcurrentPollRace(t *testing.T) {
 	wr := newWriter(t, nil)
 	for i := 0; i < 10; i++ {
 		_, err := wr.Write(ctx, makeWriteReq("apps/v1/Deployment", "default",
-			"r13-"+string(rune('a'+i)), 1))
+			"r13-"+string(rune('a'+i))))
 		require.NoError(t, err)
 		time.Sleep(30 * time.Millisecond)
 	}

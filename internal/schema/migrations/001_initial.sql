@@ -1,11 +1,3 @@
--- Commit-ordered sequence per (bucket, GVK)
-CREATE TABLE IF NOT EXISTS gvk_bucket_counters (
-    bucket_id   INT    NOT NULL,
-    gvk         TEXT   NOT NULL,
-    current_seq BIGINT NOT NULL DEFAULT 0,
-    PRIMARY KEY (bucket_id, gvk)
-) WITH (fillfactor = 50);
-
 -- Resources: one row per object. Three lifecycle states:
 --   live (deletion_timestamp IS NULL),
 --   dying (deletion_timestamp set, has finalizers),
@@ -15,8 +7,7 @@ CREATE TABLE IF NOT EXISTS kubernetes_resources (
     namespace          TEXT        NOT NULL,
     name               TEXT        NOT NULL,
     uid                UUID        NOT NULL DEFAULT gen_random_uuid(),
-    bucket_id          INT         NOT NULL,
-    gvk_bucket_seq     BIGINT      NOT NULL,
+    txid_stamp         xid8        NOT NULL,
     object_version     BIGINT      NOT NULL DEFAULT 1,
     spec               JSONB       NOT NULL,
     status             JSONB       NOT NULL,
@@ -27,56 +18,52 @@ CREATE TABLE IF NOT EXISTS kubernetes_resources (
     PRIMARY KEY (gvk, namespace, name)
 );
 
--- Covers live-only queries (e.g., Get). List uses a broader predicate that
--- also includes dying objects (deletion_timestamp set, has finalizers) and
--- falls back to idx_resources_watch.
 CREATE INDEX IF NOT EXISTS idx_resources_list
-    ON kubernetes_resources (gvk, bucket_id)
+    ON kubernetes_resources (gvk)
     WHERE deletion_timestamp IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_resources_watch
-    ON kubernetes_resources (gvk, bucket_id, gvk_bucket_seq);
+    ON kubernetes_resources (gvk, txid_stamp);
 
--- Compaction horizon per (bucket, GVK)
+-- Compaction horizon per GVK
 CREATE TABLE IF NOT EXISTS compaction_horizon (
-    bucket_id     INT    NOT NULL,
-    gvk           TEXT   NOT NULL,
-    compacted_seq BIGINT NOT NULL,
-    PRIMARY KEY (bucket_id, gvk)
+    gvk           TEXT   NOT NULL PRIMARY KEY,
+    compacted_xid BIGINT NOT NULL
 );
+
 -- Write stored procedure.
--- Performs optional no-op suppression, counter increment, and upsert in a
--- single server-side call. Does NOT issue pg_notify — the caller fires
--- the doorbell after commit to avoid the global notification-queue lock
--- that serializes all commits.
--- Returns per-step timings (microseconds) so the caller can emit them
--- as Prometheus histograms without additional round-trips.
+-- Performs optional no-op suppression and upsert in a single server-side call.
+-- Uses pg_current_xact_id() as the ordering stamp — no shared counter, no lock
+-- contention. Does NOT issue pg_notify — the caller fires the doorbell after
+-- commit to avoid the global notification-queue lock.
+-- Returns per-step timings (microseconds) so the caller can emit them as
+-- Prometheus histograms without additional round-trips.
 DROP FUNCTION IF EXISTS pgctl_write;
 CREATE OR REPLACE FUNCTION pgctl_write(
     p_status_only      BOOLEAN,
     p_gvk             TEXT,
     p_namespace        TEXT,
     p_name             TEXT,
-    p_bucket_id        INT,
     p_expected_version BIGINT,
     p_force_write      BOOLEAN,
     p_spec             JSONB,
     p_status           JSONB,
     p_metadata         JSONB,
     p_deletion_ts      TIMESTAMPTZ DEFAULT NULL
-) RETURNS TABLE(out_uid UUID, out_version BIGINT, out_seq BIGINT, out_changed BOOLEAN,
-                out_suppress_us BIGINT, out_counter_us BIGINT, out_upsert_us BIGINT)
+) RETURNS TABLE(out_uid UUID, out_version BIGINT, out_txid xid8, out_changed BOOLEAN,
+                out_suppress_us BIGINT, out_upsert_us BIGINT)
 LANGUAGE plpgsql AS $$
 DECLARE
-    v_seq         BIGINT;
+    v_txid        xid8;
     v_uid         UUID;
     v_version     BIGINT;
     v_existing    RECORD;
     v_t0          TIMESTAMPTZ;
     v_suppress_us BIGINT := 0;
-    v_counter_us  BIGINT := 0;
     v_upsert_us   BIGINT := 0;
 BEGIN
+    v_txid := pg_current_xact_id();
+
     -- 1. Suppression check (skip if force_write)
     v_t0 := clock_timestamp();
     IF NOT p_force_write THEN
@@ -90,8 +77,8 @@ BEGIN
             IF p_status_only THEN
                 IF v_existing.status = p_status THEN
                     v_suppress_us := extract(microseconds from clock_timestamp() - v_t0)::BIGINT;
-                    RETURN QUERY SELECT v_existing.uid, v_existing.object_version, 0::BIGINT, false,
-                        v_suppress_us, v_counter_us, v_upsert_us;
+                    RETURN QUERY SELECT v_existing.uid, v_existing.object_version, '0'::xid8, false,
+                        v_suppress_us, v_upsert_us;
                     RETURN;
                 END IF;
             -- Branch: Write/WriteObject — compare spec+metadata+deletion_ts, and status if non-NULL
@@ -101,8 +88,8 @@ BEGIN
                    AND v_existing.metadata = p_metadata
                    AND v_existing.deletion_timestamp IS NOT DISTINCT FROM p_deletion_ts THEN
                     v_suppress_us := extract(microseconds from clock_timestamp() - v_t0)::BIGINT;
-                    RETURN QUERY SELECT v_existing.uid, v_existing.object_version, 0::BIGINT, false,
-                        v_suppress_us, v_counter_us, v_upsert_us;
+                    RETURN QUERY SELECT v_existing.uid, v_existing.object_version, '0'::xid8, false,
+                        v_suppress_us, v_upsert_us;
                     RETURN;
                 END IF;
             END IF;
@@ -110,16 +97,7 @@ BEGIN
     END IF;
     v_suppress_us := extract(microseconds from clock_timestamp() - v_t0)::BIGINT;
 
-    -- 2. Counter increment
-    v_t0 := clock_timestamp();
-    INSERT INTO gvk_bucket_counters (bucket_id, gvk, current_seq)
-    VALUES (p_bucket_id, p_gvk, 1)
-    ON CONFLICT (bucket_id, gvk)
-    DO UPDATE SET current_seq = gvk_bucket_counters.current_seq + 1
-    RETURNING current_seq INTO v_seq;
-    v_counter_us := extract(microseconds from clock_timestamp() - v_t0)::BIGINT;
-
-    -- 3. Upsert — three mutually exclusive branches:
+    -- 2. Upsert — three mutually exclusive branches:
     --    a) p_status_only            → WriteStatus (update status only, version > 0)
     --    b) p_expected_version = 0   → Create (with tombstone revival on conflict)
     --    c) else                     → Update via Write/WriteObject
@@ -132,10 +110,10 @@ BEGIN
         END IF;
 
         UPDATE kubernetes_resources
-           SET gvk_bucket_seq = v_seq,
-               object_version = object_version + 1,
-               status         = p_status,
-               updated_at     = now()
+           SET txid_stamp      = v_txid,
+               object_version  = object_version + 1,
+               status          = p_status,
+               updated_at      = now()
          WHERE gvk = p_gvk AND namespace = p_namespace AND name = p_name
            AND object_version = p_expected_version
         RETURNING uid, object_version INTO v_uid, v_version;
@@ -147,9 +125,9 @@ BEGIN
     ELSIF p_expected_version = 0 THEN
         BEGIN
             INSERT INTO kubernetes_resources
-                (gvk, namespace, name, bucket_id, gvk_bucket_seq,
+                (gvk, namespace, name, txid_stamp,
                  object_version, spec, status, metadata, deletion_timestamp)
-            VALUES (p_gvk, p_namespace, p_name, p_bucket_id, v_seq,
+            VALUES (p_gvk, p_namespace, p_name, v_txid,
                     1, p_spec, p_status, p_metadata, p_deletion_ts)
             RETURNING uid, object_version INTO v_uid, v_version;
         EXCEPTION WHEN unique_violation THEN
@@ -159,8 +137,7 @@ BEGIN
             -- and live objects fall through to 'already exists'.
             UPDATE kubernetes_resources
                SET uid                = gen_random_uuid(),
-                   bucket_id          = p_bucket_id,
-                   gvk_bucket_seq     = v_seq,
+                   txid_stamp         = v_txid,
                    object_version     = 1,
                    spec               = p_spec,
                    status             = COALESCE(p_status, '{}'::jsonb),
@@ -181,13 +158,13 @@ BEGIN
     -- COALESCE(p_status, status) preserves existing status when p_status is NULL (WriteObject)
     ELSE
         UPDATE kubernetes_resources
-           SET gvk_bucket_seq     = v_seq,
-               object_version     = object_version + 1,
-               spec               = p_spec,
-               status             = COALESCE(p_status, status),
-               metadata           = p_metadata,
-               deletion_timestamp = p_deletion_ts,
-               updated_at         = now()
+           SET txid_stamp          = v_txid,
+               object_version      = object_version + 1,
+               spec                = p_spec,
+               status              = COALESCE(p_status, status),
+               metadata            = p_metadata,
+               deletion_timestamp  = p_deletion_ts,
+               updated_at          = now()
          WHERE gvk = p_gvk AND namespace = p_namespace AND name = p_name
            AND object_version = p_expected_version
         RETURNING uid, object_version INTO v_uid, v_version;
@@ -198,7 +175,7 @@ BEGIN
     END IF;
     v_upsert_us := extract(microseconds from clock_timestamp() - v_t0)::BIGINT;
 
-    RETURN QUERY SELECT v_uid, v_version, v_seq, true,
-        v_suppress_us, v_counter_us, v_upsert_us;
+    RETURN QUERY SELECT v_uid, v_version, v_txid, true,
+        v_suppress_us, v_upsert_us;
 END;
 $$;

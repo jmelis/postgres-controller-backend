@@ -136,7 +136,7 @@ func runSingleThreadedWrites(ctx context.Context, dsn string, iterations int, gv
 	defer conn.Close(context.Background())
 
 	// Clean slate.
-	if _, err := conn.Exec(ctx, "TRUNCATE kubernetes_resources, gvk_bucket_counters"); err != nil {
+	if _, err := conn.Exec(ctx, "TRUNCATE kubernetes_resources"); err != nil {
 		return 0, 0, fmt.Errorf("truncate: %w", err)
 	}
 
@@ -160,7 +160,6 @@ func runSingleThreadedWrites(ctx context.Context, dsn string, iterations int, gv
 			GVK:       gvk,
 			Namespace: namespace,
 			Name:      fmt.Sprintf("p0-%s-%d", namespace, i),
-			BucketID:  1,
 			Spec:      spec,
 			Status:    status,
 			Metadata:  metadata,
@@ -218,7 +217,7 @@ func measureStoredProcComparison(ctx context.Context, dsn string, iterations int
 	defer spConn.Close(context.Background())
 
 	// Clean slate — pgctl_write is created by the schema migration.
-	if _, err := spConn.Exec(ctx, "TRUNCATE kubernetes_resources, gvk_bucket_counters"); err != nil {
+	if _, err := spConn.Exec(ctx, "TRUNCATE kubernetes_resources"); err != nil {
 		return fmt.Errorf("truncate for sproc: %w", err)
 	}
 
@@ -237,14 +236,15 @@ func measureStoredProcComparison(ctx context.Context, dsn string, iterations int
 			return fmt.Errorf("sproc begin %d: %w", i, err)
 		}
 		var uid [16]byte
-		var version, seq int64
+		var version int64
+		var txid uint64
 		var changed bool
-		var suppressUs, counterUs, upsertUs int64
+		var suppressUs, upsertUs int64
 		err = tx.QueryRow(ctx,
-			"SELECT * FROM pgctl_write($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-			false, gvk, "phase0-sproc", name, 1,
+			"SELECT * FROM pgctl_write($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+			false, gvk, "phase0-sproc", name,
 			int64(0), false, spec, status, metadata, nil,
-		).Scan(&uid, &version, &seq, &changed, &suppressUs, &counterUs, &upsertUs)
+		).Scan(&uid, &version, &txid, &changed, &suppressUs, &upsertUs)
 		if err != nil {
 			tx.Rollback(ctx) //nolint:errcheck
 			return fmt.Errorf("sproc call %d: %w", i, err)
@@ -277,7 +277,7 @@ func runWritesWithLatencies(ctx context.Context, dsn string, iterations int, gvk
 	}
 	defer conn.Close(context.Background())
 
-	if _, err := conn.Exec(ctx, "TRUNCATE kubernetes_resources, gvk_bucket_counters"); err != nil {
+	if _, err := conn.Exec(ctx, "TRUNCATE kubernetes_resources"); err != nil {
 		return nil, fmt.Errorf("truncate: %w", err)
 	}
 
@@ -292,7 +292,6 @@ func runWritesWithLatencies(ctx context.Context, dsn string, iterations int, gvk
 			GVK:       gvk,
 			Namespace: namespace,
 			Name:      fmt.Sprintf("p0-%s-%d", namespace, i),
-			BucketID:  1,
 			Spec:      spec,
 			Status:    status,
 			Metadata:  metadata,
@@ -321,7 +320,6 @@ func snapshotPgStat(ctx context.Context, conn *pgx.Conn) (map[string]pgStatRow, 
 		SELECT query, calls, total_exec_time
 		FROM pg_stat_statements
 		WHERE query LIKE '%kubernetes_resources%'
-		   OR query LIKE '%gvk_bucket_counters%'
 		   OR query LIKE '%pg_notify%'
 		ORDER BY total_exec_time DESC
 		LIMIT 50`)

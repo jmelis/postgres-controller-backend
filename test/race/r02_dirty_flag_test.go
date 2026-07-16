@@ -32,8 +32,7 @@ func TestR2_DirtyFlagSwallow(t *testing.T) {
 
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
-		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Watermark: 0},
 		BaselineInterval: 10 * time.Second, // long baseline so doorbell drives polling
 		DebounceFloor:    50 * time.Millisecond,
 	}, hooks)
@@ -53,7 +52,7 @@ func TestR2_DirtyFlagSwallow(t *testing.T) {
 
 	// Write a resource — doorbell fires, should trigger at least one poll
 	wr := newWriter(t, nil)
-	req := makeWriteReq("apps/v1/Deployment", "default", "dirty-flag-test", 1)
+	req := makeWriteReq("apps/v1/Deployment", "default", "dirty-flag-test")
 	_, err := wr.Write(ctx, req)
 	require.NoError(t, err)
 
@@ -99,8 +98,7 @@ func TestR2_DirtyFlagSwallow_Stress(t *testing.T) {
 
 	w := reader.NewWatcher(pollConn, nil, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
-		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Watermark: 0},
 		BaselineInterval: 200 * time.Millisecond,
 		DebounceFloor:    10 * time.Millisecond,
 	}, hooks)
@@ -124,7 +122,7 @@ func TestR2_DirtyFlagSwallow_Stress(t *testing.T) {
 			defer wg.Done()
 			wr := newWriter(t, nil)
 			req := makeWriteReq("apps/v1/Deployment", "default",
-				fmt.Sprintf("stress-%d", idx), 1)
+				fmt.Sprintf("stress-%d", idx))
 			wr.Write(ctx, req)
 		}(i)
 	}

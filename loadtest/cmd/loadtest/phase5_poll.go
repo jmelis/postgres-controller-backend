@@ -44,7 +44,6 @@ func (h *phase5TimingHooks) AfterPoll(_ []reader.Event) {
 // Phase C: notify-loss drill (no listen conn, baseline-only delivery)
 func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, error) {
 	pCfg := cfg.Phases.Phase5Poll
-	numBuckets := cfg.Cluster.Buckets
 	numWatchers := pCfg.NumWatchers
 	writeRate := pCfg.WriteRate
 	writeCount := pCfg.WriteCount
@@ -68,8 +67,6 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	log.Printf("phase5: starting poll test — %d watchers, %d writes at %d/s",
 		numWatchers, writeCount, writeRate)
 
-	bucketIDs := makeBucketIDs(numBuckets)
-
 	// Get starting HWM: use a probe watcher to discover the current sequence position.
 	probeConn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
@@ -77,10 +74,10 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	}
 	defer probeConn.Close(context.Background())
 
-	startRV := resourceversion.RV{Buckets: make(map[int]int64)}
+	var startRV resourceversion.RV
 
 	// Build initial HWM from a list query.
-	listResult, err := reader.List(ctx, probeConn, gvk, bucketIDs)
+	listResult, err := reader.List(ctx, probeConn, gvk)
 	if err != nil {
 		log.Printf("phase5: list for HWM failed (starting from zero): %v", err)
 	} else {
@@ -114,8 +111,7 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 
 		w := reader.NewWatcher(pc, nil, reader.WatcherConfig{
 			GVK:              gvk,
-			BucketIDs:        bucketIDs,
-			StartRV:          resourceversion.RV{Buckets: copyHWM(startRV.Buckets)},
+			StartRV:          startRV,
 			BaselineInterval: baselineInterval,
 		}, hooks).WithMetrics(libWatcherMetrics)
 
@@ -183,8 +179,7 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 
 		w := reader.NewWatcher(pc, lc, reader.WatcherConfig{
 			GVK:              gvk,
-			BucketIDs:        bucketIDs,
-			StartRV:          resourceversion.RV{Buckets: copyHWM(startRV.Buckets)},
+			StartRV:          startRV,
 			BaselineInterval: 10 * time.Second,
 			DebounceFloor:    50 * time.Millisecond,
 		}, nil).WithMetrics(libWatcherMetrics)
@@ -242,13 +237,11 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	writeInterval := time.Duration(float64(time.Second) / float64(writeRate))
 
 	for i := 0; i < writeCount; i++ {
-		bucketID := (i % numBuckets) + 1
 		name := fmt.Sprintf("phase5-db-%d", i)
 		req := model.WriteRequest{
 			GVK:       gvk,
 			Namespace: "phase5-db",
 			Name:      name,
-			BucketID:  bucketID,
 			Spec:      json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
 			Status:    json.RawMessage(`{}`),
 			Metadata:  json.RawMessage(`{}`),
@@ -297,12 +290,10 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 		log.Printf("phase5: --- Phase C: notify-loss drill ---")
 
 		// Get HWM from phase B watchers.
-		lossHWM := make(map[int]int64)
+		var lossHWM uint64
 		for _, w := range dbWatchers {
-			for k, v := range w.HWM() {
-				if v > lossHWM[k] {
-					lossHWM[k] = v
-				}
+			if h := w.HWM(); h > lossHWM {
+				lossHWM = h
 			}
 		}
 
@@ -324,8 +315,7 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 
 			w := reader.NewWatcher(pc, nil, reader.WatcherConfig{
 				GVK:              gvk,
-				BucketIDs:        bucketIDs,
-				StartRV:          resourceversion.RV{Buckets: copyHWM(lossHWM)},
+				StartRV:          resourceversion.RV{Watermark: lossHWM},
 				BaselineInterval: baselineInterval,
 			}, nil).WithMetrics(libWatcherMetrics)
 			lossWatchers[i] = w
@@ -382,13 +372,11 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 		}
 		lossWr := writer.New(lossWriteConn, nil).WithMetrics(libWriterMetrics)
 		for i := 0; i < writeCount; i++ {
-			bucketID := (i % numBuckets) + 1
 			name := fmt.Sprintf("phase5-loss-%d", i)
 			req := model.WriteRequest{
 				GVK:       gvk,
 				Namespace: "phase5-loss",
 				Name:      name,
-				BucketID:  bucketID,
 				Spec:      json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
 				Status:    json.RawMessage(`{}`),
 				Metadata:  json.RawMessage(`{}`),
@@ -462,12 +450,4 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 			"idle_p99_ms":  idleP99.Milliseconds(),
 		},
 	}, nil
-}
-
-func copyHWM(src map[int]int64) map[int]int64 {
-	dst := make(map[int]int64, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
 }

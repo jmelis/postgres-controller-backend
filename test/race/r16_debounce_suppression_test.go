@@ -30,8 +30,7 @@ func TestR16_DebounceSuppression(t *testing.T) {
 
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
-		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Watermark: 0},
 		BaselineInterval: 10 * time.Second, // long baseline so doorbells drive polling
 		DebounceFloor:    200 * time.Millisecond,
 	}, hooks)
@@ -54,7 +53,7 @@ func TestR16_DebounceSuppression(t *testing.T) {
 	notifyConn := connectManualShared(t)
 	defer notifyConn.Close(context.Background())
 	for i := 0; i < 30; i++ {
-		_, err := notifyConn.Exec(ctx, `SELECT pg_notify('resource_changes_b1', '')`)
+		_, err := notifyConn.Exec(ctx, `SELECT pg_notify($1, '')`, "resource_changes_apps/v1/Deployment")
 		require.NoError(t, err)
 	}
 
@@ -69,7 +68,7 @@ func TestR16_DebounceSuppression(t *testing.T) {
 
 	// Write one real resource AFTER the burst to verify delivery survived suppression.
 	wr := newWriter(t, nil)
-	req := makeWriteReq("apps/v1/Deployment", "default", "debounce-survivor", 1)
+	req := makeWriteReq("apps/v1/Deployment", "default", "debounce-survivor")
 	_, err := wr.Write(ctx, req)
 	require.NoError(t, err)
 
@@ -102,8 +101,7 @@ func TestR16_TrailingEdgeTiming(t *testing.T) {
 
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
-		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Watermark: 0},
 		BaselineInterval: 10 * time.Second,
 		DebounceFloor:    debounceFloor,
 	}, hooks)
@@ -136,7 +134,7 @@ func TestR16_TrailingEdgeTiming(t *testing.T) {
 	mu.Unlock()
 
 	require.Eventually(t, func() bool {
-		notifyConn.Exec(ctx, `SELECT pg_notify('resource_changes_b1', '')`) //nolint:errcheck
+		notifyConn.Exec(ctx, `SELECT pg_notify($1, '')`, "resource_changes_apps/v1/Deployment") //nolint:errcheck
 		mu.Lock()
 		defer mu.Unlock()
 		return len(pollTimestamps) >= warmupBase+1
@@ -151,7 +149,7 @@ func TestR16_TrailingEdgeTiming(t *testing.T) {
 	mu.Unlock()
 
 	// Fire one doorbell — triggers leading-edge poll.
-	_, err := notifyConn.Exec(ctx, `SELECT pg_notify('resource_changes_b1', '')`)
+	_, err := notifyConn.Exec(ctx, `SELECT pg_notify($1, '')`, "resource_changes_apps/v1/Deployment")
 	require.NoError(t, err)
 
 	// Wait for the leading poll to register.
@@ -167,7 +165,7 @@ func TestR16_TrailingEdgeTiming(t *testing.T) {
 	mu.Unlock()
 
 	// Fire a second doorbell immediately after the leading poll is detected.
-	_, err = notifyConn.Exec(ctx, `SELECT pg_notify('resource_changes_b1', '')`)
+	_, err = notifyConn.Exec(ctx, `SELECT pg_notify($1, '')`, "resource_changes_apps/v1/Deployment")
 	require.NoError(t, err)
 
 	// Wait for the trailing poll.
@@ -213,8 +211,7 @@ func TestR16_DebounceSuppression_NoEventLoss(t *testing.T) {
 
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
-		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Watermark: 0},
 		BaselineInterval: 10 * time.Second,
 		DebounceFloor:    200 * time.Millisecond,
 	}, nil)
@@ -235,7 +232,7 @@ func TestR16_DebounceSuppression_NoEventLoss(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		wr := newWriter(t, nil)
 		req := makeWriteReq("apps/v1/Deployment", "default",
-			fmt.Sprintf("debounce-stress-%d", i), 1)
+			fmt.Sprintf("debounce-stress-%d", i))
 		_, err := wr.Write(ctx, req)
 		require.NoError(t, err)
 	}

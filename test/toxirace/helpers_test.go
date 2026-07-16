@@ -46,7 +46,6 @@ func truncateAll(t *testing.T) {
 	conn := directConn(t)
 	tables := []string{
 		"kubernetes_resources",
-		"gvk_bucket_counters",
 		"compaction_horizon",
 	}
 	ctx := context.Background()
@@ -57,9 +56,9 @@ func truncateAll(t *testing.T) {
 	}
 }
 
-func makeWriteReq(gvk, ns, name string, bucketID int) model.WriteRequest {
+func makeWriteReq(gvk, ns, name string) model.WriteRequest {
 	return model.WriteRequest{
-		GVK: gvk, Namespace: ns, Name: name, BucketID: bucketID,
+		GVK: gvk, Namespace: ns, Name: name,
 		Spec: json.RawMessage(`{"replicas":1}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`),
 	}

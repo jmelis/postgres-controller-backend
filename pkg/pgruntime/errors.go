@@ -59,7 +59,7 @@ func mapGetError(err error, gvk schema.GroupVersionKind, name string) error {
 	return err
 }
 
-func mapWriteError(ctx context.Context, w *writer.Writer, err error, gvk schema.GroupVersionKind, name string, seq int64) (*model.Resource, error) {
+func mapWriteError(ctx context.Context, w *writer.Writer, err error, gvk schema.GroupVersionKind, name string, _ int64) (*model.Resource, error) {
 	if errors.Is(err, writer.ErrAlreadyExists) {
 		return nil, apierrors.NewAlreadyExists(groupResource(gvk), name)
 	}
@@ -69,7 +69,7 @@ func mapWriteError(ctx context.Context, w *writer.Writer, err error, gvk schema.
 
 	var ace *writer.AmbiguousCommitError
 	if errors.As(err, &ace) {
-		r, rbErr := w.ReadBack(ctx, ace.GVK, ace.Namespace, ace.Name, ace.Seq)
+		r, rbErr := w.ReadBack(ctx, ace.GVK, ace.Namespace, ace.Name, ace.Txid)
 		if rbErr != nil {
 			return nil, fmt.Errorf("ambiguous commit + read-back failed: %w (original: %v)", rbErr, err)
 		}

@@ -15,32 +15,20 @@ import (
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
 )
 
-func TestCeiling_BucketScaling(t *testing.T) {
+func TestCeiling_WorkerScaling(t *testing.T) {
 	if testing.Short() {
 		t.Skip("ceiling test skipped in short mode")
 	}
 
-	bucketConfigs := []struct {
-		buckets        int
-		workersPerBucket int
-	}{
-		{1, 10},
-		{1, 50},
-		{2, 25},
-		{4, 12},
-		{8, 6},
-		{16, 3},
-		{30, 2},
-	}
+	workerCounts := []int{10, 50, 50, 48, 48, 48, 60}
 
-	for _, bc := range bucketConfigs {
-		name := fmt.Sprintf("%db_%dw", bc.buckets, bc.workersPerBucket)
+	for _, workers := range workerCounts {
+		name := fmt.Sprintf("%dw", workers)
 		t.Run(name, func(t *testing.T) {
 			truncateAll(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
-			totalWorkers := bc.buckets * bc.workersPerBucket
 			const (
 				gvk          = "apps/v1/Deployment"
 				testDuration = 5 * time.Second
@@ -48,55 +36,51 @@ func TestCeiling_BucketScaling(t *testing.T) {
 
 			var totalWrites atomic.Int64
 			var totalErrors atomic.Int64
-			var allLatencies sync.Map // bucket -> []time.Duration
+			var allLatencies sync.Map // workerID -> []time.Duration
 			var wg sync.WaitGroup
 
 			start := time.Now()
 			deadline := start.Add(testDuration)
 
-			workerID := 0
-			for b := 1; b <= bc.buckets; b++ {
-				for w := 0; w < bc.workersPerBucket; w++ {
-					wg.Add(1)
-					go func(wID, bucketID int) {
-						defer wg.Done()
+			for w := 0; w < workers; w++ {
+				wg.Add(1)
+				go func(wID int) {
+					defer wg.Done()
 
-						conn, err := pgx.Connect(ctx, sharedDB.ConnStr)
+					conn, err := pgx.Connect(ctx, sharedDB.ConnStr)
+					if err != nil {
+						totalErrors.Add(1)
+						return
+					}
+					defer conn.Close(context.Background())
+
+					wr := writer.New(conn, nil)
+					var lats []time.Duration
+					var writeNum int
+
+					for time.Now().Before(deadline) {
+						req := model.WriteRequest{
+							GVK: gvk, Namespace: "ceiling", Name: fmt.Sprintf("w%d-r%d", wID, writeNum),
+							Spec: json.RawMessage(`{}`),
+							Status: json.RawMessage(`{}`), Metadata: json.RawMessage(`{}`),
+						}
+
+						t0 := time.Now()
+						_, err := wr.Write(ctx, req)
+						lat := time.Since(t0)
+
 						if err != nil {
 							totalErrors.Add(1)
-							return
-						}
-						defer conn.Close(context.Background())
-
-						wr := writer.New(conn, nil)
-						var lats []time.Duration
-						var writeNum int
-
-						for time.Now().Before(deadline) {
-							req := model.WriteRequest{
-								GVK: gvk, Namespace: "ceiling", Name: fmt.Sprintf("w%d-r%d", wID, writeNum),
-								BucketID: bucketID, Spec: json.RawMessage(`{}`),
-								Status: json.RawMessage(`{}`), Metadata: json.RawMessage(`{}`),
-							}
-
-							t0 := time.Now()
-							_, err := wr.Write(ctx, req)
-							lat := time.Since(t0)
-
-							if err != nil {
-								totalErrors.Add(1)
-								continue
-							}
-
-							lats = append(lats, lat)
-							totalWrites.Add(1)
-							writeNum++
+							continue
 						}
 
-						allLatencies.Store(wID, lats)
-					}(workerID, b)
-					workerID++
-				}
+						lats = append(lats, lat)
+						totalWrites.Add(1)
+						writeNum++
+					}
+
+					allLatencies.Store(wID, lats)
+				}(w)
 			}
 
 			wg.Wait()
@@ -120,8 +104,8 @@ func TestCeiling_BucketScaling(t *testing.T) {
 				p99 = percentile(combined, 0.99)
 			}
 
-			t.Logf("buckets=%-2d  workers=%-3d  writes=%-6d  RPS=%-8.1f  p50=%-12v  p99=%-12v  errors=%d",
-				bc.buckets, totalWorkers, total, rps, p50, p99, errs)
+			t.Logf("workers=%-3d  writes=%-6d  RPS=%-8.1f  p50=%-12v  p99=%-12v  errors=%d",
+				workers, total, rps, p50, p99, errs)
 		})
 	}
 }

@@ -49,49 +49,40 @@ func generatePayload(sizeBytes int, idx int) json.RawMessage {
 }
 
 // Seed populates the database with objects according to the config.
-// It writes objects round-robin across buckets.
 func Seed(ctx context.Context, conn *pgx.Conn, cfg *Config) error {
-	numBuckets := cfg.Cluster.Buckets
-
 	wr := writer.New(conn, nil).WithMetrics(libWriterMetrics)
 	totalSeeded := 0
 
 	for _, gvkCfg := range cfg.Seed.GVKs {
 		gvkSeeded := 0
-		totalForGVK := gvkCfg.ObjectsPerBucket * numBuckets
 
-		log.Printf("seeder: seeding %d objects for GVK %s (%d per bucket x %d buckets)",
-			totalForGVK, gvkCfg.GVK, gvkCfg.ObjectsPerBucket, numBuckets)
+		log.Printf("seeder: seeding %d objects for GVK %s",
+			gvkCfg.Objects, gvkCfg.GVK)
 
-		objIdx := 0
-		for i := 0; i < gvkCfg.ObjectsPerBucket; i++ {
-			for b := 1; b <= numBuckets; b++ {
-				spec := generatePayload(gvkCfg.SpecSizeBytes, objIdx)
-				status := generatePayload(gvkCfg.StatusSizeBytes, objIdx)
-				metadata := generatePayload(gvkCfg.MetadataSizeBytes, objIdx)
+		for i := 0; i < gvkCfg.Objects; i++ {
+			spec := generatePayload(gvkCfg.SpecSizeBytes, i)
+			status := generatePayload(gvkCfg.StatusSizeBytes, i)
+			metadata := generatePayload(gvkCfg.MetadataSizeBytes, i)
 
-				req := model.WriteRequest{
-					GVK:       gvkCfg.GVK,
-					Namespace: "loadtest-seed",
-					Name:      fmt.Sprintf("seed-%s-%d", gvkCfg.GVK, objIdx),
-					BucketID:  b,
-					Spec:      spec,
-					Status:    status,
-					Metadata:  metadata,
-				}
+			req := model.WriteRequest{
+				GVK:       gvkCfg.GVK,
+				Namespace: "loadtest-seed",
+				Name:      fmt.Sprintf("seed-%s-%d", gvkCfg.GVK, i),
+				Spec:      spec,
+				Status:    status,
+				Metadata:  metadata,
+			}
 
-				if _, err := wr.Write(ctx, req); err != nil {
-					return fmt.Errorf("seed write (gvk=%s, obj=%d, bucket=%d): %w",
-						gvkCfg.GVK, objIdx, b, err)
-				}
+			if _, err := wr.Write(ctx, req); err != nil {
+				return fmt.Errorf("seed write (gvk=%s, obj=%d): %w",
+					gvkCfg.GVK, i, err)
+			}
 
-				objIdx++
-				gvkSeeded++
-				totalSeeded++
+			gvkSeeded++
+			totalSeeded++
 
-				if totalSeeded%1000 == 0 {
-					log.Printf("seeder: progress %d objects seeded", totalSeeded)
-				}
+			if totalSeeded%1000 == 0 {
+				log.Printf("seeder: progress %d objects seeded", totalSeeded)
 			}
 		}
 

@@ -25,7 +25,6 @@ func TestR21_ConcurrentTombstoneRevival(t *testing.T) {
 	past := time.Now().Add(-time.Hour)
 	tombstoneReq := model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "r21",
-		BucketID:          1,
 		Spec:              json.RawMessage(`{"old":true}`),
 		Status:            json.RawMessage(`{}`),
 		Metadata:          json.RawMessage(`{}`),
@@ -34,6 +33,7 @@ func TestR21_ConcurrentTombstoneRevival(t *testing.T) {
 	res0, err := w0.Write(ctx, tombstoneReq)
 	require.NoError(t, err)
 	oldUID := res0.UID
+	tombstoneTxid := res0.Txid
 
 	hookA := newBlockingHook()
 	wA := newWriter(t, hookA)
@@ -49,7 +49,6 @@ func TestR21_ConcurrentTombstoneRevival(t *testing.T) {
 	revivalReq := func(who string) model.WriteRequest {
 		return model.WriteRequest{
 			GVK: "apps/v1/Deployment", Namespace: "default", Name: "r21",
-			BucketID:        1,
 			ExpectedVersion: 0,
 			Spec:            json.RawMessage(`{"writer":"` + who + `"}`),
 			Status:          json.RawMessage(`{}`),
@@ -80,14 +79,16 @@ func TestR21_ConcurrentTombstoneRevival(t *testing.T) {
 
 	assert.ErrorIs(t, resB.err, writer.ErrAlreadyExists, "second reviver must get already-exists")
 
-	// Counter: create=1, A's revival=2. B's increment rolled back.
+	// txid_stamp must be from A's revival (greater than the tombstone's txid).
+	// B's transaction rolled back.
 	conn := freshConn(t)
-	var counter int64
+	var txidStamp int64
 	err = conn.QueryRow(ctx,
-		`SELECT current_seq FROM gvk_bucket_counters WHERE bucket_id = 1 AND gvk = 'apps/v1/Deployment'`,
-	).Scan(&counter)
+		`SELECT txid_stamp::text::bigint FROM kubernetes_resources
+		 WHERE gvk = 'apps/v1/Deployment' AND namespace = 'default' AND name = 'r21'`,
+	).Scan(&txidStamp)
 	require.NoError(t, err)
-	assert.Equal(t, int64(2), counter)
+	assert.Greater(t, uint64(txidStamp), tombstoneTxid, "txid_stamp must advance past tombstone")
 
 	// DB must have exactly one row, live (no deletion_timestamp), with A's content.
 	var rowCount int

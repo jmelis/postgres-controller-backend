@@ -15,74 +15,72 @@ import (
 )
 
 // R12 — Concurrent spec and status writes (I1 for mixed write paths).
-// Both write to the same resource. Each write bumps the shared counter and
-// object_version. A watcher polling after each write sees the new state at the
-// correct sequence number — the shared counter produces a commit-ordered sequence
-// across spec and status writes.
+// Both write to the same resource. Each write acquires a txid and bumps
+// object_version. A watcher polling after each write sees the new state —
+// txids produce a commit-ordered sequence across spec and status writes.
 func TestR12_ConcurrentSpecStatus(t *testing.T) {
 	truncateAll(t)
 	ctx := context.Background()
 
-	// Create resource via spec writer (seq=1, object_version=1)
+	// Create resource via spec writer
 	specW := newWriter(t, nil)
 	createReq := model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "mixed-writer",
-		BucketID: 1, Spec: json.RawMessage(`{"replicas":1}`),
+		Spec: json.RawMessage(`{"replicas":1}`),
 		Status: json.RawMessage(`{"ready":false}`), Metadata: json.RawMessage(`{}`),
 	}
 	r1, err := specW.Write(ctx, createReq)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), r1.Seq)
+	assert.Greater(t, r1.Txid, uint64(0))
 	assert.Equal(t, int64(1), r1.ObjectVersion)
 
-	// Status update by holder-b (seq=2, object_version=2)
+	// Status update by holder-b
 	statusW := writer.New(freshConn(t), nil)
 	statusReq := model.StatusWriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "mixed-writer",
-		BucketID: 1, Status: json.RawMessage(`{"ready":true,"conditions":["init"]}`),
+		Status:          json.RawMessage(`{"ready":true,"conditions":["init"]}`),
 		ExpectedVersion: r1.ObjectVersion,
 	}
 	r2, err := statusW.WriteStatus(ctx, statusReq)
 	require.NoError(t, err)
-	assert.Equal(t, int64(2), r2.Seq)
+	assert.Greater(t, r2.Txid, r1.Txid, "txid must advance")
 	assert.Equal(t, int64(2), r2.ObjectVersion)
 
-	// Spec update by holder-a (seq=3, object_version=3)
+	// Spec update by holder-a
 	specReq2 := model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "mixed-writer",
-		BucketID: 1, Spec: json.RawMessage(`{"replicas":3}`),
-		Status: json.RawMessage(`{"ready":true,"conditions":["init"]}`),
+		Spec:     json.RawMessage(`{"replicas":3}`),
+		Status:   json.RawMessage(`{"ready":true,"conditions":["init"]}`),
 		Metadata: json.RawMessage(`{}`),
 		ExpectedVersion: r2.ObjectVersion,
 	}
 	r3, err := specW.Write(ctx, specReq2)
 	require.NoError(t, err)
-	assert.Equal(t, int64(3), r3.Seq)
+	assert.Greater(t, r3.Txid, r2.Txid, "txid must advance")
 	assert.Equal(t, int64(3), r3.ObjectVersion)
 
-	// Status update by holder-b (seq=4, object_version=4)
+	// Status update by holder-b
 	statusReq2 := model.StatusWriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "mixed-writer",
-		BucketID: 1, Status: json.RawMessage(`{"ready":true,"conditions":["init","progressing"]}`),
+		Status:          json.RawMessage(`{"ready":true,"conditions":["init","progressing"]}`),
 		ExpectedVersion: r3.ObjectVersion,
 	}
 	r4, err := statusW.WriteStatus(ctx, statusReq2)
 	require.NoError(t, err)
-	assert.Equal(t, int64(4), r4.Seq)
+	assert.Greater(t, r4.Txid, r3.Txid, "txid must advance")
 	assert.Equal(t, int64(4), r4.ObjectVersion)
 
-	// Shared counter is contiguous: 1, 2, 3, 4 — proven by assertions above.
+	// Txids are monotonically increasing — proven by assertions above.
 	// The UID is stable across all 4 writes.
 	assert.Equal(t, r1.UID, r2.UID, "UID must be stable across spec/status writes")
 	assert.Equal(t, r1.UID, r3.UID)
 	assert.Equal(t, r1.UID, r4.UID)
 
-	// Watcher starting from seq=3 sees the resource at seq=4 (I2: monotonic hwm)
+	// Watcher starting from r3's txid sees the resource at r4's txid (I2: monotonic hwm)
 	pollConn := freshConn(t)
 	w := reader.NewWatcher(pollConn, nil, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
-		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 3}},
+		StartRV:          resourceversion.RV{Watermark: r3.Txid},
 		BaselineInterval: 100 * time.Millisecond,
 	}, nil)
 
@@ -94,8 +92,8 @@ func TestR12_ConcurrentSpecStatus(t *testing.T) {
 
 	select {
 	case ev := <-w.Events():
-		assert.Equal(t, int64(4), ev.Resource.GVKBucketSeq,
-			"watcher must see seq=4 after starting from hwm=3")
+		assert.Equal(t, r4.Txid, uint64(ev.Resource.TxidStamp),
+			"watcher must see r4's txid after starting from r3's hwm")
 		assert.Equal(t, reader.EventModified, ev.Type)
 	case <-watchCtx.Done():
 		t.Fatal("timeout waiting for watcher event")

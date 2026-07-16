@@ -2,6 +2,7 @@ package toxirace_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -28,42 +29,37 @@ func TestR5_Toxi_AmbiguousCommit_ResetPeer(t *testing.T) {
 	hook := &toxiCommitCutHook{t: t}
 	w := writer.New(proxiedWriterConn, hook)
 
-	req := makeWriteReq("apps/v1/Deployment", "default", "toxi-ambig", 1)
+	req := makeWriteReq("apps/v1/Deployment", "default", "toxi-ambig")
 	result, writeErr := w.Write(ctx, req)
 
 	if writeErr != nil {
 		t.Logf("write returned error (expected for ambiguous path): %v", writeErr)
 
+		// Extract the AmbiguousCommitError to get the txid for read-back
+		var ambErr *writer.AmbiguousCommitError
+		require.True(t, errors.As(writeErr, &ambErr), "expected AmbiguousCommitError, got: %v", writeErr)
+
 		// Read-back via DIRECT connection (bypasses proxy)
 		directReadConn := directConn(t)
 		cleanWriter := writer.New(directReadConn, nil)
 
-		resource, err := cleanWriter.ReadBack(ctx, req.GVK, req.Namespace, req.Name, 1)
+		resource, err := cleanWriter.ReadBack(ctx, req.GVK, req.Namespace, req.Name, ambErr.Txid)
 		require.NoError(t, err)
 
 		if resource != nil {
 			t.Log("read-back: write landed despite connection kill")
-			assert.Equal(t, int64(1), resource.GVKBucketSeq)
+			assert.True(t, resource.TxidStamp > 0, "txid should be positive")
 		} else {
 			t.Log("read-back: write did not land, retrying via direct conn")
 			directWriteConn := directConn(t)
 			retryWriter := writer.New(directWriteConn, nil)
 			retryResult, err := retryWriter.Write(ctx, req)
 			require.NoError(t, err)
-			assert.Equal(t, int64(1), retryResult.Seq)
+			assert.True(t, retryResult.Txid > 0, "retry txid should be positive")
 		}
-
-		// Verify counter state
-		verifyConn := directConn(t)
-		var counterVal int64
-		err = verifyConn.QueryRow(ctx,
-			`SELECT current_seq FROM gvk_bucket_counters WHERE bucket_id = 1 AND gvk = 'apps/v1/Deployment'`,
-		).Scan(&counterVal)
-		require.NoError(t, err)
-		assert.Equal(t, int64(1), counterVal, "exactly one seq must be issued")
 	} else {
-		t.Logf("write succeeded cleanly despite proxy kill: seq=%d", result.Seq)
-		assert.Equal(t, int64(1), result.Seq)
+		t.Logf("write succeeded cleanly despite proxy kill: txid=%d", result.Txid)
+		assert.True(t, result.Txid > 0, "txid should be positive")
 	}
 
 	// Final invariant: exactly one resource row
@@ -87,8 +83,8 @@ type toxiCommitCutHook struct {
 	t *testing.T
 }
 
-func (h *toxiCommitCutHook) AfterSuppressionCheck(_ context.Context, _ pgx.Tx, _ bool) error { return nil }
-func (h *toxiCommitCutHook) AfterCounter(_ context.Context, _ pgx.Tx, _ int64) error         { return nil }
+func (h *toxiCommitCutHook) AfterSuppressionCheck(_ context.Context, _ pgx.Tx, _ bool) error    { return nil }
+func (h *toxiCommitCutHook) AfterTxidAcquire(_ context.Context, _ pgx.Tx, _ uint64) error      { return nil }
 
 func (h *toxiCommitCutHook) BeforeCommit(_ context.Context, _ pgx.Tx) error {
 	// Add reset_peer toxic — kills existing connections by sending a RST

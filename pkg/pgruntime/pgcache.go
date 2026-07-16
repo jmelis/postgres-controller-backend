@@ -26,8 +26,6 @@ import (
 type pgCache struct {
 	scheme     *runtime.Scheme
 	pool       *pgxpool.Pool
-	bucketIDs  []int
-	unsharded  map[schema.GroupVersionKind]bool
 	restMapper meta.RESTMapper
 	logger     logr.Logger
 
@@ -55,15 +53,15 @@ func (c *pgCache) Get(ctx context.Context, key client.ObjectKey, obj client.Obje
 
 	var r model.Resource
 	err = poolConn.Conn().QueryRow(ctx, `
-		SELECT gvk, namespace, name, uid, bucket_id, gvk_bucket_seq,
+		SELECT gvk, namespace, name, uid, txid_stamp::text::bigint,
 		       object_version, spec, status, metadata,
 		       deletion_timestamp, created_at, updated_at
 		FROM kubernetes_resources
 		WHERE gvk = $1 AND namespace = $2 AND name = $3`,
 		gvkStr, key.Namespace, key.Name,
 	).Scan(
-		&r.GVK, &r.Namespace, &r.Name, &r.UID, &r.BucketID,
-		&r.GVKBucketSeq, &r.ObjectVersion, &r.Spec, &r.Status,
+		&r.GVK, &r.Namespace, &r.Name, &r.UID,
+		&r.TxidStamp, &r.ObjectVersion, &r.Spec, &r.Status,
 		&r.Metadata, &r.DeletionTimestamp, &r.CreatedAt, &r.UpdatedAt,
 	)
 	if err != nil {
@@ -96,17 +94,12 @@ func (c *pgCache) List(ctx context.Context, list client.ObjectList, opts ...clie
 	}
 	defer poolConn.Release()
 
-	buckets := c.bucketIDs
-	if c.unsharded[itemGVK] {
-		buckets = []int{UnshardedBucket}
-	}
-
 	filter, err := buildListFilter(listOpts)
 	if err != nil {
 		return err
 	}
 
-	result, err := reader.List(ctx, poolConn.Conn(), gvkStr, buckets, filter)
+	result, err := reader.List(ctx, poolConn.Conn(), gvkStr, filter)
 	if err != nil {
 		return err
 	}
@@ -201,11 +194,6 @@ func (c *pgCache) getOrCreateInformer(gvk schema.GroupVersionKind) (*pgInformer,
 		return inf, nil
 	}
 
-	buckets := c.bucketIDs
-	if c.unsharded[gvk] {
-		buckets = []int{UnshardedBucket}
-	}
-
 	gvkStr := gvkToString(gvk)
 	listGVK := schema.GroupVersionKind{
 		Group:   gvk.Group,
@@ -221,7 +209,7 @@ func (c *pgCache) getOrCreateInformer(gvk schema.GroupVersionKind) (*pgInformer,
 			}
 			defer poolConn.Release()
 
-			result, err := reader.List(ctx, poolConn.Conn(), gvkStr, buckets)
+			result, err := reader.List(ctx, poolConn.Conn(), gvkStr)
 			if err != nil {
 				return nil, fmt.Errorf("list: %w", err)
 			}
@@ -252,7 +240,7 @@ func (c *pgCache) getOrCreateInformer(gvk schema.GroupVersionKind) (*pgInformer,
 			return listObj, nil
 		},
 		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
-			startRV := resourceversion.RV{Buckets: make(map[int]int64)}
+			startRV := resourceversion.RV{}
 			if opts.ResourceVersion != "" {
 				rv, err := resourceversion.Parse(opts.ResourceVersion)
 				if err != nil {
@@ -275,9 +263,8 @@ func (c *pgCache) getOrCreateInformer(gvk schema.GroupVersionKind) (*pgInformer,
 			listenConn := listenPoolConn.Hijack()
 
 			w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
-				GVK:       gvkStr,
-				BucketIDs: buckets,
-				StartRV:   startRV,
+				GVK:     gvkStr,
+				StartRV: startRV,
 			}, nil)
 
 			watchCtx, watchCancel := context.WithCancel(ctx)

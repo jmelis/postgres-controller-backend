@@ -24,9 +24,9 @@ type PhaseResult struct {
 	Baseline           *BaselineResult   `json:"baseline,omitempty"`
 }
 
-// SweepEntry records one data point in a bucket-count sweep.
+// SweepEntry records one data point in a worker-count sweep.
 type SweepEntry struct {
-	Buckets    int           `json:"buckets"`
+	Workers    int           `json:"workers"`
 	RPS        float64       `json:"rps"`
 	RPSStdDev  float64       `json:"rps_stddev,omitempty"`
 	P50        time.Duration `json:"p50"`
@@ -142,11 +142,11 @@ func PrintSummary(report *Report) {
 		if len(p.Sweep) > 0 {
 			fmt.Println()
 			fmt.Printf("    %-10s %10s %10s %10s %10s %10s %8s\n",
-				"Buckets", "RPS", "+-stddev", "p50", "p99", "p999", "Errors")
+				"Workers", "RPS", "+-stddev", "p50", "p99", "p999", "Errors")
 			fmt.Println("    " + strings.Repeat("-", 72))
 			for _, s := range p.Sweep {
 				fmt.Printf("    %-10d %10.1f %10.1f %10s %10s %10s %8d\n",
-					s.Buckets, s.RPS, s.RPSStdDev,
+					s.Workers, s.RPS, s.RPSStdDev,
 					s.P50.Round(time.Microsecond),
 					s.P99.Round(time.Microsecond),
 					s.P999.Round(time.Microsecond),

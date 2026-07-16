@@ -7,7 +7,6 @@ import (
 	"log"
 	"math/rand"
 	"sort"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,15 +19,15 @@ import (
 
 const phase3Name = "phase3_avalanche"
 
-// RunPhase3 runs the kill-replicas test.
-//  1. Starts N writers (one per bucket), each writing continuously.
+// RunPhase3 runs the kill-and-recover test.
+//  1. Starts N writers, each writing continuously.
 //  2. After a warmup period, kills kill_fraction of them.
-//  3. New writers take over the killed buckets.
+//  3. New writers take over.
 //  4. Verifier checks commit-ordered stream across handover.
 func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, error) {
 	pCfg := cfg.Phases.Phase3Avalanche
-	numBuckets := cfg.Cluster.Buckets
 	killFraction := pCfg.KillFraction
+	numWriters := 8
 
 	gvk := "apps/v1/Deployment"
 	if len(cfg.Seed.GVKs) > 0 {
@@ -38,8 +37,8 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	const warmupDuration = 10 * time.Second
 	const postKillDuration = 20 * time.Second
 
-	log.Printf("phase3: starting avalanche test — %d buckets, kill_fraction=%.1f",
-		numBuckets, killFraction)
+	log.Printf("phase3: starting avalanche test — %d writers, kill_fraction=%.1f",
+		numWriters, killFraction)
 
 	// Start verifier.
 	var ver *verifier.Verifier
@@ -54,7 +53,6 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 
 		ver = verifier.New(verConn, nil, verifier.Config{
 			GVK:          gvk,
-			BucketIDs:    makeBucketIDs(numBuckets),
 			PollInterval: 200 * time.Millisecond,
 		}).WithMetrics(libVerifierMetrics)
 		var verCtx context.Context
@@ -69,9 +67,9 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	var totalWrites atomic.Int64
 	var totalSerFail, totalOtherErr atomic.Int64
 
-	// writerLoop is a single writer that writes to its assigned bucket until
+	// writerLoop is a single writer that writes continuously until
 	// its context is cancelled.
-	writerLoop := func(ctx context.Context, bucketID int, writerID string, wg *sync.WaitGroup) {
+	writerLoop := func(ctx context.Context, writerID string, wg *sync.WaitGroup) {
 		defer wg.Done()
 
 		conn, err := pgx.Connect(ctx, dsn)
@@ -91,12 +89,11 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 			default:
 			}
 
-			name := fmt.Sprintf("p3-%s-b%d-r%d", writerID, bucketID, writeNum)
+			name := fmt.Sprintf("p3-%s-r%d", writerID, writeNum)
 			req := model.WriteRequest{
 				GVK:       gvk,
 				Namespace: "phase3",
 				Name:      name,
-				BucketID:  bucketID,
 				Spec:      json.RawMessage(fmt.Sprintf(`{"w":"%s","n":%d}`, writerID, writeNum)),
 				Status:    json.RawMessage(`{}`),
 				Metadata:  json.RawMessage(`{}`),
@@ -117,7 +114,7 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 
 			totalWrites.Add(1)
 			writeLatency.WithLabelValues(phase3Name, gvk).Observe(lat.Seconds())
-			writesTotal.WithLabelValues(phase3Name, gvk, strconv.Itoa(bucketID)).Inc()
+			writesTotal.WithLabelValues(phase3Name, gvk).Inc()
 
 			mu.Lock()
 			allLatencies = append(allLatencies, lat)
@@ -128,55 +125,55 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 
 	start := time.Now()
 
-	// Phase A: start one writer per bucket (warmup).
-	log.Printf("phase3: warmup — starting %d writers for %v", numBuckets, warmupDuration)
+	// Phase A: start writers (warmup).
+	log.Printf("phase3: warmup — starting %d writers for %v", numWriters, warmupDuration)
 	warmupCtx, warmupCancel := context.WithCancel(ctx)
 	var warmupWg sync.WaitGroup
-	writerCancels := make([]context.CancelFunc, numBuckets)
+	writerCancels := make([]context.CancelFunc, numWriters)
 
-	for b := 1; b <= numBuckets; b++ {
+	for i := 0; i < numWriters; i++ {
 		wCtx, wCancel := context.WithCancel(warmupCtx)
-		writerCancels[b-1] = wCancel
+		writerCancels[i] = wCancel
 		warmupWg.Add(1)
-		go writerLoop(wCtx, b, "phase3-holder", &warmupWg)
+		go writerLoop(wCtx, fmt.Sprintf("holder-%d", i), &warmupWg)
 	}
 
 	time.Sleep(warmupDuration)
 
 	// Phase B: kill kill_fraction of writers.
-	numToKill := int(float64(numBuckets) * killFraction)
+	numToKill := int(float64(numWriters) * killFraction)
 	if numToKill < 1 && killFraction > 0 {
 		numToKill = 1
 	}
-	if numToKill > numBuckets {
-		numToKill = numBuckets
+	if numToKill > numWriters {
+		numToKill = numWriters
 	}
 
-	// Randomly select which buckets to kill.
+	// Randomly select which writers to kill.
 	//nolint:gosec
-	perm := rand.Perm(numBuckets)
-	killedBuckets := make([]int, numToKill)
-	survivingBuckets := make([]int, 0, numBuckets-numToKill)
+	perm := rand.Perm(numWriters)
+	killedWorkers := make([]int, numToKill)
+	survivingWorkers := make([]int, 0, numWriters-numToKill)
 	for i := 0; i < numToKill; i++ {
-		killedBuckets[i] = perm[i] + 1
+		killedWorkers[i] = perm[i]
 	}
-	for i := numToKill; i < numBuckets; i++ {
-		survivingBuckets = append(survivingBuckets, perm[i]+1)
-	}
-
-	log.Printf("phase3: killing writers for buckets %v", killedBuckets)
-	for _, b := range killedBuckets {
-		writerCancels[b-1]()
+	for i := numToKill; i < numWriters; i++ {
+		survivingWorkers = append(survivingWorkers, perm[i])
 	}
 
-	// Phase C: new writers take over killed buckets.
+	log.Printf("phase3: killing writers %v", killedWorkers)
+	for _, w := range killedWorkers {
+		writerCancels[w]()
+	}
+
+	// Phase C: new writers take over.
 	var newWriterWg sync.WaitGroup
 	newCtx, newCancel := context.WithCancel(ctx)
-	for _, b := range killedBuckets {
+	for i, w := range killedWorkers {
 		newWriterWg.Add(1)
-		go writerLoop(newCtx, b, "phase3-survivor", &newWriterWg)
+		go writerLoop(newCtx, fmt.Sprintf("survivor-%d-%d", w, i), &newWriterWg)
 	}
-	log.Printf("phase3: new writers started for %d killed buckets", len(killedBuckets))
+	log.Printf("phase3: new writers started for %d killed workers", len(killedWorkers))
 
 	// Let the system run for postKillDuration.
 	log.Printf("phase3: running post-kill for %v", postKillDuration)
@@ -198,8 +195,7 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 		verCancel()
 		<-verDone
 		for _, v := range ver.Violations() {
-			violations = append(violations, fmt.Sprintf("[%s] bucket=%d gvk=%s: %s",
-				v.Invariant, v.Bucket, v.GVK, v.Detail))
+			violations = append(violations, v.String())
 		}
 	}
 
@@ -229,7 +225,7 @@ func RunPhase3(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 
 	log.Printf("phase3: completed — %d writes (%.1f w/s), violations=%d",
 		total, rps, len(violations))
-	log.Printf("phase3: killed=%v, surviving=%v", killedBuckets, survivingBuckets)
+	log.Printf("phase3: killed=%v, surviving=%v", killedWorkers, survivingWorkers)
 
 	passed := true
 	if len(violations) > 0 {

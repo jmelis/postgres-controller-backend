@@ -30,7 +30,6 @@ type RDSConfig struct {
 }
 
 type ClusterConfig struct {
-	Buckets              int           `yaml:"buckets"`
 	BaselinePollInterval time.Duration `yaml:"baseline_poll_interval"`
 	DebounceFloor        time.Duration `yaml:"debounce_floor"`
 }
@@ -44,7 +43,7 @@ type SeedGVK struct {
 	SpecSizeBytes    int    `yaml:"spec_size_bytes"`
 	StatusSizeBytes  int    `yaml:"status_size_bytes"`
 	MetadataSizeBytes int   `yaml:"metadata_size_bytes"`
-	ObjectsPerBucket int    `yaml:"objects_per_bucket"`
+	Objects          int    `yaml:"objects"`
 }
 
 type PhasesConfig struct {
@@ -72,7 +71,7 @@ type Phase1Config struct {
 	Runs             int           `yaml:"runs"`
 	TargetRPS        float64       `yaml:"target_rps"`
 	TargetP99Ms      int           `yaml:"target_p99_ms"`
-	BucketSweep      []int         `yaml:"bucket_sweep"`
+	WorkerSweep      []int         `yaml:"worker_sweep"`
 }
 
 type Phase2Config struct {
@@ -85,9 +84,7 @@ type Phase2Config struct {
 }
 
 type Phase2bConfig struct {
-	Enabled           bool `yaml:"enabled"`
-	HotBucketWritePct int  `yaml:"hot_bucket_write_pct"`
-	ColdP99Ms         int  `yaml:"cold_p99_ms"`
+	Enabled bool `yaml:"enabled"`
 }
 
 type Phase3Config struct {
@@ -108,7 +105,6 @@ type VerifierConfig struct {
 	Enabled        bool          `yaml:"enabled"`
 	PollInterval   time.Duration `yaml:"poll_interval"`
 	CanaryInterval time.Duration `yaml:"canary_interval"`
-	SampleBuckets  int           `yaml:"sample_buckets"`
 }
 
 // LoadConfig reads and parses a YAML spec file into a Config.
@@ -131,19 +127,16 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 // ComputeTotalObjects returns the total number of objects that will be seeded
-// across all GVKs and all buckets.
+// across all GVKs.
 func (c *Config) ComputeTotalObjects() int {
 	total := 0
 	for _, g := range c.Seed.GVKs {
-		total += g.ObjectsPerBucket * c.Cluster.Buckets
+		total += g.Objects
 	}
 	return total
 }
 
 func (c *Config) validate() error {
-	if c.Cluster.Buckets <= 0 {
-		return fmt.Errorf("cluster.buckets must be > 0")
-	}
 	if c.Cluster.BaselinePollInterval <= 0 {
 		c.Cluster.BaselinePollInterval = 5 * time.Second
 	}

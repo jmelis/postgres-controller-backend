@@ -7,7 +7,6 @@ rds:
   engine_version: "16.4"
 
 cluster:
-  buckets: 64
   baseline_poll_interval: 5s
   debounce_floor: 100ms
 
@@ -17,17 +16,17 @@ seed:
       spec_size_bytes: 8192
       status_size_bytes: 12288
       metadata_size_bytes: 2048
-      objects_per_bucket: 100
+      objects: 6400
     - gvk: "hypershift.openshift.io/v1beta1/HostedNodePool"
       spec_size_bytes: 4096
       status_size_bytes: 6144
       metadata_size_bytes: 1024
-      objects_per_bucket: 500
+      objects: 32000
     - gvk: "apps/v1/Deployment"
       spec_size_bytes: 2048
       status_size_bytes: 1024
       metadata_size_bytes: 512
-      objects_per_bucket: 200
+      objects: 12800
 
 phases:
   phase1_ceiling:
@@ -47,8 +46,6 @@ phases:
 
   phase2b_skew:
     enabled: true
-    hot_bucket_write_pct: 20
-    cold_p99_ms: 15
 
   phase3_avalanche:
     enabled: true
@@ -73,6 +70,5 @@ verifier:
   enabled: true
   poll_interval: 200ms
   canary_interval: 500ms
-  sample_buckets: 16
 
 checkpoint_interval: 15m
