@@ -62,6 +62,36 @@ func TestParseErrors(t *testing.T) {
 	}
 }
 
+func TestObjectVersionRoundTrip(t *testing.T) {
+	rv := RV{ObjectVersion: 5, Buckets: map[int]int64{0: 42, 1: 17}}
+	s := rv.String()
+	assert.Equal(t, "o5;b0:42,b1:17", s)
+
+	parsed, err := Parse(s)
+	require.NoError(t, err)
+	assert.Equal(t, int64(5), parsed.ObjectVersion)
+	assert.Equal(t, rv.Buckets, parsed.Buckets)
+}
+
+func TestParseWithoutObjectVersion(t *testing.T) {
+	rv, err := Parse("b0:42,b1:17")
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), rv.ObjectVersion)
+}
+
+func TestObjectVersionParseErrors(t *testing.T) {
+	bad := []string{
+		"o;b0:42",
+		"oabc;b0:42",
+		"o5;",
+		"o5;x0:42",
+	}
+	for _, s := range bad {
+		_, err := Parse(s)
+		assert.Error(t, err, "expected error for %q", s)
+	}
+}
+
 func TestStringDeterministic(t *testing.T) {
 	rv := RV{Buckets: map[int]int64{3: 10, 1: 20, 2: 30}}
 	for i := 0; i < 100; i++ {

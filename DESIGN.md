@@ -95,6 +95,8 @@ CREATE TABLE compaction_horizon (
 
 `b2:1044,b5:902,b9:4123` — per-bucket high-water map. Serialization is canonical (buckets sorted ascending) so equal states compare equal. Sub-horizon seq → `410 Gone` (**I5**).
 
+When a composite RV is stamped on a single object delivered by a watch event (the Reflector stores each event object's RV as its reconnect cursor), the object's own version rides along as an `o<version>;` prefix: `o5;b2:1044,b5:902`. Write paths parse the prefix to keep optimistic concurrency working for objects taken from the informer cache; watch resumption ignores it.
+
 ### 3.3 Atomic Write Path — Stored Procedure
 
 The write path uses a server-side stored procedure `pgctl_write()` that performs no-op suppression, counter increment, and upsert in a single server-side call. The doorbell (`pg_notify`) fires **after** the transaction commits, outside the procedure, to avoid the global notification-queue lock that would serialize all concurrent commits.

@@ -186,7 +186,7 @@ func (c *pgCache) WaitForCacheSync(ctx context.Context) bool {
 	}
 	c.mu.Unlock()
 
-	return toolscache.WaitForCacheSync(c.stopCh, syncFuncs...)
+	return toolscache.WaitForCacheSync(ctx.Done(), syncFuncs...)
 }
 
 func (c *pgCache) IndexField(ctx context.Context, obj client.Object, field string, extractValue client.IndexerFunc) error {
@@ -281,14 +281,13 @@ func (c *pgCache) getOrCreateInformer(gvk schema.GroupVersionKind) (*pgInformer,
 			}, nil)
 
 			watchCtx, watchCancel := context.WithCancel(ctx)
-			go func() {
-				_ = w.Run(watchCtx)
+			cleanup := func() {
 				pollConn.Close(context.Background())
 				listenConn.Close(context.Background())
 				watchCancel()
-			}()
+			}
 
-			return newPgWatcher(watchCtx, w, c.scheme, startRV), nil
+			return newPgWatcher(watchCtx, w, c.scheme, startRV, cleanup), nil
 		},
 	}}
 
