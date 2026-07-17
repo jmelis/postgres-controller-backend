@@ -101,6 +101,7 @@ resource "aws_rds_cluster" "postgres" {
   vpc_security_group_ids          = [aws_security_group.rds.id]
   db_cluster_parameter_group_name = aws_rds_cluster_parameter_group.aurora.name
 
+  storage_type      = "aurora-iopt1"
   storage_encrypted = true
 
   backup_retention_period = 1
