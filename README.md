@@ -4,7 +4,7 @@ Runs the controller-runtime controllers against plain PostgreSQL instead of kube
 
 This works because the library re-implements the Kubernetes List/Watch contract — commit-ordered event streams with `resourceVersion` semantics — on ordinary Postgres tables. Informers, reconcile loops, and optimistic concurrency behave as they always have; underneath, writers (controllers, or an API server fronting the database) and watchers talk to Postgres directly, with no etcd protocol, no kube-apiserver, and no consensus layer in the path.
 
-The motivation is operational. At fleet scale, etcd becomes the component you engineer around, and colocating application state in the cluster's own etcd ties your data's disaster-recovery story to the cluster's. One managed Postgres instance replaces it with a database your team already knows how to run — independent backup/restore, standard failover — and gives up nothing on throughput: ~10,000 writes/s on modest hardware (db.m6g.2xlarge), with correctness enforced by PostgreSQL's native transaction IDs.
+The motivation is operational. At fleet scale, etcd becomes the component you engineer around, and colocating application state in the cluster's own etcd ties your data's disaster-recovery story to the cluster's. One managed Postgres instance replaces it with a database your team already knows how to run — independent backup/restore, standard failover — and gives up nothing on throughput: up to ~15,000 writes/s with small payloads, ~4,000 with realistic 15-20KB payloads (db.m6g.8xlarge), with correctness enforced by PostgreSQL's native transaction IDs.
 
 **This is not a general-purpose etcd replacement.** It targets deployments where you own every writer and all writes go through this library. Check [Is this for you?](#is-this-for-you) to see if your use case matches the assumptions. If not, use [kine](https://github.com/k3s-io/kine).
 
@@ -118,27 +118,20 @@ All three write paths (`Write` for full writes, `WriteObject` for spec + metadat
 
 ## Performance
 
-AWS RDS Multi-AZ (synchronous commit), stored procedure write path, 64 concurrent workers:
+db.m6g/r6g.8xlarge (32 vCPU), 48 concurrent workers, synchronous commit, 10 GVKs:
 
-| Instance       | vCPU | Writes/s | p50    | p99    |
-| -------------- | ---- | -------- | ------ | ------ |
-| db.m6g.large   | 2    | 2,852    | 20.0ms | 68.5ms |
-| db.m6g.xlarge  | 4    | 5,770    | 10.2ms | 23.4ms |
-| db.m6g.2xlarge | 8    | 9,622    | 6.1ms  | 13.2ms |
-| db.m6g.8xlarge | 32   | 11,728   | 5.0ms  | 7.7ms  |
+| Engine | Payloads | Writes/s | p50   | p99   |
+| ------ | -------- | -------- | ----- | ----- |
+| RDS    | 50B      | 15,322   | 3.0ms | 4.3ms |
+| Aurora | 50B      | 11,061   | 4.3ms | 7.4ms |
+| Aurora | 15-20KB  | 3,932    | 11ms  | 26ms  |
+| RDS    | 15-20KB  | 1,728    | 8ms   | 1.4s  |
+
+Payload size is the primary throughput variable: realistic 15-20KB payloads (matching production GVK sizes) reduce throughput 3-4x compared to minimal payloads due to WAL volume. Aurora handles large payloads substantially better than RDS Multi-AZ (3,932 vs 1,728 w/s), though RDS is faster with small payloads.
 
 All correctness invariants (I1–I6) verified under load: zero serialization failures, zero verifier violations across all runs.
 
 Full perfscale suite: [`loadtest/README.md`](loadtest/README.md).
-
-All runs: zero serialization failures, zero invariant violations.
-
-Against DESIGN.md §4 sizing tiers:
-
-| Tier            | Steady RPS | Burst RPS |
-| --------------- | ---------- | --------- |
-| 5,000 clusters  | 187        | 374       |
-| 50,000 clusters | 1,870      | 3,740     |
 
 ### Poll cost & delivery latency (Phase 5)
 

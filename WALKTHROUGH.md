@@ -220,7 +220,8 @@ per 50ms per GVK.
 Why debouncing? Per-write `pg_notify` was catastrophic on Aurora — each
 notification added a full round-trip to the distributed storage layer, capping
 throughput at ~538 w/s regardless of concurrency. The debouncer recovers full
-throughput (~2,954 w/s at 64 workers on Aurora db.r6g.2xlarge).
+throughput (~11,061 w/s with small payloads, ~3,932 w/s with realistic 15-20KB
+payloads at 48 workers on Aurora db.r6g.8xlarge).
 
 Channel naming: short GVKs use `resource_changes_<gvk>`; long GVKs (that
 exceed PostgreSQL's 63-byte identifier limit) use `rc_<sha256[:12]>`.

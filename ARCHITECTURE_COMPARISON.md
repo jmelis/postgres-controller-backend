@@ -64,8 +64,8 @@ The direct-to-Postgres design is significantly more reliable because:
 | Metric                    | Hyperfleet-API (CLM)                                                                                                | Direct-to-Postgres                                                                                                                                                  |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Write hops**            | HTTP request -> JSON parse -> GORM -> SQL -> PG                                                                     | Single stored procedure call (`pgctl_write()`: suppress + counter + upsert) + external doorbell                                                                     |
-| **Latency (write)**       | HTTP overhead + GORM reflection + connection pool wait. 30s request timeout under pressure; 500s on pool exhaustion | p50=6.1ms, p99=13.2ms (64 concurrent workers on db.m6g.2xlarge). Measured with autocommit stored procedure                                                          |
-| **Throughput ceiling**    | Not published. Connection pool: 50 max open (default). Transaction-per-write-request middleware                     | **9,622 writes/s** on RDS db.m6g.2xlarge (Multi-AZ sync commit, 64 concurrent workers); near-linear scaling with concurrency. Zero serialization failures            |
+| **Latency (write)**       | HTTP overhead + GORM reflection + connection pool wait. 30s request timeout under pressure; 500s on pool exhaustion | p50=3.0ms, p99=4.3ms (RDS, small payloads); p50=11ms, p99=26ms (Aurora, realistic 15-20KB payloads). Measured with autocommit stored procedure on db.m6g/r6g.8xlarge |
+| **Throughput ceiling**    | Not published. Connection pool: 50 max open (default). Transaction-per-write-request middleware                     | **15,322 writes/s** (RDS, small payloads); **3,932 writes/s** (Aurora, realistic 15-20KB payloads) on 8xlarge, 48 workers, sync commit. Zero serialization failures   |
 | **No-op suppression**     | None -- every PATCH/PUT hits the database regardless of whether content changed                                     | Content-equal writes consume no sequence, no version bump, no doorbell, no watch event. Critical for status re-appliers that rewrite identical content periodically |
 | **Connection efficiency** | 50 max connections shared across all HTTP requests (reads + writes). PgBouncer sidecar optional                     | pgx pool of 4-8 connections. ~20 total connections for the entire fleet                                                                                             |
 
@@ -93,7 +93,7 @@ The direct-to-Postgres design is substantially faster:
 
 1. **Latency:** Eliminates 2-3 network hops per operation. Write latency is measured in tens of milliseconds, not hundreds.
 
-2. **Throughput:** 9,622 writes/s measured on RDS db.m6g.2xlarge (Multi-AZ sync commit, 64 concurrent workers) vs. an unquantified CLM throughput bounded by HTTP overhead and connection pool limits.
+2. **Throughput:** up to 15,322 writes/s (RDS, small payloads) and 3,932 writes/s with realistic 15-20KB payloads (Aurora) on 8xlarge, 48 workers, sync commit — vs. an unquantified CLM throughput bounded by HTTP overhead and connection pool limits.
 
 3. **Connection efficiency:** 20 connections for the entire fleet vs. 50 per API replica -- critical at scale.
 

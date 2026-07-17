@@ -6,7 +6,7 @@
 **Storage:** gp3, 100 GB (baseline 3,000 IOPS / 125 MiBps)
 **Concurrent workers:** 1 per test step (sweep varies)
 
-> **Note:** Tests 1–3 below were run with the old multi-statement write path (5 SQL round-trips + pg_notify inside the transaction). The stored procedure optimization recommended at the bottom has since been implemented — see the [loadtest README](../README.md) for current results (9,622 w/s @ 64 workers on db.m6g.2xlarge).
+> **Note:** Tests 1–3 below were run with the old multi-statement write path (5 SQL round-trips + pg_notify inside the transaction). The stored procedure optimization recommended at the bottom has since been implemented — see the [loadtest README](../README.md) for current results (up to 15,322 w/s with small payloads; 3,932 w/s with realistic 15-20KB payloads on Aurora db.r6g.8xlarge).
 
 ## Raw Results
 
@@ -84,10 +84,10 @@ shared resources (CPU + `pg_notify` global lock) saturated at 4 workers on r6g.l
 queue, serializing all concurrent commits regardless of worker count.
 
 **This is no longer the case.** The stored procedure eliminated the extra round-trips
-and moving `pg_notify` outside the transaction removed the global lock. With the current
-code, throughput scales near-linearly with worker count (~150 w/s per worker on 2xlarge),
-reaching 9,622 w/s at 64 workers. The remaining bottleneck is per-connection WAL sync
-latency, which is inherently parallelizable across workers.
+and moving `pg_notify` outside the transaction (via a debounced doorbell) removed the
+global lock. With the current code, throughput reaches 15,322 w/s (RDS, small payloads)
+and 3,932 w/s (Aurora, realistic 15-20KB payloads) at 48 workers on 8xlarge. The
+remaining bottleneck is WAL volume per commit — payload size is now the primary variable.
 
 ## Production Implications
 
@@ -95,32 +95,35 @@ latency, which is inherently parallelizable across workers.
 
 Pre-stored-procedure (old baseline for reference):
 
-| Metric                   | Old (multi-statement) | Current (stored proc, 64 workers) |
-| ------------------------ | --------------------- | --------------------------------- |
-| Write ceiling (Multi-AZ) | ~685 w/s              | **9,622 w/s** (64 workers)        |
-| Burst rate per cluster   | 0.0748 w/s            | 0.0748 w/s                        |
-| Max clusters at burst    | ~9,200                | **~128,000**                      |
+| Metric                   | Old (multi-statement) | Current (stored proc + debounced doorbell, 48 workers, 8xlarge) |
+| ------------------------ | --------------------- | --------------------------------------------------------------- |
+| Write ceiling (RDS, 50B) | ~685 w/s              | **15,322 w/s**                                                  |
+| Write ceiling (Aurora, 15-20KB) | —              | **3,932 w/s**                                                   |
+| Burst rate per cluster   | 0.0748 w/s            | 0.0748 w/s                                                      |
+| Max clusters at burst (Aurora, realistic) | ~9,200 | **~53,000**                                                    |
 
-### Instance class matters less than expected
+### Payload size is the primary variable
 
-With the old multi-statement path, the Multi-AZ sync commit dominated and instance class
-was irrelevant (r6g.large and m6g.2xlarge both hit ~685 w/s). With the stored procedure,
-the bottleneck is still WAL sync but instance class now helps modestly at high worker
-counts: 8xlarge adds +22% at 64 workers (11,728 vs 9,622 w/s), but nothing at 32 and
-below. The 2xlarge is the right cost/performance choice.
+With the stored procedure, the old per-commit round-trip bottleneck is eliminated. The
+dominant factor is now **WAL volume per commit** — realistic 15-20KB payloads reduce
+throughput 3-4x compared to small payloads. Aurora handles large payloads better than
+RDS Multi-AZ (3,932 vs 1,728 w/s), though RDS is faster with small payloads (15,322 vs
+11,061 w/s).
 
 ### What WOULD increase the write ceiling
 
-| Option                  | Expected improvement                 | Trade-off                                                                             | Status                                                             |
-| ----------------------- | ------------------------------------ | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| **Reduce round-trips**  | ~14x (685 -> 9,622 w/s @ 64 workers) | —                                                                                     | **Done.** `pgctl_write()` stored procedure + external `pg_notify`. |
-| **Disable Multi-AZ**    | +42% (on old path)                   | No HA — failover requires manual intervention or restore from backup                  | Not recommended                                                    |
-| **Batch writes**        | 2-5x                                 | Requires application-level changes to group multiple writes per COMMIT                | Not needed at current ceiling                                      |
-| **Async commit**        | ~2x                                  | Risk of losing last ~100ms of committed data on crash                                 | Next lever if needed                                               |
-| **Horizontal sharding** | Linear                               | Multiple RDS instances — adds operational complexity                                  | Not needed                                                         |
+| Option                  | Expected improvement                  | Trade-off                                                                             | Status                                                                                  |
+| ----------------------- | ------------------------------------- | ------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| **Reduce round-trips**  | ~22x (685 -> 15,322 w/s, RDS small)  | —                                                                                     | **Done.** `pgctl_write()` stored procedure + debounced doorbell.                        |
+| **Reduce payload size** | ~4x (3,932 -> 15,322 w/s equivalent) | Requires application-level changes to reduce spec/status/metadata sizes               | Application-dependent                                                                    |
+| **Async commit**        | ~2x                                  | Risk of losing last ~100ms of committed data on crash                                 | Next lever if needed                                                                     |
+| **Batch writes**        | 2-5x                                 | Requires application-level changes to group multiple writes per COMMIT                | Not needed at current ceiling                                                            |
+| **Horizontal sharding** | Linear                               | Multiple RDS instances — adds operational complexity                                  | Not needed                                                                               |
 
 ### Recommendation (updated)
 
-**db.m6g.2xlarge with Multi-AZ is the right production config.** After implementing the stored procedure (`pgctl_write()`) and moving `pg_notify` outside the transaction, the ceiling rose from ~685 w/s to **9,622 w/s** at 64 workers — near-linear scaling that removed the old flat ceiling. The 8xlarge (4x cost) adds only +22%, confirming the bottleneck is WAL sync, not CPU. Fleet capacity at burst: ~128k clusters on 2xlarge.
+After implementing the stored procedure (`pgctl_write()`), autocommit, and the debounced doorbell, the ceiling rose from ~685 w/s to **15,322 w/s** (RDS, small payloads) and **3,932 w/s** (Aurora, realistic 15-20KB payloads). The primary bottleneck is now WAL volume per commit, not round-trips or CPU.
 
-The next optimization lever, if ever needed, is `synchronous_commit = off` (async commit) which would remove the WAL sync bottleneck entirely. See [loadtest/README.md](../README.md) for the full current results.
+For production with realistic payloads on Aurora, the 5,000-cluster tier (374 burst w/s) has over 10x headroom. The 50,000-cluster tier (3,740 burst w/s) is within the measured ceiling on a single db.r6g.8xlarge.
+
+The next optimization lever, if needed, is `synchronous_commit = off` (async commit) which would remove the WAL sync bottleneck. See [loadtest/README.md](../README.md) for the full current results.

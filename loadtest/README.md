@@ -209,62 +209,28 @@ The writer uses a PL/pgSQL stored procedure (`pgctl_write`) that performs the su
 
 COMMIT dominates write latency (~61% of total time) — this is the Multi-AZ synchronous replication wait. The WAL sync round-trip is the throughput bottleneck, not CPU.
 
-### Throughput ceiling (sync commit, Multi-AZ)
+### Throughput ceiling (sync commit)
 
-Measured with the `ceiling-hunt` spec: 120s duration, 15s warm-up.
+Measured with `TestCeiling_MultiGVK`: 10 GVKs, 48 concurrent workers, 15s test duration + 2s warm-up, on db.m6g/r6g.8xlarge (32 vCPU). Both RDS (Multi-AZ sync replication) and Aurora (cross-AZ storage) tested with minimal (50B) and realistic (15-20KB) payloads.
 
-| Workers | large (2 vCPU) | xlarge (4 vCPU) | 2xlarge (8 vCPU) | 8xlarge (32 vCPU) |
-| ------- | -------------- | --------------- | ---------------- | ----------------- |
-| 64      | 2,852 w/s      | 5,770 w/s       | 9,622 w/s        | 11,728 w/s        |
-| 32      | 2,745          | 5,224           | 6,663            | 6,815             |
-| 16      | 2,376          | 3,271           | 3,803            | 3,719             |
-| 8       | 1,709          | 1,790           | 2,049            | 1,918             |
-| 4       | 931            | 931             | 1,068            | 974               |
-| 1       | 339            | 292             | 317              | 306               |
-
-p99 latency at 64 workers: large 68.5ms, xlarge 23.4ms, 2xlarge 13.2ms, 8xlarge 7.7ms.
-
-**db.m6g.2xlarge (8 vCPU)**
-
-| Workers | w/s   | p50   | p99    | p999    |
-| ------- | ----- | ----- | ------ | ------- |
-| 64      | 9,622 | 6.1ms | 13.2ms | 212.9ms |
-| 32      | 6,663 | 4.4ms | 7.3ms  | 24.8ms  |
-| 16      | 3,803 | 4.1ms | 5.6ms  | 15.6ms  |
-| 8       | 2,049 | 3.8ms | 5.5ms  | 12.1ms  |
-| 4       | 1,068 | 3.7ms | 4.6ms  | 9.0ms   |
-| 1       | 317   | 3.1ms | 3.7ms  | 6.5ms   |
-
-**db.m6g.8xlarge (32 vCPU)**
-
-| Workers | w/s    | p50   | p99   | p999   |
-| ------- | ------ | ----- | ----- | ------ |
-| 64      | 11,728 | 5.0ms | 7.7ms | 58.9ms |
-| 32      | 6,815  | 4.5ms | 6.1ms | 17.4ms |
-| 16      | 3,719  | 4.2ms | 5.5ms | 13.9ms |
-| 8       | 1,918  | 4.1ms | 5.0ms | 8.7ms  |
-| 4       | 974    | 4.1ms | 4.5ms | 7.8ms  |
-| 1       | 306    | 3.2ms | 3.6ms | 4.7ms  |
+| Engine | Payloads | Writes/s | p50   | p99   |
+| ------ | -------- | -------- | ----- | ----- |
+| RDS    | 50B      | 15,322   | 3.0ms | 4.3ms |
+| Aurora | 50B      | 11,061   | 4.3ms | 7.4ms |
+| Aurora | 15-20KB  | 3,932    | 11ms  | 26ms  |
+| RDS    | 15-20KB  | 1,728    | 8ms   | 1.4s  |
 
 ### Scaling characteristics
 
-- **Near-linear with worker count** up to the instance's CPU ceiling. Single-worker baseline is ~300 w/s regardless of instance class (WAL sync limited).
-- **CPU-bound at high parallelism.** The large (2 vCPU) saturates at ~2,850 w/s with spiking latencies. The xlarge (4 vCPU) saturates at ~5,800 w/s. The 2xlarge and 8xlarge both plateau around 10-12k w/s — at that point the bottleneck shifts from CPU to WAL sync latency.
-- **Diminishing returns past 2xlarge.** The 8xlarge (4x cost vs 2xlarge) adds only 22% at 64 workers. At 32 and below, it's identical or slightly worse.
-- **At 8 workers and below, all instances converge.** The write path is WAL-sync-bound, not CPU-bound, at low parallelism.
+- **Payload size is the primary variable.** Realistic 15-20KB payloads (matching production GVK sizes) reduce throughput 3-4x compared to 50B payloads due to WAL volume per commit.
+- **Aurora handles large payloads better than RDS Multi-AZ** (3,932 vs 1,728 w/s) — Aurora's distributed storage absorbs large WAL flushes more gracefully, while RDS Multi-AZ synchronous replication amplifies the per-commit cost. RDS p99 spikes to 1.4s with large payloads.
+- **RDS is faster with small payloads** (15,322 vs 11,061 w/s) — Aurora's cross-AZ storage round-trip adds overhead that dominates when per-write WAL volume is minimal.
 
 ### Fleet capacity
 
 Per [DESIGN.md §4](../DESIGN.md): 0.0374 w/s per cluster steady, 0.0748 w/s per cluster at burst (2x).
 
-| Instance       | vCPU | Ceiling (64 workers) | Max fleet at burst |
-| -------------- | ---- | -------------------- | ------------------ |
-| db.m6g.large   | 2    | 2,852 w/s            | ~38k clusters      |
-| db.m6g.xlarge  | 4    | 5,770 w/s            | ~77k clusters      |
-| db.m6g.2xlarge | 8    | 9,622 w/s            | ~128k clusters     |
-| db.m6g.8xlarge | 32   | 11,728 w/s           | ~157k clusters     |
-
-The 2xlarge is the sweet spot — the 50k-cluster tier requires 3,740 burst w/s, and the measured ceiling is 2.6x that. Even the large handles 38k clusters, well above the 5k-cluster default tier.
+Using the realistic-payload ceiling (Aurora, 3,932 w/s): **~53k clusters at burst** on a single db.r6g.8xlarge. The 5,000-cluster tier needs 374 burst w/s — over 10x headroom. The 50,000-cluster tier needs 3,740 burst w/s, which is within the measured ceiling.
 
 ### Remaining optimization lever: async commit
 
