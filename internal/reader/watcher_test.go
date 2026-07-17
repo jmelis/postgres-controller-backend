@@ -49,8 +49,7 @@ func TestWatchReceivesWrittenEvents(t *testing.T) {
 
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
-		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Watermark: 0},
 		BaselineInterval: 500 * time.Millisecond,
 		DebounceFloor:    50 * time.Millisecond,
 	}, nil)
@@ -71,8 +70,9 @@ func TestWatchReceivesWrittenEvents(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		_, err := wr.Write(ctx, model.WriteRequest{
 			GVK: "apps/v1/Deployment", Namespace: "default",
-			Name: fmt.Sprintf("deploy-%d", i), BucketID: 1,
-			Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+			Name:     fmt.Sprintf("deploy-%d", i),
+			Spec:     json.RawMessage(`{}`),
+			Status:   json.RawMessage(`{}`),
 			Metadata: json.RawMessage(`{}`),
 		})
 		require.NoError(t, err)
@@ -90,9 +90,13 @@ func TestWatchReceivesWrittenEvents(t *testing.T) {
 	}
 
 	assert.Len(t, events, 3)
-	for i, ev := range events {
+	for _, ev := range events {
 		assert.Equal(t, reader.EventAdded, ev.Type)
-		assert.Equal(t, int64(i+1), ev.Resource.GVKBucketSeq)
+		assert.Greater(t, ev.Resource.TxidStamp, uint64(0))
+	}
+	// Verify monotonically increasing txid stamps
+	for i := 1; i < len(events); i++ {
+		assert.Greater(t, events[i].Resource.TxidStamp, events[i-1].Resource.TxidStamp)
 	}
 }
 
@@ -109,7 +113,7 @@ func TestWatchDetectsDeletion(t *testing.T) {
 
 	result, err := wr.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "to-delete",
-		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`),
 	})
 	require.NoError(t, err)
@@ -117,7 +121,7 @@ func TestWatchDetectsDeletion(t *testing.T) {
 	now := time.Now()
 	_, err = wr.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "to-delete",
-		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`), DeletionTimestamp: &now,
 		ExpectedVersion: result.ObjectVersion,
 	})
@@ -125,8 +129,8 @@ func TestWatchDetectsDeletion(t *testing.T) {
 
 	pollConn := connectManual(t, db)
 	w := reader.NewWatcher(pollConn, nil, reader.WatcherConfig{
-		GVK: "apps/v1/Deployment", BucketIDs: []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
+		GVK:              "apps/v1/Deployment",
+		StartRV:          resourceversion.RV{Watermark: 0},
 		BaselineInterval: 500 * time.Millisecond,
 	}, nil)
 
@@ -138,8 +142,8 @@ func TestWatchDetectsDeletion(t *testing.T) {
 		pollConn.Close(context.Background())
 	}()
 
-	// PK is (gvk, namespace, name), so only ONE row exists — at seq=2 with deletion.
-	// Watcher from hwm=0 sees seq=2 DELETED.
+	// PK is (gvk, namespace, name), so only ONE row exists — with deletion.
+	// Watcher from hwm=0 sees DELETED.
 	var events []reader.Event
 	deadline := time.After(3 * time.Second)
 	for {
@@ -156,7 +160,7 @@ func TestWatchDetectsDeletion(t *testing.T) {
 done2:
 	require.Len(t, events, 1)
 	assert.Equal(t, reader.EventDeleted, events[0].Type)
-	assert.Equal(t, int64(2), events[0].Resource.GVKBucketSeq)
+	assert.Greater(t, events[0].Resource.TxidStamp, uint64(0))
 }
 
 func TestWatchBaselinePollDelivers(t *testing.T) {
@@ -169,8 +173,8 @@ func TestWatchBaselinePollDelivers(t *testing.T) {
 
 	pollConn := connectManual(t, db)
 	w := reader.NewWatcher(pollConn, nil, reader.WatcherConfig{
-		GVK: "apps/v1/Deployment", BucketIDs: []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
+		GVK:              "apps/v1/Deployment",
+		StartRV:          resourceversion.RV{Watermark: 0},
 		BaselineInterval: 300 * time.Millisecond,
 	}, nil)
 
@@ -188,7 +192,7 @@ func TestWatchBaselinePollDelivers(t *testing.T) {
 	wr := writer.New(writerConn, nil)
 	_, err := wr.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "baseline-test",
-		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`),
 	})
 	require.NoError(t, err)
@@ -218,8 +222,7 @@ func TestListenLoop_NoHotSpinOnDeadConn(t *testing.T) {
 
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
-		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Watermark: 0},
 		BaselineInterval: 300 * time.Millisecond,
 	}, nil)
 
@@ -240,7 +243,7 @@ func TestListenLoop_NoHotSpinOnDeadConn(t *testing.T) {
 	wr := writer.New(writerConn, nil)
 	_, err := wr.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "backoff-test",
-		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`),
 	})
 	require.NoError(t, err)
@@ -274,8 +277,7 @@ func TestListenLoop_DegradedModeSignal(t *testing.T) {
 
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
-		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Watermark: 0},
 		BaselineInterval: 300 * time.Millisecond,
 		// No ListenConnFactory — watcher should fall back to baseline-only.
 	}, nil)
@@ -296,8 +298,9 @@ func TestListenLoop_DegradedModeSignal(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		_, err := wr.Write(ctx, model.WriteRequest{
 			GVK: "apps/v1/Deployment", Namespace: "default",
-			Name: fmt.Sprintf("degraded-%d", i), BucketID: 1,
-			Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+			Name:     fmt.Sprintf("degraded-%d", i),
+			Spec:     json.RawMessage(`{}`),
+			Status:   json.RawMessage(`{}`),
 			Metadata: json.RawMessage(`{}`),
 		})
 		require.NoError(t, err)

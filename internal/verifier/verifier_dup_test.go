@@ -8,11 +8,11 @@ import (
 	"github.com/jmelis/postgres-controller-backend/internal/reader"
 )
 
-// B5 — Verifier state must be O(buckets), not O(events).
+// B5 — Verifier state must be O(1), not O(events).
 //
 // The old seenKeys map recorded every (bucket, seq) pair ever seen, growing
 // without bound. After the fix, per-event state is gone: duplicates are caught
-// by the hwm monotonicity check (seq <= hwm ⇒ I3 violation).
+// by the hwm monotonicity check (txid <= hwm => I3 violation).
 func TestVerifier_NoUnboundedMap(t *testing.T) {
 	typ := reflect.TypeOf(Verifier{})
 	for i := 0; i < typ.NumField(); i++ {
@@ -27,37 +27,33 @@ func TestVerifier_NoUnboundedMap(t *testing.T) {
 	}
 }
 
-// TestDuplicateDetection_ViaMonotonicity verifies that duplicate delivery is
-// caught by the I3 monotonicity check (seq <= hwm). No per-event map needed.
-func TestDuplicateDetection_ViaMonotonicity(t *testing.T) {
+// TestRedelivery_CountedNotViolation verifies that re-delivered events
+// (txid <= hwm) are counted as redeliveries, not flagged as violations.
+// In the xid8 watermark model, the watcher re-scans the (hwm, xmin) window
+// each poll, so re-delivery is expected behavior.
+func TestRedelivery_CountedNotViolation(t *testing.T) {
 	v := &Verifier{
 		cfg: Config{
-			GVK:       "apps/v1/Deployment",
-			BucketIDs: []int{1},
+			GVK: "apps/v1/Deployment",
 		},
-		hwm: map[int]int64{1: 0},
+		hwm: 0,
 	}
 
 	ev := reader.Event{
 		Type: reader.EventAdded,
 		Resource: model.Resource{
-			GVK:          "apps/v1/Deployment",
-			BucketID:     1,
-			GVKBucketSeq: 1,
+			GVK:       "apps/v1/Deployment",
+			TxidStamp: 1,
 		},
 	}
 
-	v.checkEvent(ev) // first delivery — clean
-	v.checkEvent(ev) // duplicate — seq=1 <= hwm=1
+	v.checkEvent(ev) // first delivery — advances hwm to 1
+	v.checkEvent(ev) // re-delivery — txid=1 <= hwm=1
 
-	var found bool
-	for _, viol := range v.violations {
-		if viol.Invariant == "I2" {
-			found = true
-			break
-		}
+	if len(v.violations) > 0 {
+		t.Fatalf("re-delivery should not produce violations, got %v", v.violations)
 	}
-	if !found {
-		t.Fatal("duplicate delivery not detected by hwm monotonicity (I2)")
+	if v.redeliveries != 1 {
+		t.Fatalf("expected 1 redelivery, got %d", v.redeliveries)
 	}
 }

@@ -87,9 +87,9 @@ func collectUntilClose(t *testing.T, pw *pgWatcher, timeout time.Duration) []wat
 // watch that failed with ErrGone (compaction advanced past the informer's RV)
 // is retried with the same stale RV forever and the informer never recovers.
 func TestPgWatcher_ErrGoneEmitsExpiredError(t *testing.T) {
-	src := newFakeWatchSource(nil, fmt.Errorf("bucket 0: %w (hwm=1 < compacted=5)", reader.ErrGone))
+	src := newFakeWatchSource(nil, fmt.Errorf("%w (hwm=1 < compacted=5)", reader.ErrGone))
 	pw := newPgWatcher(context.Background(), src, runtime.NewScheme(),
-		resourceversion.RV{Buckets: map[int]int64{0: 1}}, nil)
+		resourceversion.RV{Watermark: 1}, nil)
 
 	events := collectUntilClose(t, pw, 5*time.Second)
 	require.Len(t, events, 1, "expected a terminal watch.Error event before close")
@@ -106,7 +106,7 @@ func TestPgWatcher_ErrGoneEmitsExpiredError(t *testing.T) {
 func TestPgWatcher_PollErrorEmitsInternalError(t *testing.T) {
 	src := newFakeWatchSource(nil, errors.New("poll begin tx: connection refused"))
 	pw := newPgWatcher(context.Background(), src, runtime.NewScheme(),
-		resourceversion.RV{Buckets: map[int]int64{0: 1}}, nil)
+		resourceversion.RV{Watermark: 1}, nil)
 
 	events := collectUntilClose(t, pw, 5*time.Second)
 	require.Len(t, events, 1, "expected a terminal watch.Error event before close")
@@ -123,7 +123,7 @@ func TestPgWatcher_CleanStopClosesWithoutError(t *testing.T) {
 	cleanedUp := make(chan struct{})
 	src := newFakeWatchSource(nil, nil)
 	pw := newPgWatcher(context.Background(), src, runtime.NewScheme(),
-		resourceversion.RV{Buckets: map[int]int64{0: 1}},
+		resourceversion.RV{Watermark: 1},
 		func() { close(cleanedUp) })
 
 	pw.Stop()
@@ -142,7 +142,7 @@ func TestPgWatcher_ContextCancelClosesWithoutError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	src := newFakeWatchSource(nil, nil)
 	pw := newPgWatcher(ctx, src, runtime.NewScheme(),
-		resourceversion.RV{Buckets: map[int]int64{0: 1}}, nil)
+		resourceversion.RV{Watermark: 1}, nil)
 
 	cancel()
 	events := collectUntilClose(t, pw, 5*time.Second)
@@ -160,14 +160,13 @@ func TestPgWatcher_ConversionErrorTerminatesWatch(t *testing.T) {
 			GVK:           "test.example.com/v1/Unregistered",
 			Namespace:     "default",
 			Name:          "x",
-			BucketID:      0,
-			GVKBucketSeq:  2,
+			TxidStamp:     2,
 			ObjectVersion: 1,
 		},
 	}
 	src := newFakeWatchSource([]reader.Event{ev}, nil)
 	pw := newPgWatcher(context.Background(), src, runtime.NewScheme(),
-		resourceversion.RV{Buckets: map[int]int64{0: 1}}, nil)
+		resourceversion.RV{Watermark: 1}, nil)
 
 	events := collectUntilClose(t, pw, 5*time.Second)
 	require.Len(t, events, 1, "expected a terminal watch.Error event for the unconvertible object")

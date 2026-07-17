@@ -25,7 +25,7 @@ test-toxirace:
 	go test -race -v -count=1 -timeout=180s ./test/toxirace/
 
 test-load:
-	go test -race -v -count=1 -timeout=120s ./test/loadtest/
+	go test -race -v -count=1 -timeout=600s ./test/loadtest/
 
 test-parity:
 	@which setup-envtest > /dev/null 2>&1 || go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest

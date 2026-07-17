@@ -34,13 +34,13 @@ func Compact(ctx context.Context, conn *pgx.Conn, cfg Config) (*Result, error) {
 			WHERE deletion_timestamp IS NOT NULL
 			  AND GREATEST(deletion_timestamp, updated_at) < now() - $1::interval
 			  AND (metadata->'finalizers' IS NULL OR metadata->'finalizers' = '[]'::jsonb) -- tombstone filter: also in list.go, 001_initial.sql, writer.go
-			RETURNING bucket_id, gvk, gvk_bucket_seq
+			RETURNING gvk, txid_stamp
 		),
 		horizon AS (
-			INSERT INTO compaction_horizon (bucket_id, gvk, compacted_seq)
-			SELECT bucket_id, gvk, max(gvk_bucket_seq) FROM del GROUP BY 1, 2
-			ON CONFLICT (bucket_id, gvk)
-			DO UPDATE SET compacted_seq = GREATEST(compaction_horizon.compacted_seq, EXCLUDED.compacted_seq)
+			INSERT INTO compaction_horizon (gvk, compacted_xid)
+			SELECT gvk, max(txid_stamp::text::bigint) FROM del GROUP BY gvk
+			ON CONFLICT (gvk)
+			DO UPDATE SET compacted_xid = GREATEST(compaction_horizon.compacted_xid, EXCLUDED.compacted_xid)
 		)
 		SELECT count(*) FROM del`, cutoff).Scan(&deleted)
 	if err != nil {

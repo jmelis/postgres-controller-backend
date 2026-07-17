@@ -54,7 +54,6 @@ func TestVerifier_CleanStream_NoViolations(t *testing.T) {
 
 	v := verifier.New(pollConn, nil, verifier.Config{
 		GVK:          "apps/v1/Deployment",
-		BucketIDs:    []int{1},
 		PollInterval: 200 * time.Millisecond,
 	})
 
@@ -70,8 +69,9 @@ func TestVerifier_CleanStream_NoViolations(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		req := model.WriteRequest{
 			GVK: "apps/v1/Deployment", Namespace: "default",
-			Name: fmt.Sprintf("clean-%d", i), BucketID: 1,
-			Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+			Name:     fmt.Sprintf("clean-%d", i),
+			Spec:     json.RawMessage(`{}`),
+			Status:   json.RawMessage(`{}`),
 			Metadata: json.RawMessage(`{}`),
 		}
 		_, err := wr.Write(ctx, req)
@@ -100,7 +100,6 @@ func TestVerifier_WithCanary(t *testing.T) {
 
 	v := verifier.New(pollConn, canaryConn, verifier.Config{
 		GVK:            "apps/v1/Deployment",
-		BucketIDs:      []int{1},
 		PollInterval:   200 * time.Millisecond,
 		CanaryInterval: 300 * time.Millisecond,
 	})
@@ -135,18 +134,17 @@ func TestVerifier_DetectsDuplicate_I5(t *testing.T) {
 	wrConn := freshConn(t)
 	wr := writer.New(wrConn, nil)
 	req := model.WriteRequest{
-		GVK: "apps/v1/Deployment", Namespace: "default", Name: "dup-test", BucketID: 1,
+		GVK: "apps/v1/Deployment", Namespace: "default", Name: "dup-test",
 		Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`),
 	}
 	_, err := wr.Write(ctx, req)
 	require.NoError(t, err)
 
-	// Start verifier with hwm=0 — it will see seq=1
+	// Start verifier with hwm=0 — it will see the write
 	pollConn := manualConn(t)
 	v := verifier.New(pollConn, nil, verifier.Config{
 		GVK:          "apps/v1/Deployment",
-		BucketIDs:    []int{1},
 		PollInterval: 200 * time.Millisecond,
 	})
 
@@ -159,7 +157,7 @@ func TestVerifier_DetectsDuplicate_I5(t *testing.T) {
 
 	result := v.Result()
 	assert.Equal(t, int64(1), result.EventsChecked)
-	// The watcher delivers no duplicates by design (seq > hwm),
+	// The watcher delivers no duplicates by design (txid > hwm),
 	// so no I4 violation should fire.
 	assert.Empty(t, result.Violations)
 

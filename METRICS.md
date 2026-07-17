@@ -11,15 +11,15 @@ instrumentation with zero overhead.
 
 | Metric                                     | Type      | Labels                       | Description                                                       |
 | ------------------------------------------ | --------- | ---------------------------- | ----------------------------------------------------------------- |
-| `pgctl_writer_write_duration_seconds`      | Histogram | `gvk`, `bucket_id`, `result` | Duration of write operations (stored procedure through commit).   |
+| `pgctl_writer_write_duration_seconds`      | Histogram | `gvk`, `result`              | Duration of write operations (stored procedure call).             |
 | `pgctl_writer_write_step_duration_seconds` | Histogram | `step`                       | Duration of individual steps within a write transaction.          |
-| `pgctl_writer_writes_total`                | Counter   | `gvk`, `bucket_id`, `result` | Total write operations by outcome.                                |
+| `pgctl_writer_writes_total`                | Counter   | `gvk`, `result`              | Total write operations by outcome.                                |
 | `pgctl_writer_noop_suppressions_total`     | Counter   | —                            | Writes suppressed because the row already held identical content. |
 | `pgctl_writer_doorbell_errors_total`       | Counter   | —                            | Failed `pg_notify` doorbell sends (fire-and-forget, non-fatal).   |
 
 **Result label values:** `success`, `noop`, `conflict`, `already_exists`, `ambiguous_commit`, `error`.
 
-**Step label values:** `stored_proc` (overall server-side call), `suppression_check`, `counter_increment`, `upsert` (returned by the stored procedure via `clock_timestamp()` instrumentation), `commit`, `doorbell_external`.
+**Step label values:** `stored_proc` (overall server-side call), `suppression_check`, `upsert` (returned by the stored procedure via `clock_timestamp()` instrumentation).
 
 ---
 

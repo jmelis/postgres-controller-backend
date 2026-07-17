@@ -11,36 +11,36 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// R10 — 409 handling corrupting the stream (I1).
-// A version conflict on the resource upsert must roll back the counter increment.
-// Defense: counter and upsert are in the same transaction; rollback undoes both.
-func TestR10_ConflictRollbacksCounter(t *testing.T) {
+// R10 — 409 handling: transaction rollback on conflict (I1).
+// A version conflict on the resource upsert must roll back the entire
+// transaction, including the txid_stamp assignment.
+// Defense: txid acquisition and upsert are in the same transaction; rollback undoes both.
+func TestR10_ConflictRollback(t *testing.T) {
 	truncateAll(t)
 	ctx := context.Background()
 
 	w := newWriter(t, nil)
 
 	// Create the initial resource
-	createReq := makeWriteReq("apps/v1/Deployment", "default", "nginx", 1)
+	createReq := makeWriteReq("apps/v1/Deployment", "default", "nginx")
 	result, err := w.Write(ctx, createReq)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), result.Seq)
+	assert.Greater(t, result.Txid, uint64(0))
 
-	// Read counter value after create
+	// Read txid_stamp after create
 	conn := freshConn(t)
-	var counterBefore int64
+	var txidBefore int64
 	err = conn.QueryRow(ctx,
-		`SELECT current_seq FROM gvk_bucket_counters WHERE bucket_id = 1 AND gvk = 'apps/v1/Deployment'`,
-	).Scan(&counterBefore)
+		`SELECT txid_stamp::text::bigint FROM kubernetes_resources WHERE gvk = 'apps/v1/Deployment' AND namespace = 'default' AND name = 'nginx'`,
+	).Scan(&txidBefore)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), counterBefore)
+	assert.Greater(t, txidBefore, int64(0))
 
 	// Attempt update with stale version (409)
 	updateReq := model.WriteRequest{
 		GVK:             "apps/v1/Deployment",
 		Namespace:       "default",
 		Name:            "nginx",
-		BucketID:        1,
 		Spec:            json.RawMessage(`{"replicas":99}`),
 		Status:          json.RawMessage(`{}`),
 		Metadata:        json.RawMessage(`{}`),
@@ -49,11 +49,11 @@ func TestR10_ConflictRollbacksCounter(t *testing.T) {
 	_, err = w.Write(ctx, updateReq)
 	assert.ErrorIs(t, err, writer.ErrConflict)
 
-	// Counter must be unchanged — the increment was rolled back
-	var counterAfter int64
+	// txid_stamp must be unchanged — the transaction was rolled back
+	var txidAfter int64
 	err = conn.QueryRow(ctx,
-		`SELECT current_seq FROM gvk_bucket_counters WHERE bucket_id = 1 AND gvk = 'apps/v1/Deployment'`,
-	).Scan(&counterAfter)
+		`SELECT txid_stamp::text::bigint FROM kubernetes_resources WHERE gvk = 'apps/v1/Deployment' AND namespace = 'default' AND name = 'nginx'`,
+	).Scan(&txidAfter)
 	require.NoError(t, err)
-	assert.Equal(t, counterBefore, counterAfter, "counter must not advance on 409")
+	assert.Equal(t, txidBefore, txidAfter, "txid_stamp must not change on 409")
 }

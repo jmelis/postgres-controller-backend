@@ -54,12 +54,13 @@ terms):
   transaction A can take version 5 and transaction B take version 6, but B
   commits _first_. A watcher sees 6, advances its bookmark to 6, and when A
   finally commits its 5 it is below the bookmark — **missed forever.**
-- **No single global counter.** For scale, objects are sharded into _buckets_,
-  and we want per-bucket ordering without one global write lock. So there is no
-  single revision number — there is one _per (GVK, bucket)_.
-- **Failover.** If the database fails over and the counter rewinds even slightly,
-  a reused number carrying different content silently corrupts every watcher's
-  cache.
+- **In-flight transactions.** Even with PostgreSQL's native transaction IDs, a
+  watcher can't simply advance to the highest txid it's seen — a lower-numbered
+  transaction might still be in-flight. The watermark must only advance to a
+  point where all prior transactions are guaranteed committed.
+- **Failover.** If the database fails over and transaction IDs rewind even
+  slightly, a reused number carrying different content silently corrupts every
+  watcher's cache.
 
 Everything below is the machinery that defeats those three hazards.
 
@@ -67,22 +68,23 @@ Everything below is the machinery that defeats those three hazards.
 
 ## 2. The tables at a glance
 
-Only three tables carry the core idea; the rest are supporting cast. Full DDL is
+Only two tables carry the core idea; the rest are supporting cast. Full DDL is
 in `internal/schema/migrations/001_initial.sql`.
 
 | Table                  | Its one job                                                              | etcd analogy            |
 | ---------------------- | ------------------------------------------------------------------------ | ----------------------- |
 | `kubernetes_resources` | The object in one of three lifecycle states (live, dying, fully deleted) | the keyspace            |
-| `gvk_bucket_counters`  | The commit-ordered version number, one row per (bucket, GVK)             | the global revision     |
 | `compaction_horizon`   | How far back history has been destroyed                                  | the compaction revision |
 
 The central row, in `kubernetes_resources`, has three columns worth calling out:
 
-- **`gvk_bucket_seq`** — the object's position in its bucket's ordered log. This
-  _is_ the per-bucket version number. Bumped on every write.
-- **`object_version`** — a _separate_ per-object counter used only for optimistic
-  concurrency ("update only if you still have the current version, else 409").
-  Do not confuse it with `gvk_bucket_seq`; they solve different problems.
+- **`txid_stamp`** — the PostgreSQL transaction ID (`xid8`) assigned at write
+  time via `pg_current_xact_id()`. This is the ordering stamp — watchers use it
+  to find changed rows. Unlike a counter, it is assigned by PostgreSQL itself
+  and requires no shared row lock.
+- **`object_version`** — a per-object counter used for optimistic concurrency
+  ("update only if you still have the current version, else 409"). Do not
+  confuse it with `txid_stamp`; they solve different problems.
 - **`deletion_timestamp`** — determines the object's lifecycle state (the key
   to garbage collection — Section 7):
   - `NULL` — **live** object, visible and active.
@@ -95,67 +97,69 @@ The central row, in `kubernetes_resources`, has three columns worth calling out:
 
 ## 3. The linchpin: the composite resourceVersion
 
-Because there is no single global counter, the bookmark cannot be one number. It
-is a **vector** — one high-water mark per bucket (see `internal/resourceversion/rv.go`):
+The bookmark is a single number — a **watermark** derived from PostgreSQL's
+`pg_snapshot_xmin()` (see `internal/resourceversion/rv.go`):
 
 ```
-b2:1044,b5:902,b9:4123
-└─ bucket 2 is at seq 1044, bucket 5 at 902, bucket 9 at 4123
+12345678
+└─ everything at or below this transaction ID is committed and delivered
 ```
 
-Read it as: _"I have seen everything up to seq 1044 in bucket 2, 902 in bucket
-5, and 4123 in bucket 9."_
+Read it as: _"I have seen every committed transaction up through 12345678."_
 
-The **per-bucket map** exists because sequences are per-bucket — a client
-tracks a position in each bucket it watches. Failover safety (I2/I4) relies on
-RDS Multi-AZ synchronous replication, which guarantees no committed sequence is
-ever lost. On database restore from backup, all controller pods must be
-restarted so caches relist from the current state.
+The watermark is `xmin - 1`, where `xmin` is the oldest in-flight transaction ID
+from the watcher's snapshot. Everything below `xmin` is guaranteed committed, so
+the watcher knows its view is complete up to that point. Failover safety
+(I2/I4) relies on RDS Multi-AZ synchronous replication, which guarantees no
+committed transaction is ever lost. On database restore from backup, all
+controller pods must be restarted so caches relist from the current state.
 
-The serialization is canonical (buckets sorted) so equal states compare equal.
-
-One wrinkle: when the pgruntime layer stamps this composite RV on a single
-object delivered by a watch event (the informer machinery stores each event
-object's RV as its reconnect bookmark), the object's own version rides along as
-an `o<version>;` prefix — `o5;b2:1044,b5:902` — so that the object remains
-usable for optimistic-concurrency writes. Watch resumption ignores the prefix
+One wrinkle: when the pgruntime layer stamps the RV on a single object
+delivered by a watch event (the informer machinery stores each event object's RV
+as its reconnect bookmark), the object's own version rides along as an
+`o<version>;` prefix — `o5;12345678` — so that the object remains usable for
+optimistic-concurrency writes. Watch resumption ignores the prefix
 (DESIGN.md §3.2).
 
 ---
 
 ## 4. The write path
 
-A stored procedure plus one post-commit notification (`internal/writer/writer.go`,
-`internal/schema/migrations/001_initial.sql`).
+A stored procedure in autocommit mode, plus a debounced doorbell
+(`internal/writer/writer.go`, `internal/schema/migrations/001_initial.sql`).
 
 ```mermaid
 sequenceDiagram
     participant C as Controller (writer)
+    participant D as Debouncer
     participant DB as Postgres
-    Note over C,DB: BEGIN (READ COMMITTED)
-    C->>DB: SELECT * FROM pgctl_write(gvk, ns, name, bucket, expected_version, force_write, spec, status, metadata, deletion_ts)
-    Note over DB: Inside pgctl_write(): (a) suppress? → (b) counter → (c) upsert
+    Note over C,DB: Autocommit — no explicit BEGIN/COMMIT
+    C->>DB: SELECT * FROM pgctl_write(status_only, gvk, ns, name, expected_version, force_write, spec, status, metadata, deletion_ts)
+    Note over DB: Inside pgctl_write(): (a) suppress? → (b) upsert + pg_current_xact_id()
     alt incoming content == stored content (suppressed)
-        DB-->>C: (uid, version, 0, changed=false) → COMMIT
+        DB-->>C: (uid, version, 0, changed=false)
     end
     alt object_version mismatch
-        DB-->>C: RAISE P0002 → ROLLBACK → 409 Conflict
+        DB-->>C: RAISE P0002 → 409 Conflict
     end
-    DB-->>C: (uid, version, seq, changed=true) → COMMIT
-    Note over C,DB: Transaction committed — doorbell fires outside
-    C->>DB: SELECT pg_notify('resource_changes_bN','')
+    DB-->>C: (uid, version, txid, changed=true)
+    Note over C,D: If changed, notify the debouncer
+    C->>D: Ring(gvk)
+    Note over D,DB: Every 50ms, debouncer flushes dirty GVKs
+    D->>DB: SELECT pg_notify('resource_changes_<gvk>','')
 ```
 
-The transaction runs at `READ COMMITTED`, Postgres's default isolation level —
-ordering here comes from **row locks**, not from snapshots. (Isolation levels are
-explained in the aside in Section 5, where the contrast with the read paths
-becomes visible.)
+The call runs in **autocommit mode** — a single `conn.QueryRow` with no
+explicit `BEGIN`/`COMMIT`. This eliminates 2 round-trips per write (the `BEGIN`
+and `COMMIT` that would otherwise bracket the stored procedure call). On Aurora
+with cross-AZ latency (~0.5–1ms per hop), this cuts ~2–3ms of pure network
+overhead per write.
 
-The stored procedure (`pgctl_write()`) consolidates three formerly-separate
-SQL statements into one server-side call, eliminating two network round-trips
-per write. The doorbell fires **after** the commit, in a separate statement —
-this avoids a global lock on Postgres's notification queue that otherwise
-serializes all concurrent commits (see Section 4d).
+The stored procedure (`pgctl_write()`) performs no-op suppression and upsert in
+one server-side call. Each row is stamped with `pg_current_xact_id()` —
+PostgreSQL's native transaction ID — so **writers never contend on a shared
+counter**. This is the fundamental difference from the old design: no exclusive
+row lock, no serialization point, no per-shard throughput ceiling.
 
 ### (a) No-op suppression — "did anything actually change?"
 
@@ -166,73 +170,61 @@ It runs _before_ the counter (so a no-op burns no sequence number — no gap). T
 big deal in practice: status re-appliers that rewrite identical content every few
 minutes produce zero database writes and zero watch events.
 
-### (b) The counter — the heart of the whole design
+### (b) The transaction ID stamp — the heart of the whole design
 
-```sql
-INSERT INTO gvk_bucket_counters (bucket_id, gvk, current_seq) VALUES ($1,$2,1)
-ON CONFLICT (bucket_id, gvk) DO UPDATE SET current_seq = current_seq + 1
-RETURNING current_seq;
-```
+Instead of a shared counter with exclusive row locks, each write is stamped with
+PostgreSQL's native `pg_current_xact_id()` — the transaction's own 64-bit ID
+(`xid8`). This is how out-of-order commits are defeated. The key insight:
 
-This is how out-of-order commits are defeated; read it twice. The `DO UPDATE`
-takes an **exclusive row lock** on that bucket's counter row and Postgres holds
-it until COMMIT. Picture two writers to the same bucket:
+- Every transaction gets a unique, monotonically increasing `xid8`.
+- `pg_snapshot_xmin()` returns the oldest transaction ID that is still in flight.
+- Everything below `xmin` is guaranteed committed.
 
-- Writer A increments to seq 5, keeps the row lock, keeps working.
-- Writer B tries to increment — it **blocks**, because A holds the lock.
-- B cannot proceed until A commits (or aborts).
-- So B necessarily receives seq 6 _and_ commits after A.
+So the watcher advances its watermark to `xmin - 1` (not to the highest txid
+it's seen). This means it never skips a transaction that committed late — it
+simply waits until `xmin` advances past it. Rows between the old watermark and
+the new `xmin - 1` may re-appear on the next poll; the informer cache
+deduplicates them.
 
-Therefore **if seq(A) < seq(B), then A committed before B** — sequence order
-equals commit order, with no holes (a rollback undoes the increment too). That is
-invariant I1 (commit-ordered sequences). A plain Postgres `SEQUENCE` cannot do this: sequences are
+The performance advantage is fundamental: **no shared row lock, no
+serialization point.** Two writers to the same GVK run fully concurrently —
+their transactions each get their own `xid8` without blocking. This eliminates
+the throughput ceiling that the old counter-based design imposed per bucket.
+
+A plain Postgres `SEQUENCE` cannot do this either: sequences are
 non-transactional and hold nothing to commit, so A could take 5, B take 6, and B
-commit first. This one row lock is the price of rebuilding etcd's ordered
-revision — and it is also why per-bucket write throughput has a ceiling (writers
-to one hot bucket serialize here). Sharding into many buckets is what keeps that
-ceiling high in aggregate.
-
-> **Postgres aside — `fillfactor`, or why the counter table is deliberately
-> half-empty.** The schema declares this table `WITH (fillfactor = 50)`. A table
-> is stored as 8 KB **pages**; `fillfactor` says how full to pack each page on
-> insert (default 100 = completely full; 50 = leave half empty). Why waste space
-> on purpose? Because Postgres is **MVCC**: an `UPDATE` never overwrites a row in
-> place — it writes a _new version_ of the row and marks the old one dead.
-> Normally the new version must also be inserted into **every index** on the
-> table, since it lives at a new physical location. The escape hatch is a **HOT
-> update** (Heap-Only Tuple): if the new version (a) fits on the _same page_ as
-> the old one and (b) changed no indexed column, Postgres stores it beside the
-> old one and skips all index maintenance — much cheaper, and the dead versions
-> are cleaned up cheaply too. The counter is the hottest table in the system —
-> every write does `current_seq + 1`. The changed column is not indexed and the
-> PK never changes, so (b) always holds; `fillfactor = 50` guarantees (a) by
-> always leaving room on the page. Result: **every counter bump is a HOT
-> update.** The cost (~2× the pages) is negligible — the table has one row per
-> (bucket, GVK).
+commit first — the watcher would miss A. The `xid8 + snapshot-xmin` approach
+solves this by making the watermark conservative: it doesn't advance past
+in-flight transactions.
 
 ### (c) The upsert with optimistic concurrency
 
-Writes the new content, stamps the fresh `gvk_bucket_seq`, and bumps
+Writes the new content, stamps `txid_stamp = pg_current_xact_id()`, and bumps
 `object_version`. The `WHERE object_version = $expected` clause means a stale
 updater (who read version 3 while it is now 5) matches zero rows and gets a 409 —
 invariant I6, no lost updates.
 
 ### (d) The doorbell
 
-`pg_notify` on the bucket's channel, empty payload. This is _only_ a latency
+`pg_notify` on a per-GVK channel, empty payload. This is _only_ a latency
 optimization: it tells watchers "wake up and poll now" instead of waiting for
 their timer. Correctness never depends on it; if the notification is lost, the
 timer still fires.
 
-The doorbell fires **after** the transaction commits, in a separate statement —
-not inside the stored procedure. Why? `pg_notify` inside a transaction acquires
-a global exclusive lock on Postgres's internal notification queue at pre-commit
-time. With many buckets writing concurrently, every commit serializes on that
-one lock — throughput collapses to a single-threaded ceiling regardless of bucket
-count. Moving `pg_notify` outside the transaction means the lock is held only for
-the brief standalone statement, not for the entire commit. The worst case of a
-lost doorbell (the writer crashes between COMMIT and `pg_notify`) is harmless:
-the watcher's baseline timer fires within 5 s.
+Writers do not call `pg_notify` directly. Instead, each write calls
+`debouncer.Ring(gvk)`, which marks the GVK as dirty in a set. A background
+goroutine wakes every 50ms and issues one `pg_notify` per dirty GVK, then
+clears the set. This coalesces bursts of writes into at most one notification
+per 50ms per GVK.
+
+Why debouncing? Per-write `pg_notify` was catastrophic on Aurora — each
+notification added a full round-trip to the distributed storage layer, capping
+throughput at ~538 w/s regardless of concurrency. The debouncer recovers full
+throughput (~11,061 w/s with small payloads, ~3,932 w/s with realistic 15-20KB
+payloads at 48 workers on Aurora db.r6g.8xlarge).
+
+Channel naming: short GVKs use `resource_changes_<gvk>`; long GVKs (that
+exceed PostgreSQL's 63-byte identifier limit) use `rc_<sha256[:12]>`.
 
 ---
 
@@ -241,7 +233,7 @@ the watcher's baseline timer fires within 5 s.
 List is a single `REPEATABLE READ` read-only transaction
 (`internal/reader/list.go`) that does two reads in one snapshot:
 
-1. Read `gvk_bucket_counters` for the buckets → the per-bucket high-water marks.
+1. Get `pg_snapshot_xmin(pg_current_snapshot())` → the watermark (`xmin - 1`).
 2. Read live and dying rows (fully-deleted tombstones are excluded by the query).
 
 Because both happen in the _same snapshot_, the data and the RV describe the
@@ -261,21 +253,19 @@ READ`).** A transaction's isolation level controls how much of _other_
 > **`REPEATABLE READ`**, the _entire transaction_ sees one snapshot frozen at its
 > first query; everything committed afterward is invisible to it. The read paths
 > (List here, Watch in Section 6) use `REPEATABLE READ` because they do several
-> reads — counters or horizon, then rows — that must all describe the
-> **same instant**; under `READ COMMITTED` a compaction could commit between two
-> of those reads and produce a torn view. The write path deliberately uses
-> `READ COMMITTED` instead: a writer _wants_ the latest committed counter value,
-> and its ordering comes from row locks, not snapshots — under `REPEATABLE READ`,
-> concurrent writers to the same hot counter row would abort with serialization
-> failures.
+> reads — `pg_snapshot_xmin`, compaction horizon, then rows — that must all
+> describe the **same instant**; under `READ COMMITTED` a compaction could commit
+> between two of those reads and produce a torn view. The write path runs in
+> autocommit mode (no explicit transaction), so the isolation level is
+> irrelevant — the stored procedure executes as a single implicit transaction.
 
 ---
 
 ## 6. The Watch path
 
 There is exactly **one** correctness mechanism: **polling.**
-`SELECT everything WHERE seq > my_bookmark ORDER BY seq`. The doorbell and the
-timer only decide _when_ to poll; they never carry data.
+`SELECT everything WHERE txid_stamp > my_watermark ORDER BY txid_stamp`. The
+doorbell and the timer only decide _when_ to poll; they never carry data.
 
 ```mermaid
 sequenceDiagram
@@ -284,38 +274,41 @@ sequenceDiagram
     W->>DB: initial poll (catch up from StartRV)
     loop scheduling: 5s timer OR doorbell, through a 100ms debounce
         W->>DB: BEGIN REPEATABLE READ, READ ONLY
-        loop each bucket
-            W->>DB: SELECT compacted_seq FROM compaction_horizon
-            alt my hwm < compacted_seq
-                DB-->>W: 410 Gone (history destroyed — Section 7)
-            end
-            W->>DB: SELECT … WHERE seq > hwm ORDER BY seq ASC
-            DB-->>W: changed rows
-            W->>W: classify Added/Modified/Deleted, advance hwm
+        W->>DB: SELECT pg_snapshot_xmin(pg_current_snapshot()) → xmin
+        W->>DB: SELECT compacted_xid FROM compaction_horizon WHERE gvk=$1
+        alt my hwm < compacted_xid
+            DB-->>W: 410 Gone (history destroyed — Section 7)
         end
+        W->>DB: SELECT … WHERE txid_stamp > hwm ORDER BY txid_stamp ASC
+        DB-->>W: changed rows (may include re-deliveries)
+        W->>W: classify Added/Modified/Deleted, advance hwm to xmin-1
         W->>DB: COMMIT
     end
 ```
 
 Key design choices (`internal/reader/watcher.go`):
 
-- **A single goroutine owns everything** — one loop, one timer, one `hwm` map.
+- **A single goroutine owns everything** — one loop, one timer, one watermark.
   The LISTEN connection runs in a side goroutine whose only job is to nudge a
-  1-buffered channel. So the `hwm` map is never touched concurrently — no locks,
+  1-buffered channel. So the watermark is never touched concurrently — no locks,
   no data races.
 - **The debounce**: if a doorbell arrives and it has been ≥100 ms since the last
   poll, poll immediately (leading edge). If less, set a "pending" flag and
   schedule one poll at the 100 ms mark (trailing edge). This collapses a burst of
   doorbells into roughly one poll without ever losing the guarantee that a poll
   follows.
+- **Watermark advancement**: the watermark advances to `xmin - 1`, _not_ to the
+  highest `txid_stamp` seen. This ensures everything below the watermark is
+  committed. Rows between the old watermark and the new `xmin - 1` may
+  re-appear on the next poll — this is expected behavior, and the informer cache
+  deduplicates them.
 - **The whole poll is one `REPEATABLE READ` snapshot** — that is what makes the
-  horizon check and the row read consistent, so a compaction running _during_ a
-  poll is invisible to it.
+  horizon check, the `xmin` read, and the row scan consistent, so a compaction
+  running _during_ a poll is invisible to it.
 - **Coalescing is correct, not a bug.** If an object is written five times
-  between two polls, the watcher sees only the latest state (one row, one seq).
+  between two polls, the watcher sees only the latest state (one row, one txid).
   Kubernetes watch semantics explicitly allow this — you deliver current state,
-  not every intermediate edit. This is also why delivered seq numbers are _not_
-  contiguous — a fact the verifier (Section 10) has to respect.
+  not every intermediate edit.
 
 Event type classification is more nuanced than a simple "deleted or not" check.
 The raw watcher delivers every changed row; the **pgruntime layer** above it
@@ -338,8 +331,8 @@ Built one brick at a time, because this is where people get lost.
 
 ### 7.1 Why deletes are a problem at all
 
-A watcher only ever runs `SELECT … WHERE seq > hwm`. It can only see **rows that
-exist.** So what happens if a delete is a plain `DELETE FROM kubernetes_resources`?
+A watcher only ever runs `SELECT … WHERE txid_stamp > hwm`. It can only see
+**rows that exist.** So what happens if a delete is a plain `DELETE FROM kubernetes_resources`?
 
 The row vanishes. The next poll finds nothing at that key, and **the watcher
 never learns the object was deleted.** Its cache keeps a ghost copy forever. You
@@ -348,19 +341,19 @@ to be a _visible event in the log_, exactly like a create or an update.
 
 ### 7.2 The fix: soft delete with a three-state lifecycle
 
-Instead of removing the row, a delete **bumps the sequence and sets
+Instead of removing the row, a delete **stamps a new `txid_stamp` and sets
 `deletion_timestamp`.** But the object does not become invisible immediately —
 its lifecycle depends on whether it still has **finalizers** (cleanup hooks
 registered by controllers):
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Live: create — seq=5, deletion_timestamp=NULL
-    Live --> Live: update — seq=8, object_version+1
-    Live --> Dying: delete with finalizers — seq=12, deletion_timestamp=now()
-    Live --> FullyDeleted: delete without finalizers — seq=12, deletion_timestamp=now()
-    Dying --> Dying: controller cleanup — seq=13, object_version+1
-    Dying --> FullyDeleted: last finalizer removed — seq=14
+    [*] --> Live: create — txid=100, deletion_timestamp=NULL
+    Live --> Live: update — txid=108, object_version+1
+    Live --> Dying: delete with finalizers — txid=120, deletion_timestamp=now()
+    Live --> FullyDeleted: delete without finalizers — txid=120, deletion_timestamp=now()
+    Dying --> Dying: controller cleanup — txid=125, object_version+1
+    Dying --> FullyDeleted: last finalizer removed — txid=130
     FullyDeleted --> Live: tombstone revival — create same name, new UID
     FullyDeleted --> Removed: compaction (after retention)
     Removed --> [*]
@@ -395,8 +388,8 @@ collection — here called **compaction**.
 
 ### 7.4 The danger compaction reintroduces — the crux
 
-Say you physically delete the tombstone at seq 12. Now a **slow watcher** appears
-whose bookmark is `hwm=9`. It runs `WHERE seq > 9`, and seq 12 is gone. It never
+Say you physically delete the tombstone at txid 120. Now a **slow watcher** appears
+whose watermark is `hwm=90`. It runs `WHERE txid_stamp > 90`, and txid 120 is gone. It never
 sees the delete — **ghost object forever again.** The exact bug tombstones were
 meant to fix, just moved later in time. This is the "silent gap" hazard,
 invariant I5.
@@ -415,18 +408,18 @@ silent.** That is the compaction horizon.
 
 ### 7.5 The compaction horizon + 410 Gone
 
-When compaction physically deletes tombstones up to seq N, it records, for that
-(bucket, GVK):
+When compaction physically deletes tombstones up to txid N, it records, for that
+GVK:
 
-> `compaction_horizon.compacted_seq = N` — "history at or below N has been
+> `compaction_horizon.compacted_xid = N` — "history at or below N has been
 > destroyed; nobody below N can be safely caught up."
 
-Then every watch poll, _before_ reading rows, compares its bookmark to the
+Then every watch poll, _before_ reading rows, compares its watermark to the
 horizon (`internal/reader/watcher.go`):
 
 ```sql
-SELECT compacted_seq FROM compaction_horizon WHERE bucket_id=$1 AND gvk=$2;
--- if my hwm < compacted_seq  →  return 410 Gone
+SELECT compacted_xid FROM compaction_horizon WHERE gvk=$1;
+-- if my hwm < compacted_xid  →  return 410 Gone
 ```
 
 `410 Gone` is a real Kubernetes status. The client knows what it means: _"your
@@ -458,15 +451,15 @@ WITH del AS (
       AND GREATEST(deletion_timestamp, updated_at) < now() - $1::interval   -- retention
       AND (metadata->'finalizers' IS NULL              -- finalizer guard
            OR metadata->'finalizers' = '[]'::jsonb)
-    RETURNING bucket_id, gvk, gvk_bucket_seq
+    RETURNING gvk, txid_stamp
 ),
 horizon AS (
-    INSERT INTO compaction_horizon (bucket_id, gvk, compacted_seq)
-    SELECT bucket_id, gvk, max(gvk_bucket_seq) FROM del GROUP BY 1,2
-    ON CONFLICT (bucket_id, gvk)
-    DO UPDATE SET compacted_seq = GREATEST(
-        compaction_horizon.compacted_seq,   -- value already stored
-        EXCLUDED.compacted_seq)             -- value I just tried to insert
+    INSERT INTO compaction_horizon (gvk, compacted_xid)
+    SELECT gvk, max(txid_stamp::text::bigint) FROM del GROUP BY gvk
+    ON CONFLICT (gvk)
+    DO UPDATE SET compacted_xid = GREATEST(
+        compaction_horizon.compacted_xid,   -- value already stored
+        EXCLUDED.compacted_xid)             -- value I just tried to insert
 )
 SELECT count(*) FROM del;
 ```
@@ -474,13 +467,12 @@ SELECT count(*) FROM del;
 Top to bottom:
 
 - `del` deletes fully-deleted tombstones (no finalizers) whose retention window
-  has elapsed and returns the seqs it killed. The retention clock starts from
+  has elapsed and returns the txids it killed. The retention clock starts from
   `GREATEST(deletion_timestamp, updated_at)` — whichever is later — so a dying
   object that received controller updates during cleanup doesn't get compacted
   prematurely. The finalizer guard ensures dying objects are never compacted,
   even if their `deletion_timestamp` is past the retention window.
-- `horizon` advances the horizon to the highest seq just deleted, per
-  (bucket, GVK).
+- `horizon` advances the horizon to the highest txid just deleted, per GVK.
 - `GREATEST(...)` guarantees the horizon **never moves backward**, even if two
   compactors run concurrently.
 
@@ -501,12 +493,9 @@ Top to bottom:
 > **`EXCLUDED`** is a pseudo-table available only inside
 > `INSERT ... ON CONFLICT DO UPDATE`: it holds **the row you _tried_ to insert
 > but that collided** — the proposed values. Above,
-> `compaction_horizon.compacted_seq` is the stored value and
-> `EXCLUDED.compacted_seq` is the value this run proposed; taking
-> `GREATEST` of the two is how the horizon advances but never retreats. (The
-> writer's counter uses the other idiom — `DO UPDATE SET current_seq =
-gvk_bucket_counters.current_seq + 1` references the _stored_ value to
-> increment it, so it never needs `EXCLUDED`.)
+> `compaction_horizon.compacted_xid` is the stored value and
+> `EXCLUDED.compacted_xid` is the value this run proposed; taking
+> `GREATEST` of the two is how the horizon advances but never retreats.
 
 Because it is one statement, the horizon is never behind the physical delete, so
 the watcher's horizon check can always be trusted.
@@ -546,46 +535,45 @@ own housekeeping that you tune, not implement.
 
 ## 8. A worked example: one object, cradle to 410
 
-Trace a single object in bucket 2 to see all the pieces interact.
+Trace a single object to see all the pieces interact.
 
-1. **Create.** No existing row, so no-op suppression does not fire. Counter for (bucket 2, GVK) goes
-   `0 → 1`. Row inserted with `gvk_bucket_seq=1`, `object_version=1`,
-   `deletion_timestamp=NULL`. Doorbell fires. A watcher at `hwm=0` polls, sees
-   seq 1, emits **Added**, advances to `hwm=1`.
+1. **Create.** No existing row, so no-op suppression does not fire. Row inserted
+   with `txid_stamp=100`, `object_version=1`, `deletion_timestamp=NULL`.
+   Debouncer rings. A watcher at `hwm=90` polls, sees txid 100, emits **Added**,
+   advances watermark to `xmin - 1` (say, 101).
 
-2. **Update.** Content differs, so not suppressed.
-   Counter `1 → 2`. Row updated: `gvk_bucket_seq=2`, `object_version=2`. Watcher
-   polls, sees seq 2, emits **Modified**, advances to `hwm=2`.
+2. **Update.** Content differs, so not suppressed. Row updated:
+   `txid_stamp=108`, `object_version=2`. Watcher polls, sees txid 108, emits
+   **Modified**, advances watermark.
 
 3. **No-op re-apply.** A status re-applier writes byte-identical content.
-   The content check matches; the transaction commits with **no**
-   counter increment and **no** doorbell. Counter stays at 2. Watchers see
-   nothing. `Changed=false`.
+   The content check matches; the stored procedure returns `changed=false` — no
+   upsert, no doorbell. Watchers see nothing.
 
 4. **Delete (with finalizer).** The object has a finalizer
-   (`["cleanup.example.com"]`). The write sets `deletion_timestamp=now()`. Counter
-   `2 → 3`. The row is now **dying** at `gvk_bucket_seq=3` — it has a deletion
-   timestamp but still has active finalizers. The pgruntime watcher dispatches
-   **OnUpdate** (not OnDelete), because the object is still visible and
-   controllers need to act on it.
+   (`["cleanup.example.com"]`). The write sets `deletion_timestamp=now()`,
+   `txid_stamp=120`. The row is now **dying** — it has a deletion timestamp but
+   still has active finalizers. The pgruntime watcher dispatches **OnUpdate** (not
+   OnDelete), because the object is still visible and controllers need to act on
+   it.
 
 5. **Controller cleanup.** A controller sees `deletionTimestamp` is set, performs
-   its cleanup work, and removes its finalizer via an Update call. Counter
-   `3 → 4`. The object now has `deletion_timestamp` set and no finalizers — it is
-   **fully deleted** (a tombstone) at `gvk_bucket_seq=4`. The pgruntime watcher
+   its cleanup work, and removes its finalizer via an Update call,
+   `txid_stamp=130`. The object now has `deletion_timestamp` set and no
+   finalizers — it is **fully deleted** (a tombstone). The pgruntime watcher
    dispatches **OnDelete**. The row still physically exists.
 
 6. **Time passes; compaction runs.** More than 24 h later the compactor's CTE
-   checks that the row has no finalizers, deletes the tombstone (seq 4), and in
-   the same statement sets `compaction_horizon(bucket 2, GVK) = 4`.
+   checks that the row has no finalizers, deletes the tombstone (txid 130), and
+   in the same statement sets `compaction_horizon(GVK).compacted_xid = 130`.
 
-7. **A slow watcher returns.** A watcher that had been offline since `hwm=1`
-   resumes. Its first poll compares `hwm=1` to the horizon `4`; since `1 < 4` it
-   receives **410 Gone**. It re-LISTs (getting the current empty state and a
-   fresh RV) and resumes watching cleanly — never a ghost object, never a silent
-   gap.
+7. **A slow watcher returns.** A watcher that had been offline since `hwm=95`
+   resumes. Its first poll compares `hwm=95` to the horizon `130`; since
+   `95 < 130` it receives **410 Gone**. It re-LISTs (getting the current empty
+   state and a fresh RV) and resumes watching cleanly — never a ghost object,
+   never a silent gap.
 
-That single lifecycle exercises the counter, no-op suppression,
+That single lifecycle exercises `pg_current_xact_id()`, no-op suppression,
 finalizer-based dying/tombstone states, compaction, the horizon, and 410. If it
 makes sense, the rest of the system is variations on it.
 
@@ -595,7 +583,7 @@ makes sense, the rest of the system is variations on it.
 
 | Mechanism                    | Which piece of "a commit-ordered version" it defends                                                                                                |
 | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Counter row + exclusive lock | Commit-ordered sequences: commit-order = seq-order (I1)                                                                                             |
+| xid8 + snapshot-xmin watermark | Commit-ordered delivery: watermark advances only past committed txids (I1)                                                                        |
 | `object_version` check       | No lost updates on one object (I6)                                                                                                                  |
 | RDS synchronous replication  | Version never goes backward across failover (I2, I4); on restore, restarting pods forces a relist                                                   |
 | Tombstones + finalizers      | Deletes are visible events; dying objects (with finalizers) stay visible for cleanup, fully-deleted tombstones (no finalizers) signal deletion (I3) |
@@ -616,43 +604,33 @@ verified pre-release decays: configs drift, code changes, production finds state
 no test imagined. So the design runs a **verifier** as a permanent, low-priority
 consumer in every environment (`internal/verifier/verifier.go`).
 
-The elegant part: **the verifier is just another watcher.** It subscribes to a
-sample of buckets (including the hottest) through the ordinary poll path — the
-same code every real controller uses — and audits the event stream it receives.
-It exercises the machinery it is auditing.
+The elegant part: **the verifier is just another watcher.** It subscribes to
+watched GVKs through the ordinary poll path — the same code every real
+controller uses — and audits the event stream it receives. It exercises the
+machinery it is auditing.
 
-What it checks per (GVK, bucket):
+What it checks:
 
-- **Monotonic high-water marks (I2).** Every delivered event's seq must be
-  strictly greater than the previous high-water mark for its bucket. One rule
-  catches two failure classes: a _regression_ (the sequence went backwards)
-  and a _duplicate delivery_ both manifest as `seq <= previous hwm`. That single comparison is the whole check, which is
-  why verifier state is tiny — **O(buckets)**, one number per bucket, no per-key
-  maps that grow with fleet size.
+- **Monotonic watermarks (I2).** The watermark must never decrease. A regression
+  means the database (or the watcher) rewound — a critical invariant violation.
+- **Re-delivery tracking.** In the xid8 watermark model, rows between the old
+  watermark and `xmin - 1` may be re-delivered on each poll. Re-deliveries are
+  counted (expected behavior) and exported as a metric, not flagged as
+  violations.
 - **Compaction consistency (I5)** comes free from the poll path itself: if the
-  verifier's bookmark ever falls below a horizon, it must receive a loud `410
+  verifier's watermark ever falls below a horizon, it must receive a loud `410
 Gone` — silence there would itself be the violation.
 
-Just as important is what it deliberately does **not** check: per-event
-contiguity. Recall from Section 6 that coalescing is legal — two rapid writes to
-one object leave only the latest seq visible, so delivered seqs legitimately skip
-numbers. A naive contiguity audit would false-alarm constantly. Contiguity
-auditing, if ever needed, must cross-check the table to prove a missing seq was
-superseded — out of scope for the stream-side verifier. (This is a nice example
-of the invariants doing real work: I3 _permits_ coalescing, so the verifier must
-tolerate it.)
-
 The second probe is a **canary**: at a low rate, the verifier writes a synthetic
-object to one of its sampled buckets through the real write path and measures
-write-to-delivery latency — the wall-clock time from `Write` returning to the
-event appearing on the watcher channel. This times the full pipeline: commit
-visibility, `pg_notify` doorbell, poll scheduling, and channel delivery. Latency
-samples are kept in a bounded ring buffer (1,000 entries, p99) and also observed
-via the `pgctl_verifier_canary_delivery_seconds` Prometheus histogram. The
-doorbell is never required for correctness (Section 4d) and would fail
-_silently_ if nobody measured latency — events would still arrive, just up to
-5 s late. The canary is what turns "doorbell quietly broken" from an invisible
-degradation into a metric.
+object through the real write path and measures write-to-delivery latency — the
+wall-clock time from `Write` returning to the event appearing on the watcher
+channel. This times the full pipeline: commit visibility, debounced `pg_notify`
+doorbell, poll scheduling, and channel delivery. Latency samples are kept in a
+bounded ring buffer (1,000 entries, p99) and also observed via the
+`pgctl_verifier_canary_delivery_seconds` Prometheus histogram. The doorbell is
+never required for correctness (Section 4d) and would fail _silently_ if nobody
+measured latency — events would still arrive, just up to 5 s late. The canary is
+what turns "doorbell quietly broken" from an invisible degradation into a metric.
 
 Operationally: any violation should page a human. With synchronous replication a
 sequence regression should be impossible — if the verifier fires, something is
@@ -676,8 +654,9 @@ So compared to kine you drop **two** moving pieces (the etcd shim _and_ the API
 server), and the write/watch path can scale better for one concrete structural
 reason: **kine stores everything in one table with a single global
 auto-incrementing revision** — every write in the cluster contends on that one
-sequence. This design _shards that counter per (GVK, bucket)_, so writes to
-different buckets never contend. That is the core performance advantage.
+sequence. This design uses PostgreSQL's native `xid8` transaction IDs with a
+`pg_snapshot_xmin()` watermark — writers never contend on a shared counter at
+all. That is the core performance advantage.
 
 The trade is real and it is the whole "iff you accept the assumptions" clause:
 dropping the API server drops everything it does — admission/validation webhooks,
@@ -687,8 +666,7 @@ because the apiserver stays. You lose the apiserver's
 in-memory watch cache (which serves many watchers from one upstream watch), so
 very high watcher fan-out may need a caching layer here to match.
 
-**Net:** if you own every controller, do not need the Kubernetes API surface, and
-your resources shard cleanly into buckets, this replaces kine _and_ the apiserver
-with fewer moving parts and better write/watch scaling. It is not a drop-in kine
-swap — it is a leaner point in the design space that is only reachable once those
-assumptions hold.
+**Net:** if you own every controller and do not need the Kubernetes API surface,
+this replaces kine _and_ the apiserver with fewer moving parts and better
+write/watch scaling. It is not a drop-in kine swap — it is a leaner point in the
+design space that is only reachable once those assumptions hold.

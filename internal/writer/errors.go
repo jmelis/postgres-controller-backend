@@ -15,12 +15,12 @@ type AmbiguousCommitError struct {
 	GVK       string
 	Namespace string
 	Name      string
-	Seq       int64
+	Txid      uint64
 }
 
 func (e *AmbiguousCommitError) Error() string {
-	return fmt.Sprintf("ambiguous commit for %s/%s/%s seq=%d: %v",
-		e.GVK, e.Namespace, e.Name, e.Seq, e.Cause)
+	return fmt.Sprintf("ambiguous commit for %s/%s/%s txid=%d: %v",
+		e.GVK, e.Namespace, e.Name, e.Txid, e.Cause)
 }
 
 func (e *AmbiguousCommitError) Unwrap() error {

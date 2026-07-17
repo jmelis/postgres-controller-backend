@@ -11,7 +11,6 @@ rds:
   engine_version: "16.4"
 
 cluster:
-  buckets: 16                           # Number of buckets to use
   baseline_poll_interval: 5s            # Watcher poll interval when no doorbell
   debounce_floor: 100ms                 # Minimum time between doorbell-triggered polls
 
@@ -19,17 +18,16 @@ seed:
   gvks:
     # Define each GVK you want to populate and test.
     # spec/status/metadata_size_bytes control the payload size.
-    # objects_per_bucket * cluster.buckets = total objects for this GVK.
     - gvk: "example.io/v1/MyResource"
       spec_size_bytes: 2048             # Target JSON payload size
       status_size_bytes: 1024
       metadata_size_bytes: 512
-      objects_per_bucket: 100
+      objects: 1600                     # Total objects to seed for this GVK
 
 phases:
   phase1_ceiling:
     enabled: true
-    workers_per_bucket: 50              # Concurrent writers per bucket
+    workers: 50                         # Concurrent writers
     duration: 30s                       # How long to run
     target_rps: 200                     # Minimum acceptable RPS (pass/fail)
     target_p99_ms: 10                   # p99 latency target (strict mode)
@@ -44,8 +42,6 @@ phases:
 
   phase2b_skew:
     enabled: false
-    hot_bucket_write_pct: 20            # % of writes going to the hottest bucket
-    cold_p99_ms: 15                     # Cold bucket p99 must stay below this
 
   phase3_avalanche:
     enabled: false
@@ -70,6 +66,5 @@ verifier:
   enabled: true
   poll_interval: 200ms                  # Verifier poll interval
   canary_interval: 500ms                # Canary write interval
-  sample_buckets: 8                     # Buckets to verify (including hottest)
 
 checkpoint_interval: 5m                   # How often to write progress snapshots (fetchable via ./run.sh check)

@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jmelis/postgres-controller-backend/internal/doorbell"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
 	"github.com/jmelis/postgres-controller-backend/test/testinfra"
@@ -46,7 +48,6 @@ func truncateAll(t *testing.T) {
 	conn := directConn(t)
 	tables := []string{
 		"kubernetes_resources",
-		"gvk_bucket_counters",
 		"compaction_horizon",
 	}
 	ctx := context.Background()
@@ -57,9 +58,9 @@ func truncateAll(t *testing.T) {
 	}
 }
 
-func makeWriteReq(gvk, ns, name string, bucketID int) model.WriteRequest {
+func makeWriteReq(gvk, ns, name string) model.WriteRequest {
 	return model.WriteRequest{
-		GVK: gvk, Namespace: ns, Name: name, BucketID: bucketID,
+		GVK: gvk, Namespace: ns, Name: name,
 		Spec: json.RawMessage(`{"replicas":1}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`),
 	}
@@ -67,5 +68,8 @@ func makeWriteReq(gvk, ns, name string, bucketID int) model.WriteRequest {
 
 func directWriter(t *testing.T, hooks writer.TxHooks) *writer.Writer {
 	t.Helper()
-	return writer.New(directConn(t), hooks)
+	dbConn := directConn(t)
+	db := doorbell.NewDebouncer(dbConn, 50*time.Millisecond)
+	t.Cleanup(func() { db.Close() })
+	return writer.New(directConn(t), hooks).WithDoorbell(db)
 }

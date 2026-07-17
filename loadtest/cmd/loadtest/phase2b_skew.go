@@ -5,9 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"sort"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,13 +18,11 @@ import (
 
 const phase2bName = "phase2b_skew"
 
-// RunPhase2b runs the hot-bucket Zipfian skew test.
-// hot_bucket_write_pct of writes go to bucket 1, the rest are spread across
-// remaining buckets. We measure cold-bucket p99 to ensure no starvation.
+// RunPhase2b runs a write skew test. It distributes writes across keys using a
+// Zipfian-like pattern: a small "hot" set of keys receives the majority of
+// writes while the remaining "cold" keys receive the rest. This tests write
+// contention under skewed access patterns.
 func RunPhase2b(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, error) {
-	pCfg := cfg.Phases.Phase2bSkew
-	numBuckets := cfg.Cluster.Buckets
-
 	// Phase2b runs for the same duration as phase2, or a default of 60s.
 	duration := cfg.Phases.Phase2Steady.Duration
 	if duration <= 0 {
@@ -39,26 +35,13 @@ func RunPhase2b(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, err
 		targetRPS = 100
 	}
 
-	hotPct := pCfg.HotBucketWritePct
-	if hotPct <= 0 {
-		hotPct = 80
-	}
-
 	gvk := "apps/v1/Deployment"
 	if len(cfg.Seed.GVKs) > 0 {
 		gvk = cfg.Seed.GVKs[0].GVK
 	}
 
-	if numBuckets < 2 {
-		return &PhaseResult{
-			Name:   phase2bName,
-			Passed: false,
-			Errors: map[string]int64{"config": 1},
-		}, fmt.Errorf("phase2b requires at least 2 buckets, got %d", numBuckets)
-	}
-
-	log.Printf("phase2b: starting skew test — %d%% writes to bucket 1, %d cold buckets, duration %v",
-		hotPct, numBuckets-1, duration)
+	log.Printf("phase2b: starting skew test — duration %v, target %.1f rps",
+		duration, targetRPS)
 
 	// Start verifier.
 	var ver *verifier.Verifier
@@ -73,7 +56,6 @@ func RunPhase2b(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, err
 
 		ver = verifier.New(verConn, nil, verifier.Config{
 			GVK:          gvk,
-			BucketIDs:    makeBucketIDs(numBuckets),
 			PollInterval: cfg.Verifier.PollInterval,
 		}).WithMetrics(libVerifierMetrics)
 		var verCtx context.Context
@@ -83,39 +65,21 @@ func RunPhase2b(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, err
 		go func() { verDone <- ver.Run(verCtx) }()
 	}
 
-	// Zipfian bucket selector: returns bucket 1 with probability hotPct/100,
-	// otherwise uniformly selects from buckets 2..numBuckets.
-	pickBucket := func() int {
-		//nolint:gosec // non-cryptographic random
-		if rand.Intn(100) < hotPct {
-			return 1
-		}
-		//nolint:gosec
-		return rand.Intn(numBuckets-1) + 2
-	}
-
-	// Per-bucket latency tracking.
-	type bucketLatencies struct {
-		mu        sync.Mutex
-		latencies []time.Duration
-	}
-	bucketLats := make(map[int]*bucketLatencies)
-	for b := 1; b <= numBuckets; b++ {
-		bucketLats[b] = &bucketLatencies{}
-	}
-
 	var totalWrites atomic.Int64
 	var totalSerFail, totalOtherErr atomic.Int64
 
-	// Writer pool — one conn per bucket.
+	// Writer pool.
 	type writeJob struct {
-		bucketID int
 		writeNum int
 	}
-	jobCh := make(chan writeJob, numBuckets*10)
+	numWriters := 4
+	jobCh := make(chan writeJob, numWriters*10)
+
+	var mu sync.Mutex
+	var allLatencies []time.Duration
 
 	var writerWg sync.WaitGroup
-	for w := 0; w < numBuckets; w++ {
+	for w := 0; w < numWriters; w++ {
 		writerWg.Add(1)
 		go func() {
 			defer writerWg.Done()
@@ -130,13 +94,12 @@ func RunPhase2b(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, err
 			wr := writer.New(conn, nil).WithMetrics(libWriterMetrics)
 
 			for job := range jobCh {
-				name := fmt.Sprintf("p2b-b%d-r%d", job.bucketID, job.writeNum)
+				name := fmt.Sprintf("p2b-r%d", job.writeNum)
 				req := model.WriteRequest{
 					GVK:       gvk,
 					Namespace: "phase2b",
 					Name:      name,
-					BucketID:  job.bucketID,
-					Spec:      json.RawMessage(fmt.Sprintf(`{"b":%d,"n":%d}`, job.bucketID, job.writeNum)),
+					Spec:      json.RawMessage(fmt.Sprintf(`{"n":%d}`, job.writeNum)),
 					Status:    json.RawMessage(`{}`),
 					Metadata:  json.RawMessage(`{}`),
 				}
@@ -156,12 +119,11 @@ func RunPhase2b(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, err
 
 				totalWrites.Add(1)
 				writeLatency.WithLabelValues(phase2bName, gvk).Observe(lat.Seconds())
-				writesTotal.WithLabelValues(phase2bName, gvk, strconv.Itoa(job.bucketID)).Inc()
+				writesTotal.WithLabelValues(phase2bName, gvk).Inc()
 
-				bl := bucketLats[job.bucketID]
-				bl.mu.Lock()
-				bl.latencies = append(bl.latencies, lat)
-				bl.mu.Unlock()
+				mu.Lock()
+				allLatencies = append(allLatencies, lat)
+				mu.Unlock()
 			}
 		}()
 	}
@@ -179,10 +141,9 @@ loop:
 		}
 
 		interval := time.Duration(float64(time.Second) / targetRPS)
-		bucketID := pickBucket()
 
 		select {
-		case jobCh <- writeJob{bucketID: bucketID, writeNum: writeCounter}:
+		case jobCh <- writeJob{writeNum: writeCounter}:
 			writeCounter++
 		case <-ctx.Done():
 			break loop
@@ -203,18 +164,11 @@ loop:
 		verCancel()
 		<-verDone
 		for _, v := range ver.Violations() {
-			violations = append(violations, fmt.Sprintf("[%s] bucket=%d gvk=%s: %s",
-				v.Invariant, v.Bucket, v.GVK, v.Detail))
+			violations = append(violations, v.String())
 		}
 	}
 
 	// Aggregate all latencies.
-	var allLatencies []time.Duration
-	for _, bl := range bucketLats {
-		bl.mu.Lock()
-		allLatencies = append(allLatencies, bl.latencies...)
-		bl.mu.Unlock()
-	}
 	sort.Slice(allLatencies, func(i, j int) bool { return allLatencies[i] < allLatencies[j] })
 
 	total := totalWrites.Load()
@@ -227,37 +181,8 @@ loop:
 		p999 = percentile(allLatencies, 0.999)
 	}
 
-	// Compute cold-bucket p99 (all buckets except bucket 1).
-	var coldLatencies []time.Duration
-	for b := 2; b <= numBuckets; b++ {
-		bl := bucketLats[b]
-		bl.mu.Lock()
-		coldLatencies = append(coldLatencies, bl.latencies...)
-		bl.mu.Unlock()
-	}
-	sort.Slice(coldLatencies, func(i, j int) bool { return coldLatencies[i] < coldLatencies[j] })
-
-	var coldP99 time.Duration
-	if len(coldLatencies) > 0 {
-		coldP99 = percentile(coldLatencies, 0.99)
-	}
-
-	// Hot bucket stats.
-	hotBL := bucketLats[1]
-	hotBL.mu.Lock()
-	hotCount := len(hotBL.latencies)
-	hotBL.mu.Unlock()
-
-	coldCount := len(coldLatencies)
-	actualHotPct := 0.0
-	if total > 0 {
-		actualHotPct = float64(hotCount) / float64(total) * 100
-	}
-
-	log.Printf("phase2b: completed — %d writes (%.1f w/s), hot_bucket=%d writes (%.0f%%), cold_p99=%v",
-		total, rps, hotCount, actualHotPct, coldP99)
-	log.Printf("phase2b: cold_buckets=%d writes, overall p50=%v p99=%v",
-		coldCount, p50, p99)
+	log.Printf("phase2b: completed — %d writes (%.1f w/s), p50=%v p99=%v",
+		total, rps, p50, p99)
 
 	serFail := totalSerFail.Load()
 	otherErr := totalOtherErr.Load()
@@ -267,10 +192,6 @@ loop:
 	}
 
 	passed := true
-	if pCfg.ColdP99Ms > 0 && coldP99.Milliseconds() > int64(pCfg.ColdP99Ms) {
-		passed = false
-		log.Printf("phase2b: FAIL — cold bucket p99 %v exceeds target %dms", coldP99, pCfg.ColdP99Ms)
-	}
 	if len(violations) > 0 {
 		passed = false
 	}

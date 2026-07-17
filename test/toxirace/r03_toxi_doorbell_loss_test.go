@@ -32,8 +32,7 @@ func TestR3_Toxi_DoorbellLoss_ResetPeer(t *testing.T) {
 
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
-		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Watermark: 0},
 		BaselineInterval: 500 * time.Millisecond,
 		DebounceFloor:    50 * time.Millisecond,
 	}, nil)
@@ -48,7 +47,7 @@ func TestR3_Toxi_DoorbellLoss_ResetPeer(t *testing.T) {
 	wr := directWriter(t, nil)
 	for i := 0; i < 3; i++ {
 		req := makeWriteReq("apps/v1/Deployment", "default",
-			fmt.Sprintf("toxi-r3-%d", i), 1)
+			fmt.Sprintf("toxi-r3-%d", i))
 		_, err := wr.Write(ctx, req)
 		require.NoError(t, err)
 	}
@@ -80,7 +79,7 @@ func TestR3_Toxi_DoorbellLoss_ResetPeer(t *testing.T) {
 	wr2 := directWriter(t, nil)
 	for i := 3; i < 8; i++ {
 		req := makeWriteReq("apps/v1/Deployment", "default",
-			fmt.Sprintf("toxi-r3-%d", i), 1)
+			fmt.Sprintf("toxi-r3-%d", i))
 		_, err := wr2.Write(ctx, req)
 		require.NoError(t, err)
 	}
@@ -103,16 +102,16 @@ func TestR3_Toxi_DoorbellLoss_ResetPeer(t *testing.T) {
 
 	assert.Len(t, events, 8)
 
-	// Verify contiguous seqs, no duplicates
-	seqs := make(map[int64]bool)
+	// Verify all txids are unique (xid8 values are not contiguous)
+	txids := make(map[uint64]bool)
 	for _, ev := range events {
-		assert.False(t, seqs[ev.Resource.GVKBucketSeq],
-			"duplicate seq %d", ev.Resource.GVKBucketSeq)
-		seqs[ev.Resource.GVKBucketSeq] = true
+		assert.True(t, ev.Resource.TxidStamp > 0,
+			"txid should be positive, got %d", ev.Resource.TxidStamp)
+		assert.False(t, txids[ev.Resource.TxidStamp],
+			"duplicate txid %d", ev.Resource.TxidStamp)
+		txids[ev.Resource.TxidStamp] = true
 	}
-	for i := int64(1); i <= 8; i++ {
-		assert.True(t, seqs[i], "missing seq %d", i)
-	}
+	assert.Len(t, txids, 8, "expected 8 unique txids")
 }
 
 // R3 Toxi — Doorbell reconnect via ListenConnFactory.
@@ -134,8 +133,7 @@ func TestR3_Toxi_DoorbellReconnect(t *testing.T) {
 
 	w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
-		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Watermark: 0},
 		BaselineInterval: 10 * time.Second, // long baseline so only doorbell triggers fast delivery
 		DebounceFloor:    50 * time.Millisecond,
 		ListenConnFactory: func(ctx context.Context) (*pgx.Conn, error) {
@@ -151,7 +149,7 @@ func TestR3_Toxi_DoorbellReconnect(t *testing.T) {
 
 	// Write first resource — doorbell should be working, expect fast delivery
 	wr := directWriter(t, nil)
-	req := makeWriteReq("apps/v1/Deployment", "default", "reconnect-0", 1)
+	req := makeWriteReq("apps/v1/Deployment", "default", "reconnect-0")
 	_, err = wr.Write(ctx, req)
 	require.NoError(t, err)
 
@@ -168,7 +166,7 @@ func TestR3_Toxi_DoorbellReconnect(t *testing.T) {
 	require.NoError(t, err)
 
 	wrKill := directWriter(t, nil)
-	reqKill := makeWriteReq("apps/v1/Deployment", "default", "reconnect-kill", 1)
+	reqKill := makeWriteReq("apps/v1/Deployment", "default", "reconnect-kill")
 	_, err = wrKill.Write(ctx, reqKill)
 	require.NoError(t, err)
 	time.Sleep(500 * time.Millisecond)
@@ -201,7 +199,7 @@ func TestR3_Toxi_DoorbellReconnect(t *testing.T) {
 
 	// Write another resource — doorbell should be restored
 	wr2 := directWriter(t, nil)
-	req2 := makeWriteReq("apps/v1/Deployment", "default", "reconnect-1", 1)
+	req2 := makeWriteReq("apps/v1/Deployment", "default", "reconnect-1")
 	_, err = wr2.Write(ctx, req2)
 	require.NoError(t, err)
 

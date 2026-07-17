@@ -27,7 +27,7 @@ func TestCompactDeletesExpiredTombstones(t *testing.T) {
 	// Create a live resource
 	_, err := w.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "live",
-		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`),
 	})
 	require.NoError(t, err)
@@ -36,7 +36,7 @@ func TestCompactDeletesExpiredTombstones(t *testing.T) {
 	past := time.Now().Add(-2 * time.Hour)
 	_, err = w.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "old-tombstone",
-		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`), DeletionTimestamp: &past,
 	})
 	require.NoError(t, err)
@@ -62,12 +62,12 @@ func TestCompactDeletesExpiredTombstones(t *testing.T) {
 	assert.Equal(t, 1, count)
 
 	// Verify compaction horizon was set
-	var compactedSeq int64
+	var compactedXid int64
 	err = verifyConn.QueryRow(ctx,
-		`SELECT compacted_seq FROM compaction_horizon WHERE bucket_id = 1 AND gvk = 'apps/v1/Deployment'`,
-	).Scan(&compactedSeq)
+		`SELECT compacted_xid FROM compaction_horizon WHERE gvk = 'apps/v1/Deployment'`,
+	).Scan(&compactedXid)
 	require.NoError(t, err)
-	assert.Equal(t, int64(2), compactedSeq)
+	assert.Greater(t, compactedXid, int64(0))
 }
 
 func TestCompactSkipsFreshTombstones(t *testing.T) {
@@ -84,7 +84,7 @@ func TestCompactSkipsFreshTombstones(t *testing.T) {
 	now := time.Now()
 	_, err := w.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "fresh-tombstone",
-		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{}`), DeletionTimestamp: &now,
 	})
 	require.NoError(t, err)
@@ -110,7 +110,7 @@ func TestCompactSkipsDyingObjects(t *testing.T) {
 	past := time.Now().Add(-2 * time.Hour)
 	_, err := w.Write(ctx, model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "dying",
-		BucketID: 1, Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
+		Spec: json.RawMessage(`{}`), Status: json.RawMessage(`{}`),
 		Metadata: json.RawMessage(`{"finalizers":["cleanup.example.com"]}`), DeletionTimestamp: &past,
 	})
 	require.NoError(t, err)

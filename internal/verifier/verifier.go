@@ -19,20 +19,18 @@ import (
 // Violation represents a detected invariant violation.
 type Violation struct {
 	Invariant string // I2, I4, I5, I6
-	Bucket    int
 	GVK       string
 	Detail    string
 	Time      time.Time
 }
 
 func (v Violation) String() string {
-	return fmt.Sprintf("[%s] bucket=%d gvk=%s: %s", v.Invariant, v.Bucket, v.GVK, v.Detail)
+	return fmt.Sprintf("[%s] gvk=%s: %s", v.Invariant, v.GVK, v.Detail)
 }
 
 // Config configures the verifier.
 type Config struct {
-	GVK       string
-	BucketIDs []int
+	GVK string
 
 	// CanaryInterval controls how often the canary writer fires. Zero disables canary.
 	CanaryInterval time.Duration
@@ -52,6 +50,7 @@ type Config struct {
 type Result struct {
 	Violations    []Violation
 	EventsChecked int64
+	Redeliveries  int64
 	CanaryWrites  int64
 	CanaryP99     time.Duration // write-to-delivery latency p99
 }
@@ -60,14 +59,13 @@ const canaryRingSize = 1000
 
 // Verifier is the continuous invariant verification consumer.
 // It subscribes via the ordinary poll path and checks:
-//   - I2/I5: monotonic hwm (seq must be strictly greater than previous hwm)
-//   - I4: no duplicate delivery (duplicate => seq <= hwm, caught by I2 check)
-//   - I6: hwm-below-horizon implies 410 was received
+//   - Completeness: canary writes always arrive (measured by delivery latency)
+//   - Re-delivery tracking: txids seen more than once are counted (expected
+//     in the xid8 watermark model where the watcher re-scans the (hwm, xmin) window)
 //
 // The canary probe writes synthetic objects and measures write-to-delivery
 // latency (the wall-clock time from Write returning to the event appearing
-// on the watcher channel). This times the full pipeline: commit visibility,
-// pg_notify doorbell, poll scheduling, and channel delivery.
+// on the watcher channel).
 type Verifier struct {
 	cfg        Config
 	pollConn   *pgx.Conn
@@ -75,7 +73,8 @@ type Verifier struct {
 
 	mu              sync.Mutex
 	violations      []Violation
-	hwm             map[int]int64
+	hwm             uint64
+	redeliveries    int64
 	eventsCount     int64
 	canaryCount     int64
 	canaryTimes     [canaryRingSize]time.Duration
@@ -95,16 +94,11 @@ func New(pollConn, canaryConn *pgx.Conn, cfg Config) *Verifier {
 		cfg.CanaryInterval = 5 * time.Second
 	}
 
-	hwm := make(map[int]int64, len(cfg.BucketIDs))
-	for _, bid := range cfg.BucketIDs {
-		hwm[bid] = 0
-	}
-
 	return &Verifier{
 		cfg:             cfg,
 		pollConn:        pollConn,
 		canaryConn:      canaryConn,
-		hwm:             hwm,
+		hwm:             0,
 		pendingCanaries: make(map[string]time.Time),
 	}
 }
@@ -119,8 +113,7 @@ func (v *Verifier) WithMetrics(m *metrics.VerifierMetrics) *Verifier {
 func (v *Verifier) Run(ctx context.Context) error {
 	watcher := reader.NewWatcher(v.pollConn, v.cfg.ListenConn, reader.WatcherConfig{
 		GVK:               v.cfg.GVK,
-		BucketIDs:         v.cfg.BucketIDs,
-		StartRV:           resourceversion.RV{Buckets: v.hwm},
+		StartRV:           resourceversion.RV{Watermark: v.hwm},
 		BaselineInterval:  v.cfg.PollInterval,
 		ListenConnFactory: v.cfg.ListenConnFactory,
 	}, nil)
@@ -191,6 +184,7 @@ func (v *Verifier) Result() Result {
 	return Result{
 		Violations:    append([]Violation{}, v.violations...),
 		EventsChecked: v.eventsCount,
+		Redeliveries:  v.redeliveries,
 		CanaryWrites:  v.canaryCount,
 		CanaryP99:     p99,
 	}
@@ -205,20 +199,13 @@ func (v *Verifier) checkEvent(ev reader.Event) {
 		v.metrics.EventsCheckedTotal.Inc()
 	}
 
-	bucket := ev.Resource.BucketID
-	seq := ev.Resource.GVKBucketSeq
+	txid := ev.Resource.TxidStamp
 
-	prevHWM := v.hwm[bucket]
-
-	// I2/I4/I5: monotonic hwm — seq must be strictly greater than previous hwm.
-	if seq <= prevHWM {
-		v.addViolation(Violation{
-			Invariant: "I2",
-			Bucket:    bucket,
-			GVK:       v.cfg.GVK,
-			Detail:    fmt.Sprintf("non-monotonic: seq=%d <= hwm=%d", seq, prevHWM),
-			Time:      time.Now(),
-		})
+	// In the xid8 watermark model, the watcher re-scans the (hwm, xmin)
+	// window each poll. Re-delivered rows (txid <= verifier's max-seen)
+	// are expected — count them for observability but don't flag violations.
+	if txid <= v.hwm && v.hwm > 0 {
+		v.redeliveries++
 	}
 
 	// Canary delivery latency measurement
@@ -238,8 +225,8 @@ func (v *Verifier) checkEvent(ev reader.Event) {
 		}
 	}
 
-	if seq > v.hwm[bucket] {
-		v.hwm[bucket] = seq
+	if txid > v.hwm {
+		v.hwm = txid
 	}
 }
 
@@ -256,13 +243,12 @@ func (v *Verifier) writeCanary(ctx context.Context) {
 	name := fmt.Sprintf("_verifier-canary-%d", count)
 
 	req := model.WriteRequest{
-		GVK:         v.cfg.GVK,
-		Namespace:   "_verifier",
-		Name:        name,
-		BucketID:    v.cfg.BucketIDs[0],
-		Spec:     json.RawMessage(`{"canary":true}`),
-		Status:   json.RawMessage(`{}`),
-		Metadata: json.RawMessage(`{}`),
+		GVK:       v.cfg.GVK,
+		Namespace: "_verifier",
+		Name:      name,
+		Spec:      json.RawMessage(`{"canary":true}`),
+		Status:    json.RawMessage(`{}`),
+		Metadata:  json.RawMessage(`{}`),
 	}
 
 	_, err := w.Write(ctx, req)
@@ -273,7 +259,6 @@ func (v *Verifier) writeCanary(ctx context.Context) {
 
 	v.mu.Lock()
 	v.canaryCount++
-	// Cap pending map to stay bounded
 	if len(v.pendingCanaries) >= canaryRingSize {
 		for k := range v.pendingCanaries {
 			delete(v.pendingCanaries, k)

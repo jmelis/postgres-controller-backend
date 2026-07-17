@@ -14,19 +14,19 @@ func TestRoundTrip(t *testing.T) {
 		want string
 	}{
 		{
-			name: "single bucket",
-			rv:   RV{Buckets: map[int]int64{2: 1044}},
-			want: "b2:1044",
+			name: "watermark only",
+			rv:   RV{Watermark: 12345678},
+			want: "12345678",
 		},
 		{
-			name: "multiple buckets sorted",
-			rv:   RV{Buckets: map[int]int64{9: 4123, 2: 1044, 5: 902}},
-			want: "b2:1044,b5:902,b9:4123",
+			name: "zero watermark",
+			rv:   RV{Watermark: 0},
+			want: "0",
 		},
 		{
-			name: "empty buckets",
-			rv:   RV{Buckets: map[int]int64{}},
-			want: "",
+			name: "with object version",
+			rv:   RV{ObjectVersion: 5, Watermark: 42},
+			want: "o5;42",
 		},
 	}
 
@@ -37,64 +37,42 @@ func TestRoundTrip(t *testing.T) {
 
 			parsed, err := Parse(s)
 			require.NoError(t, err)
-			assert.Equal(t, tt.rv.Buckets, parsed.Buckets)
+			assert.Equal(t, tt.rv.Watermark, parsed.Watermark)
+			assert.Equal(t, tt.rv.ObjectVersion, parsed.ObjectVersion)
 		})
 	}
 }
 
-func TestParseCanonical(t *testing.T) {
-	rv, err := Parse("b2:1044,b5:902,b9:4123")
+func TestParseEmpty(t *testing.T) {
+	rv, err := Parse("")
 	require.NoError(t, err)
-	assert.Equal(t, int64(1044), rv.Buckets[2])
-	assert.Equal(t, int64(902), rv.Buckets[5])
-	assert.Equal(t, int64(4123), rv.Buckets[9])
+	assert.Equal(t, uint64(0), rv.Watermark)
+	assert.Equal(t, int64(0), rv.ObjectVersion)
 }
 
 func TestParseErrors(t *testing.T) {
 	bad := []string{
-		"x2:1044",
-		"b2",
-		"b2:abc",
-	}
-	for _, s := range bad {
-		_, err := Parse(s)
-		assert.Error(t, err, "expected error for %q", s)
-	}
-}
-
-func TestObjectVersionRoundTrip(t *testing.T) {
-	rv := RV{ObjectVersion: 5, Buckets: map[int]int64{0: 42, 1: 17}}
-	s := rv.String()
-	assert.Equal(t, "o5;b0:42,b1:17", s)
-
-	parsed, err := Parse(s)
-	require.NoError(t, err)
-	assert.Equal(t, int64(5), parsed.ObjectVersion)
-	assert.Equal(t, rv.Buckets, parsed.Buckets)
-}
-
-func TestParseWithoutObjectVersion(t *testing.T) {
-	rv, err := Parse("b0:42,b1:17")
-	require.NoError(t, err)
-	assert.Equal(t, int64(0), rv.ObjectVersion)
-}
-
-func TestObjectVersionParseErrors(t *testing.T) {
-	bad := []string{
-		"o;b0:42",
-		"oabc;b0:42",
+		"abc",
+		"o;42",
+		"oabc;42",
 		"o5;",
-		"o5;x0:42",
+		"o5;abc",
 	}
 	for _, s := range bad {
 		_, err := Parse(s)
 		assert.Error(t, err, "expected error for %q", s)
 	}
+}
+
+func TestOldBucketFormatRejected(t *testing.T) {
+	_, err := Parse("b2:1044")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "old bucket-based format")
 }
 
 func TestStringDeterministic(t *testing.T) {
-	rv := RV{Buckets: map[int]int64{3: 10, 1: 20, 2: 30}}
+	rv := RV{ObjectVersion: 3, Watermark: 99999}
 	for i := 0; i < 100; i++ {
-		assert.Equal(t, "b1:20,b2:30,b3:10", rv.String())
+		assert.Equal(t, "o3;99999", rv.String())
 	}
 }

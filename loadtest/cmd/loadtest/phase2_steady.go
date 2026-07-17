@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"sort"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,11 +19,10 @@ import (
 const phase2Name = "phase2_steady"
 
 // RunPhase2 runs the steady-state test for the configured duration.
-// It maintains target_rps across all buckets using a ticker-based rate limiter,
+// It maintains target_rps using a ticker-based rate limiter,
 // and periodically bursts to burst_rps for 10s every 5 minutes.
 func RunPhase2(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, error) {
 	pCfg := cfg.Phases.Phase2Steady
-	numBuckets := cfg.Cluster.Buckets
 	duration := pCfg.Duration
 	targetRPS := pCfg.TargetRPS
 	burstRPS := pCfg.BurstRPS
@@ -50,7 +48,6 @@ func RunPhase2(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 
 		ver = verifier.New(verConn, nil, verifier.Config{
 			GVK:          gvk,
-			BucketIDs:    makeBucketIDs(numBuckets),
 			PollInterval: cfg.Verifier.PollInterval,
 		}).WithMetrics(libVerifierMetrics)
 
@@ -62,13 +59,11 @@ func RunPhase2(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	}
 
 	// Rate-limited writer pool.
-	// Each writer goroutine picks writes off a shared channel.
 	type writeJob struct {
-		bucketID int
 		writeNum int
 	}
 
-	numWriters := numBuckets // one writer conn per bucket
+	numWriters := 4
 	jobCh := make(chan writeJob, numWriters*10)
 
 	var mu sync.Mutex
@@ -92,13 +87,12 @@ func RunPhase2(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 			wr := writer.New(conn, nil).WithMetrics(libWriterMetrics)
 
 			for job := range jobCh {
-				name := fmt.Sprintf("p2-b%d-r%d", job.bucketID, job.writeNum)
+				name := fmt.Sprintf("p2-r%d", job.writeNum)
 				req := model.WriteRequest{
 					GVK:       gvk,
 					Namespace: "phase2",
 					Name:      name,
-					BucketID:  job.bucketID,
-					Spec:      json.RawMessage(fmt.Sprintf(`{"b":%d,"n":%d}`, job.bucketID, job.writeNum)),
+					Spec:      json.RawMessage(fmt.Sprintf(`{"n":%d}`, job.writeNum)),
 					Status:    json.RawMessage(`{}`),
 					Metadata:  json.RawMessage(`{}`),
 				}
@@ -118,7 +112,7 @@ func RunPhase2(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 
 				totalWrites.Add(1)
 				writeLatency.WithLabelValues(phase2Name, gvk).Observe(lat.Seconds())
-				writesTotal.WithLabelValues(phase2Name, gvk, strconv.Itoa(job.bucketID)).Inc()
+				writesTotal.WithLabelValues(phase2Name, gvk).Inc()
 
 				mu.Lock()
 				allLatencies = append(allLatencies, lat)
@@ -164,10 +158,9 @@ loop:
 		}
 
 		interval := time.Duration(float64(time.Second) / currentRPS)
-		bucketID := (writeCounter % numBuckets) + 1
 
 		select {
-		case jobCh <- writeJob{bucketID: bucketID, writeNum: writeCounter}:
+		case jobCh <- writeJob{writeNum: writeCounter}:
 			writeCounter++
 		case <-ctx.Done():
 			break loop
@@ -189,8 +182,7 @@ loop:
 		verCancel()
 		<-verDone
 		for _, v := range ver.Violations() {
-			violations = append(violations, fmt.Sprintf("[%s] bucket=%d gvk=%s: %s",
-				v.Invariant, v.Bucket, v.GVK, v.Detail))
+			violations = append(violations, v.String())
 		}
 	}
 

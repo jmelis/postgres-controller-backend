@@ -27,17 +27,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/conversion"
 )
 
-// UnshardedBucket is the reserved bucket ID for GVKs that opt out of bucket
-// sharding. Every pod watches this bucket regardless of its BucketIDs slice.
-const UnshardedBucket = -1
-
 // Options configures a postgres-backed controller-runtime Manager.
 type Options struct {
 	Scheme                 *runtime.Scheme
 	DSN                    string
-	BucketIDs              []int
-	BucketAssigner         func(ns, name string) int
-	UnshardedGVKs          []schema.GroupVersionKind
 	Logger                 logr.Logger
 	MaxPoolConns           int32
 	MinPoolConns           int32
@@ -54,17 +47,6 @@ func NewManager(opts Options) (manager.Manager, error) {
 	}
 	if opts.DSN == "" {
 		return nil, fmt.Errorf("pgruntime: DSN is required")
-	}
-	if len(opts.BucketIDs) == 0 {
-		opts.BucketIDs = []int{0}
-	}
-	for _, id := range opts.BucketIDs {
-		if id == UnshardedBucket {
-			return nil, fmt.Errorf("pgruntime: BucketIDs must not contain %d (reserved for unsharded GVKs)", UnshardedBucket)
-		}
-	}
-	if opts.BucketAssigner == nil {
-		opts.BucketAssigner = func(_, _ string) int { return opts.BucketIDs[0] }
 	}
 	if opts.Logger.GetSink() == nil {
 		opts.Logger = logr.Discard()
@@ -89,24 +71,17 @@ func NewManager(opts Options) (manager.Manager, error) {
 	}
 	migrationConn.Release()
 
-	unshardedMap := buildUnshardedMap(opts.UnshardedGVKs)
-
 	restMapper := buildRESTMapper(opts.Scheme)
 
 	pgclient := &pgClient{
 		scheme:     opts.Scheme,
 		pool:       pool,
-		assign:     opts.BucketAssigner,
-		bucketIDs:  opts.BucketIDs,
-		unsharded:  unshardedMap,
 		restMapper: restMapper,
 	}
 
 	pgcache := &pgCache{
 		scheme:     opts.Scheme,
 		pool:       pool,
-		bucketIDs:  opts.BucketIDs,
-		unsharded:  unshardedMap,
 		restMapper: restMapper,
 		logger:     opts.Logger.WithName("cache"),
 		informers:  make(map[schema.GroupVersionKind]*pgInformer),
@@ -290,14 +265,6 @@ func (m *pgManager) GetConverterRegistry() conversion.Registry {
 	return conversion.NewRegistry()
 }
 
-func buildUnshardedMap(gvks []schema.GroupVersionKind) map[schema.GroupVersionKind]bool {
-	m := make(map[schema.GroupVersionKind]bool, len(gvks))
-	for _, gvk := range gvks {
-		m[gvk] = true
-	}
-	return m
-}
-
 func buildRESTMapper(s *runtime.Scheme) meta.RESTMapper {
 	mapper := meta.NewDefaultRESTMapper(s.PrioritizedVersionsAllGroups())
 	for gvk := range s.AllKnownTypes() {
@@ -333,6 +300,10 @@ func createPool(ctx context.Context, opts Options) (*pgxpool.Pool, error) {
 	if opts.MinPoolConns > 0 {
 		config.MinConns = opts.MinPoolConns
 	}
+	if config.ConnConfig.RuntimeParams == nil {
+		config.ConnConfig.RuntimeParams = make(map[string]string)
+	}
+	config.ConnConfig.RuntimeParams["statement_timeout"] = "30000"
 	if opts.SlowQueryThreshold > 0 {
 		logger := opts.SlowQueryLogger
 		if logger == nil {
@@ -354,17 +325,6 @@ func NewClient(opts Options) (client.Client, func(), error) {
 	if opts.DSN == "" {
 		return nil, nil, fmt.Errorf("pgruntime: DSN is required")
 	}
-	if len(opts.BucketIDs) == 0 {
-		opts.BucketIDs = []int{0}
-	}
-	for _, id := range opts.BucketIDs {
-		if id == UnshardedBucket {
-			return nil, nil, fmt.Errorf("pgruntime: BucketIDs must not contain %d (reserved for unsharded GVKs)", UnshardedBucket)
-		}
-	}
-	if opts.BucketAssigner == nil {
-		opts.BucketAssigner = func(_, _ string) int { return opts.BucketIDs[0] }
-	}
 
 	ctx := context.Background()
 
@@ -385,14 +345,9 @@ func NewClient(opts Options) (client.Client, func(), error) {
 	}
 	migrationConn.Release()
 
-	unshardedMap := buildUnshardedMap(opts.UnshardedGVKs)
-
 	c := &pgClient{
 		scheme:     opts.Scheme,
 		pool:       pool,
-		assign:     opts.BucketAssigner,
-		bucketIDs:  opts.BucketIDs,
-		unsharded:  unshardedMap,
 		restMapper: buildRESTMapper(opts.Scheme),
 	}
 

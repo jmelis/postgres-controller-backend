@@ -22,10 +22,9 @@ func setupWriter(t *testing.T, db *testinfra.TestDB) *writer.Writer {
 
 func makeReq() model.WriteRequest {
 	return model.WriteRequest{
-		GVK:       "apps/v1/Deployment",
+		GVK:      "apps/v1/Deployment",
 		Namespace: "default",
 		Name:      "nginx",
-		BucketID:  1,
 		Spec:      json.RawMessage(`{"replicas":3}`),
 		Status:    json.RawMessage(`{}`),
 		Metadata:  json.RawMessage(`{}`),
@@ -43,7 +42,7 @@ func TestCreateResource(t *testing.T) {
 
 	result, err := w.Write(ctx, makeReq())
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), result.Seq)
+	assert.Greater(t, result.Txid, uint64(0))
 	assert.Equal(t, int64(1), result.ObjectVersion)
 	assert.NotEmpty(t, result.UID)
 }
@@ -65,7 +64,7 @@ func TestUpdateResource(t *testing.T) {
 	req.ExpectedVersion = result1.ObjectVersion
 	result2, err := w.Write(ctx, req)
 	require.NoError(t, err)
-	assert.Equal(t, int64(2), result2.Seq)
+	assert.Greater(t, result2.Txid, result1.Txid)
 	assert.Equal(t, int64(2), result2.ObjectVersion)
 	assert.Equal(t, result1.UID, result2.UID)
 }
@@ -83,7 +82,7 @@ func TestConflictReturns409(t *testing.T) {
 	_, err := w.Write(ctx, req)
 	require.NoError(t, err)
 
-	// Different content + stale version → 409 (suppression does not apply
+	// Different content + stale version -> 409 (suppression does not apply
 	// because content differs).
 	req.Spec = json.RawMessage(`{"replicas":99}`)
 	req.ExpectedVersion = 999
@@ -103,22 +102,22 @@ func TestWriteStatus_UpdatesOnlyStatus(t *testing.T) {
 	w := setupWriter(t, db)
 	createReq := model.WriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "status-test",
-		BucketID: 1, Spec: json.RawMessage(`{"replicas":3}`),
+		Spec: json.RawMessage(`{"replicas":3}`),
 		Status: json.RawMessage(`{"ready":false}`), Metadata: json.RawMessage(`{}`),
 	}
 	createResult, err := w.Write(ctx, createReq)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), createResult.Seq)
+	assert.Greater(t, createResult.Txid, uint64(0))
 
 	// Update status via WriteStatus
 	statusReq := model.StatusWriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "status-test",
-		BucketID: 1, Status: json.RawMessage(`{"ready":true,"replicas":3}`),
+		Status: json.RawMessage(`{"ready":true,"replicas":3}`),
 		ExpectedVersion: createResult.ObjectVersion,
 	}
 	statusResult, err := w.WriteStatus(ctx, statusReq)
 	require.NoError(t, err)
-	assert.Equal(t, int64(2), statusResult.Seq)
+	assert.Greater(t, statusResult.Txid, createResult.Txid)
 	assert.Equal(t, int64(2), statusResult.ObjectVersion)
 	assert.Equal(t, createResult.UID, statusResult.UID)
 
@@ -149,14 +148,14 @@ func TestWriteStatus_Conflict(t *testing.T) {
 	// WriteStatus with stale version
 	statusReq := model.StatusWriteRequest{
 		GVK: "apps/v1/Deployment", Namespace: "default", Name: "nginx",
-		BucketID: 1, Status: json.RawMessage(`{"ready":true}`),
+		Status: json.RawMessage(`{"ready":true}`),
 		ExpectedVersion: 999,
 	}
 	_, err = w.WriteStatus(ctx, statusReq)
 	assert.ErrorIs(t, err, writer.ErrConflict)
 }
 
-func TestSequentialWritesAreContiguous(t *testing.T) {
+func TestSequentialWritesMonotonicallyIncrease(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires postgres")
 	}
@@ -165,12 +164,14 @@ func TestSequentialWritesAreContiguous(t *testing.T) {
 	w := setupWriter(t, db)
 	ctx := context.Background()
 
+	var prevTxid uint64
 	for i := 0; i < 10; i++ {
 		req := makeReq()
 		req.Name = fmt.Sprintf("resource-%d", i)
 		result, err := w.Write(ctx, req)
 		require.NoError(t, err)
-		assert.Equal(t, int64(i+1), result.Seq)
+		assert.Greater(t, result.Txid, prevTxid)
+		prevTxid = result.Txid
 	}
 }
 
@@ -183,7 +184,7 @@ func TestCreateRevivesTombstone(t *testing.T) {
 	w := setupWriter(t, db)
 	ctx := context.Background()
 
-	// Create → tombstone → re-create with same name
+	// Create -> tombstone -> re-create with same name
 	req := makeReq()
 	result1, err := w.Write(ctx, req)
 	require.NoError(t, err)

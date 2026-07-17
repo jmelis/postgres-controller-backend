@@ -1,19 +1,32 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// DoorbellChannel returns the LISTEN/NOTIFY channel name for a GVK.
+// PostgreSQL limits identifiers to 63 bytes, so we hash long GVK strings.
+func DoorbellChannel(gvk string) string {
+	raw := fmt.Sprintf("resource_changes_%s", gvk)
+	if len(raw) <= 63 {
+		return raw
+	}
+	h := sha256.Sum256([]byte(gvk))
+	return fmt.Sprintf("rc_%s", hex.EncodeToString(h[:12]))
+}
 
 type Resource struct {
 	GVK               string
 	Namespace         string
 	Name              string
 	UID               uuid.UUID
-	BucketID          int
-	GVKBucketSeq      int64
+	TxidStamp         uint64
 	ObjectVersion     int64
 	Spec              json.RawMessage
 	Status            json.RawMessage
@@ -27,7 +40,6 @@ type WriteRequest struct {
 	GVK               string
 	Namespace         string
 	Name              string
-	BucketID          int
 	Spec              json.RawMessage
 	Status            json.RawMessage
 	Metadata          json.RawMessage
@@ -40,7 +52,6 @@ type StatusWriteRequest struct {
 	GVK             string
 	Namespace       string
 	Name            string
-	BucketID        int
 	Status          json.RawMessage
 	ExpectedVersion int64
 	ForceWrite      bool // skip no-op suppression; default false = suppress content-equal writes
@@ -50,7 +61,6 @@ type ObjectWriteRequest struct {
 	GVK               string
 	Namespace         string
 	Name              string
-	BucketID          int
 	Spec              json.RawMessage
 	Metadata          json.RawMessage
 	DeletionTimestamp *time.Time
@@ -59,7 +69,7 @@ type ObjectWriteRequest struct {
 }
 
 type WriteResult struct {
-	Seq           int64
+	Txid          uint64
 	ObjectVersion int64
 	UID           uuid.UUID
 	Changed       bool // false when suppressed (content-equal write)

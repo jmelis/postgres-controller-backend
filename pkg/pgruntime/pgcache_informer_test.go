@@ -6,15 +6,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/jmelis/postgres-controller-backend/internal/resourceversion"
-	"github.com/jmelis/postgres-controller-backend/pkg/pgruntime"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	toolscache "k8s.io/client-go/tools/cache"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -117,32 +114,6 @@ func startCacheAndClient(t *testing.T) (cache.Cache, client.Client, context.Cont
 
 	t.Cleanup(func() { cancel() })
 	return ch, c, ctx, cancel
-}
-
-func newMultiBucketManager(t *testing.T, bucketIDs []int) ctrl.Manager {
-	t.Helper()
-	conn := sharedDB.Connect(t)
-	sharedDB.TruncateAll(t, conn)
-	conn.Close(context.Background())
-
-	mgr, err := pgruntime.NewManager(pgruntime.Options{
-		Scheme:    testScheme,
-		DSN:       sharedDB.ConnStr,
-		BucketIDs: bucketIDs,
-		BucketAssigner: func(_, name string) int {
-			h := 0
-			for _, c := range name {
-				h = h*31 + int(c)
-			}
-			if h < 0 {
-				h = -h
-			}
-			return bucketIDs[h%len(bucketIDs)]
-		},
-		Logger: logr.Discard(),
-	})
-	require.NoError(t, err)
-	return mgr
 }
 
 func createWidget(t *testing.T, c client.Client, ctx context.Context, name, color string) {
@@ -503,68 +474,6 @@ func TestInformer_StatusUpdateFromEventObject(t *testing.T) {
 	upd := rec.waitForType(t, "update", 10*time.Second)
 	assert.Equal(t, "Running", upd.Obj.(*Widget).Status.Phase)
 	assert.Equal(t, "red", upd.Obj.(*Widget).Spec.Color, "spec must not be clobbered by status update")
-}
-
-// Informer watches multiple buckets and delivers events from all of them.
-func TestInformer_MultiBucket(t *testing.T) {
-	if testing.Short() {
-		t.Skip("requires postgres")
-	}
-
-	bucketIDs := []int{0, 1, 2}
-	mgr := newMultiBucketManager(t, bucketIDs)
-	c := mgr.GetClient()
-	ch := mgr.GetCache()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	inf, err := ch.GetInformer(ctx, &Widget{})
-	require.NoError(t, err)
-
-	rec := newEventRecorder(20)
-	_, err = inf.AddEventHandler(rec)
-	require.NoError(t, err)
-
-	go func() {
-		if err := mgr.Start(ctx); err != nil {
-			t.Logf("manager exited: %v", err)
-		}
-	}()
-
-	require.Eventually(t, func() bool {
-		return ch.WaitForCacheSync(ctx)
-	}, 10*time.Second, 100*time.Millisecond, "cache never synced")
-
-	// Create widgets that will land in different buckets (name hash mod 3).
-	// The exact bucket assignment isn't important — what matters is that
-	// events arrive for objects in all buckets.
-	names := []string{"alpha", "beta", "gamma", "delta", "epsilon"}
-	for _, name := range names {
-		createWidget(t, c, ctx, name, "multi")
-	}
-
-	events := rec.waitFor(t, len(names), 15*time.Second)
-	seen := map[string]bool{}
-	for _, ev := range events {
-		seen[ev.Obj.GetName()] = true
-		rv := ev.Obj.GetResourceVersion()
-		_, parseErr := resourceversion.Parse(rv)
-		require.NoError(t, parseErr,
-			"event RV %q for %s must be a valid composite RV", rv, ev.Obj.GetName())
-	}
-	for _, name := range names {
-		assert.True(t, seen[name], "expected event for widget %q", name)
-	}
-
-	// Update one widget and verify delivery continues.
-	w := &Widget{}
-	require.NoError(t, c.Get(ctx, client.ObjectKey{Namespace: "default", Name: names[0]}, w))
-	w.Spec.Color = "updated"
-	require.NoError(t, c.Update(ctx, w))
-
-	upd := rec.waitForType(t, "update", 10*time.Second)
-	assert.Equal(t, names[0], upd.Obj.GetName())
 }
 
 // All watch event RVs are composite so the Reflector can reconnect with them.

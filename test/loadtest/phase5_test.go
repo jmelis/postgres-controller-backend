@@ -27,7 +27,7 @@ type pollTiming struct {
 }
 
 // Phase 5 — Poll cost & delivery latency (DESIGN.md §7).
-// 4 buckets, 2000 seeded resources, 10 watchers.
+// 2000 seeded resources, 10 watchers.
 // Criteria:
 //   - Poll-cycle p99 ≤ 50ms (strict mode)
 //   - Healthy-doorbell write→delivery p99 ≤ 500ms (strict mode)
@@ -43,7 +43,6 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 	defer cancel()
 
 	const (
-		numBuckets     = 4
 		numSeed        = 2000
 		numWatchers    = 10
 		idleDuration   = 10 * time.Second
@@ -52,15 +51,13 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 		baselineForAll = 500 * time.Millisecond
 	)
 
-	// Seed 2000 resources across buckets
+	// Seed 2000 resources
 	seedConn := manualConn(t)
 	seedWriter := writer.New(seedConn, nil)
 	for i := range numSeed {
-		bucketID := (i % numBuckets) + 1
 		req := model.WriteRequest{
 			GVK: gvk, Namespace: "phase5-seed",
 			Name:     fmt.Sprintf("seed-%d", i),
-			BucketID: bucketID,
 			Spec:     json.RawMessage(`{"seed":true}`),
 			Status:   json.RawMessage(`{}`),
 			Metadata: json.RawMessage(`{}`),
@@ -69,14 +66,14 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 		require.NoError(t, err)
 	}
 	seedConn.Close(context.Background())
-	t.Logf("seeded %d resources across %d buckets", numSeed, numBuckets)
+	t.Logf("seeded %d resources", numSeed)
 
-	// Get current HWMs from a quick watcher start
+	// Get current HWM from a quick watcher start
 	probeConn := manualConn(t)
-	startRV := resourceversion.RV{Buckets: make(map[int]int64)}
 	probeWatcher := reader.NewWatcher(probeConn, nil, reader.WatcherConfig{
-		GVK: gvk, BucketIDs: bucketIDs(numBuckets),
-		StartRV: startRV, BaselineInterval: 100 * time.Millisecond,
+		GVK:              gvk,
+		StartRV:          resourceversion.RV{},
+		BaselineInterval: 100 * time.Millisecond,
 	}, nil)
 	probeCtx, probeCancel := context.WithCancel(ctx)
 	probeDone := make(chan error, 1)
@@ -120,8 +117,8 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 
 		hooks := &phase5TimingHooks{timing: timing}
 		w := reader.NewWatcher(pc, nil, reader.WatcherConfig{
-			GVK: gvk, BucketIDs: bucketIDs(numBuckets),
-			StartRV: resourceversion.RV{Buckets: copyHWM(seedHWM)},
+			GVK:              gvk,
+			StartRV:          resourceversion.RV{Watermark: seedHWM},
 			BaselineInterval: baselineForAll,
 		}, hooks)
 		idleWatchers[i] = w
@@ -172,7 +169,7 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 	verifyConn := manualConn(t)
 	canaryConn := freshConn(t)
 	ver := verifier.New(verifyConn, canaryConn, verifier.Config{
-		GVK: gvk, BucketIDs: bucketIDs(numBuckets),
+		GVK:            gvk,
 		PollInterval:   200 * time.Millisecond,
 		CanaryInterval: 500 * time.Millisecond,
 	})
@@ -201,8 +198,8 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 		dbPollConns[i] = pc
 		dbListenConns[i] = lc
 		w := reader.NewWatcher(pc, lc, reader.WatcherConfig{
-			GVK: gvk, BucketIDs: bucketIDs(numBuckets),
-			StartRV: resourceversion.RV{Buckets: copyHWM(seedHWM)},
+			GVK:              gvk,
+			StartRV:          resourceversion.RV{Watermark: seedHWM},
 			BaselineInterval: 10 * time.Second,
 			DebounceFloor:    50 * time.Millisecond,
 		}, nil)
@@ -254,11 +251,9 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 	writeConn := manualConn(t)
 	wr := writer.New(writeConn, nil)
 	for i := range writeCount {
-		bucketID := (i % numBuckets) + 1
 		name := fmt.Sprintf("phase5-db-%d", i)
 		req := model.WriteRequest{
 			GVK: gvk, Namespace: "phase5-db", Name: name,
-			BucketID: bucketID,
 			Spec:     json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
 			Status:   json.RawMessage(`{}`),
 			Metadata: json.RawMessage(`{}`),
@@ -312,12 +307,10 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 	const lossBaseline = 1 * time.Second
 
 	// Get current HWM after phase B writes
-	phaseC_HWM := make(map[int]int64)
+	var phaseC_HWM uint64
 	for _, w := range dbWatchers {
-		for k, v := range w.HWM() {
-			if v > phaseC_HWM[k] {
-				phaseC_HWM[k] = v
-			}
+		if hwm := w.HWM(); hwm > phaseC_HWM {
+			phaseC_HWM = hwm
 		}
 	}
 
@@ -333,8 +326,8 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 		pc := manualConn(t)
 		lossConns[i] = pc
 		w := reader.NewWatcher(pc, nil, reader.WatcherConfig{
-			GVK: gvk, BucketIDs: bucketIDs(numBuckets),
-			StartRV: resourceversion.RV{Buckets: copyHWM(phaseC_HWM)},
+			GVK:              gvk,
+			StartRV:          resourceversion.RV{Watermark: phaseC_HWM},
 			BaselineInterval: lossBaseline,
 		}, nil)
 		lossWatchers[i] = w
@@ -386,11 +379,9 @@ func TestPhase5_PollCostAndDeliveryLatency(t *testing.T) {
 	lossWriteConn := manualConn(t)
 	lossWr := writer.New(lossWriteConn, nil)
 	for i := range writeCount {
-		bucketID := (i % numBuckets) + 1
 		name := fmt.Sprintf("phase5-loss-%d", i)
 		req := model.WriteRequest{
 			GVK: gvk, Namespace: "phase5-loss", Name: name,
-			BucketID: bucketID,
 			Spec:     json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
 			Status:   json.RawMessage(`{}`),
 			Metadata: json.RawMessage(`{}`),
@@ -468,20 +459,3 @@ func (h *phase5TimingHooks) AfterPoll(_ []reader.Event) {
 	h.timing.durations = append(h.timing.durations, dur)
 	h.timing.mu.Unlock()
 }
-
-func bucketIDs(n int) []int {
-	ids := make([]int, n)
-	for i := range n {
-		ids[i] = i + 1
-	}
-	return ids
-}
-
-func copyHWM(src map[int]int64) map[int]int64 {
-	dst := make(map[int]int64, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}
-

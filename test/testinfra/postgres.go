@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -20,6 +21,21 @@ type TestDB struct {
 
 func StartPostgres(t testing.TB) *TestDB {
 	t.Helper()
+
+	if dsn := os.Getenv("PGCTL_DSN"); dsn != "" {
+		waitForPostgres(t, dsn)
+		ctx := context.Background()
+		conn, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			t.Fatalf("connect to external DB: %v", err)
+		}
+		if err := schema.Migrate(ctx, conn); err != nil {
+			conn.Close(ctx)
+			t.Fatalf("migrate external DB: %v", err)
+		}
+		conn.Close(ctx)
+		return &TestDB{ConnStr: dsn}
+	}
 
 	port := freePort(t)
 	container := fmt.Sprintf("pgctl-test-%d", port)
@@ -76,7 +92,6 @@ func (db *TestDB) TruncateAll(t testing.TB, conn *pgx.Conn) {
 	t.Helper()
 	tables := []string{
 		"kubernetes_resources",
-		"gvk_bucket_counters",
 		"compaction_horizon",
 	}
 	ctx := context.Background()
@@ -126,7 +141,26 @@ func waitForPostgres(t testing.TB, connStr string) {
 
 // StartPostgresForTestMain is for use in TestMain where testing.TB is not available.
 // The caller must call Stop() when done.
+//
+// If PGCTL_DSN is set, connects to that external database instead of starting
+// a Podman container. This allows running tests against Aurora or any remote
+// Postgres instance.
 func StartPostgresForTestMain() *TestDB {
+	if dsn := os.Getenv("PGCTL_DSN"); dsn != "" {
+		waitForPostgresNoT(dsn)
+		ctx := context.Background()
+		conn, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			panic(fmt.Sprintf("connect to external DB: %v", err))
+		}
+		if err := schema.Migrate(ctx, conn); err != nil {
+			conn.Close(ctx)
+			panic(fmt.Sprintf("migrate external DB: %v", err))
+		}
+		conn.Close(ctx)
+		return &TestDB{ConnStr: dsn}
+	}
+
 	port := freePortNoT()
 	container := fmt.Sprintf("pgctl-test-%d", port)
 

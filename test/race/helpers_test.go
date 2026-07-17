@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jmelis/postgres-controller-backend/internal/doorbell"
 	"github.com/jmelis/postgres-controller-backend/internal/model"
 	"github.com/jmelis/postgres-controller-backend/internal/writer"
 	"github.com/jmelis/postgres-controller-backend/test/testinfra"
@@ -33,12 +35,11 @@ func truncateAll(t *testing.T) {
 	conn.Close(context.Background())
 }
 
-func makeWriteReq(gvk, ns, name string, bucketID int) model.WriteRequest {
+func makeWriteReq(gvk, ns, name string) model.WriteRequest {
 	return model.WriteRequest{
 		GVK:       gvk,
 		Namespace: ns,
 		Name:      name,
-		BucketID:  bucketID,
 		Spec:      json.RawMessage(`{"replicas":1}`),
 		Status:    json.RawMessage(`{}`),
 		Metadata:  json.RawMessage(`{}`),
@@ -47,7 +48,10 @@ func makeWriteReq(gvk, ns, name string, bucketID int) model.WriteRequest {
 
 func newWriter(t *testing.T, hooks writer.TxHooks) *writer.Writer {
 	t.Helper()
-	return writer.New(freshConn(t), hooks)
+	dbConn := freshConn(t)
+	db := doorbell.NewDebouncer(dbConn, 50*time.Millisecond)
+	t.Cleanup(func() { db.Close() })
+	return writer.New(freshConn(t), hooks).WithDoorbell(db)
 }
 
 // blockingHook implements TxHooks to pause at BeforeCommit.
@@ -63,8 +67,8 @@ func newBlockingHook() *blockingHook {
 	}
 }
 
-func (h *blockingHook) AfterSuppressionCheck(_ context.Context, _ pgx.Tx, _ bool) error { return nil }
-func (h *blockingHook) AfterCounter(_ context.Context, _ pgx.Tx, _ int64) error         { return nil }
+func (h *blockingHook) AfterSuppressionCheck(_ context.Context, _ pgx.Tx, _ bool) error   { return nil }
+func (h *blockingHook) AfterTxidAcquire(_ context.Context, _ pgx.Tx, _ uint64) error      { return nil }
 
 func (h *blockingHook) BeforeCommit(ctx context.Context, _ pgx.Tx) error {
 	close(h.ready)

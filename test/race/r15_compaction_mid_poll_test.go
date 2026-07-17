@@ -15,7 +15,7 @@ import (
 
 // R15 — Compaction mid-poll (B3: I6 direct violation).
 //
-// pollBucket checks the compaction horizon and then queries rows in two separate
+// The poll cycle checks the compaction horizon and then queries rows in two separate
 // statements with no shared snapshot. A compactor committing between them deletes
 // tombstones that the watcher's hwm says it should have seen — the watcher
 // silently skips Deleted events and never receives 410.
@@ -37,7 +37,7 @@ func TestR15_CompactionMidPoll(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		past := time.Now().Add(-48 * time.Hour)
 		req := makeWriteReq("apps/v1/Deployment", "default",
-			fmt.Sprintf("r15-victim-%d", i), 1)
+			fmt.Sprintf("r15-victim-%d", i))
 		req.DeletionTimestamp = &past
 		_, err := wr.Write(ctx, req)
 		if err != nil {
@@ -45,16 +45,16 @@ func TestR15_CompactionMidPoll(t *testing.T) {
 		}
 	}
 
-	// Write 1 live resource at seq=4
+	// Write 1 live resource
 	_, err := wr.Write(ctx, makeWriteReq("apps/v1/Deployment", "default",
-		"r15-survivor", 1))
+		"r15-survivor"))
 	if err != nil {
 		t.Fatalf("setup survivor: %v", err)
 	}
 
 	// Hook: after the horizon check (finds nothing compacted yet), run
 	// compaction on a separate connection. This deletes the 3 tombstones and
-	// advances the horizon to seq=3. The subsequent row query (on the same
+	// advances the horizon. The subsequent row query (on the same
 	// conn, no transaction) sees the post-compaction state.
 	compacted := make(chan struct{})
 	hook := &compactionMidPollHook{
@@ -66,8 +66,7 @@ func TestR15_CompactionMidPoll(t *testing.T) {
 	pollConn := connectManualShared(t)
 	w := reader.NewWatcher(pollConn, nil, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
-		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Watermark: 0},
 		BaselineInterval: 300 * time.Millisecond,
 	}, hook)
 
@@ -140,7 +139,7 @@ type compactionMidPollHook struct {
 func (h *compactionMidPollHook) BeforePoll()                {}
 func (h *compactionMidPollHook) AfterPoll(_ []reader.Event) {}
 
-func (h *compactionMidPollHook) AfterHorizonCheck(bucketID int) {
+func (h *compactionMidPollHook) AfterHorizonCheck() {
 	h.once.Do(func() {
 		conn := freshConn(h.t)
 		defer conn.Close(context.Background())

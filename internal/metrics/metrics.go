@@ -7,8 +7,9 @@ type WriterMetrics struct {
 	WriteDuration         *prometheus.HistogramVec
 	WriteStepDuration     *prometheus.HistogramVec
 	WritesTotal           *prometheus.CounterVec
-	NoopSuppressionsTotal prometheus.Counter
-	DoorbellErrorsTotal   prometheus.Counter
+	NoopSuppressionsTotal  prometheus.Counter
+	DoorbellErrorsTotal    prometheus.Counter
+	StatementTimeoutsTotal prometheus.Counter
 }
 
 func NewWriterMetrics(reg prometheus.Registerer) *WriterMetrics {
@@ -21,8 +22,8 @@ func NewWriterMetrics(reg prometheus.Registerer) *WriterMetrics {
 			Subsystem: "writer",
 			Name:      "write_duration_seconds",
 			Help:      "Duration of write operations.",
-			Buckets:   []float64{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0},
-		}, []string{"gvk", "bucket_id", "result"}),
+			Buckets:   []float64{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0, 30.0},
+		}, []string{"gvk", "result"}),
 		WriteStepDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: "pgctl",
 			Subsystem: "writer",
@@ -35,7 +36,7 @@ func NewWriterMetrics(reg prometheus.Registerer) *WriterMetrics {
 			Subsystem: "writer",
 			Name:      "writes_total",
 			Help:      "Total number of write operations.",
-		}, []string{"gvk", "bucket_id", "result"}),
+		}, []string{"gvk", "result"}),
 		NoopSuppressionsTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "pgctl",
 			Subsystem: "writer",
@@ -48,8 +49,14 @@ func NewWriterMetrics(reg prometheus.Registerer) *WriterMetrics {
 			Name:      "doorbell_errors_total",
 			Help:      "Failed pg_notify doorbell sends (fire-and-forget, non-fatal).",
 		}),
+		StatementTimeoutsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: "pgctl",
+			Subsystem: "writer",
+			Name:      "statement_timeouts_total",
+			Help:      "Write transactions killed by statement_timeout — a stuck transaction pins xmin and freezes watcher HWM.",
+		}),
 	}
-	reg.MustRegister(m.WriteDuration, m.WriteStepDuration, m.WritesTotal, m.NoopSuppressionsTotal, m.DoorbellErrorsTotal)
+	reg.MustRegister(m.WriteDuration, m.WriteStepDuration, m.WritesTotal, m.NoopSuppressionsTotal, m.DoorbellErrorsTotal, m.StatementTimeoutsTotal)
 	return m
 }
 
@@ -157,4 +164,3 @@ func NewVerifierMetrics(reg prometheus.Registerer) *VerifierMetrics {
 	reg.MustRegister(m.CanaryDelivery, m.ViolationsTotal, m.EventsCheckedTotal)
 	return m
 }
-

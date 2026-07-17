@@ -26,8 +26,7 @@ func TestR3_DoorbellLoss(t *testing.T) {
 	pollConn := connectManualShared(t)
 	w := reader.NewWatcher(pollConn, nil, reader.WatcherConfig{
 		GVK:              "apps/v1/Deployment",
-		BucketIDs:        []int{1},
-		StartRV:          resourceversion.RV{Buckets: map[int]int64{1: 0}},
+		StartRV:          resourceversion.RV{Watermark: 0},
 		BaselineInterval: 300 * time.Millisecond,
 	}, nil)
 
@@ -46,7 +45,7 @@ func TestR3_DoorbellLoss(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		wr := newWriter(t, nil)
 		req := makeWriteReq("apps/v1/Deployment", "default",
-			fmt.Sprintf("doorbell-loss-%d", i), 1)
+			fmt.Sprintf("doorbell-loss-%d", i))
 		_, err := wr.Write(ctx, req)
 		require.NoError(t, err)
 	}
@@ -65,9 +64,9 @@ func TestR3_DoorbellLoss(t *testing.T) {
 
 	assert.Len(t, events, 5)
 	// Verify no duplicates
-	seqs := make(map[int64]bool)
+	txids := make(map[uint64]bool)
 	for _, ev := range events {
-		assert.False(t, seqs[ev.Resource.GVKBucketSeq], "duplicate seq %d", ev.Resource.GVKBucketSeq)
-		seqs[ev.Resource.GVKBucketSeq] = true
+		assert.False(t, txids[ev.Resource.TxidStamp], "duplicate txid %d", ev.Resource.TxidStamp)
+		txids[ev.Resource.TxidStamp] = true
 	}
 }

@@ -35,7 +35,6 @@ func TestMigrateCreatesAllTables(t *testing.T) {
 	sort.Strings(tables)
 	expected := []string{
 		"compaction_horizon",
-		"gvk_bucket_counters",
 		"kubernetes_resources",
 	}
 	assert.Equal(t, expected, tables)
