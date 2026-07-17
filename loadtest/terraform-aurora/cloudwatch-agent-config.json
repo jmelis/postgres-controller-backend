@@ -1,0 +1,26 @@
+{
+  "logs": {
+    "metrics_collected": {
+      "prometheus": {
+        "log_group_name": "pgctl-loadtest",
+        "prometheus_config_path": "/opt/loadtest/prometheus.yaml",
+        "emf_processor": {
+          "metric_namespace": "pgctl-loadtest",
+          "metric_declaration": [
+            {
+              "source_labels": ["job"],
+              "label_matcher": ".*",
+              "dimensions": [["phase"], ["phase", "gvk"], ["phase", "error_type"]],
+              "metric_selectors": [
+                "^pgctl_writer_",
+                "^pgctl_watcher_",
+                "^pgctl_verifier_",
+                "^loadtest_"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -17,6 +17,10 @@ loadtest/terraform/.terraform/
 loadtest/terraform/.terraform.lock.hcl
 loadtest/terraform/terraform.tfvars
 loadtest/terraform/terraform.tfstate*
+loadtest/terraform-aurora/.terraform/
+loadtest/terraform-aurora/.terraform.lock.hcl
+loadtest/terraform-aurora/terraform.tfvars
+loadtest/terraform-aurora/terraform.tfstate*
 
 # envtest binaries
 .envtest/

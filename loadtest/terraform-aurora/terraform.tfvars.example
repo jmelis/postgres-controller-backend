@@ -1,0 +1,16 @@
+# EC2 key pair name — must already exist in the target region.
+ec2_key_name = "pgctl-loadtest"
+
+# Aurora instance class for writer and reader instances.
+# db.r6g.large (2 vCPU, 16 GB) is a reasonable starting point.
+# Scale up to db.r6g.xlarge / db.r6g.2xlarge for ceiling hunts.
+rds_instance_class = "db.r6g.large"
+
+# Number of Aurora reader instances (0 = writer only, 1 = Multi-AZ).
+# aurora_reader_count = 1
+
+# Aurora PostgreSQL engine version.
+# rds_engine_version = "16.4"
+
+# AWS region.
+# region = "us-east-1"

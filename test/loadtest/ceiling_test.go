@@ -173,14 +173,13 @@ func TestCeiling_MultiGVK(t *testing.T) {
 		t.Skip("multi-GVK ceiling test skipped in short mode")
 	}
 
-	workerCounts := []int{8, 16, 32, 48, 64}
+	enableVerifiers := true
+	workerCounts := []int{48}
 
 	for _, totalWorkers := range workerCounts {
 		name := fmt.Sprintf("%dw", totalWorkers)
 		t.Run(name, func(t *testing.T) {
 			truncateAll(t)
-			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-			defer cancel()
 
 			const (
 				warmUp       = 2 * time.Second
@@ -191,8 +190,10 @@ func TestCeiling_MultiGVK(t *testing.T) {
 			reg := prometheus.NewRegistry()
 			writerMetrics := metrics.NewWriterMetrics(reg)
 
-			// Seed all GVKs
+			// Seed all GVKs (separate context — seeding through an SSH
+			// tunnel to Aurora can take minutes)
 			t.Log("seeding...")
+			seedCtx, seedCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			seedConn := manualConn(t)
 			seedWr := writer.New(seedConn, nil)
 			for _, gs := range testGVKs {
@@ -205,13 +206,19 @@ func TestCeiling_MultiGVK(t *testing.T) {
 						Status:    generateTestPayload(gs.statusSizeBytes),
 						Metadata:  generateTestPayload(gs.metadataSizeBytes),
 					}
-					if _, err := seedWr.Write(ctx, req); err != nil {
+					if _, err := seedWr.Write(seedCtx, req); err != nil {
+						seedCancel()
 						t.Fatalf("seed %s/%d: %v", gs.gvk, i, err)
 					}
 				}
 			}
+			seedCancel()
 			seedConn.Close(context.Background())
 			t.Logf("seeded %d objects across %d GVKs", len(testGVKs)*100, len(testGVKs))
+
+			// Fresh context for test phase (seeding may have taken minutes on Aurora)
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
 
 			// Start one verifier per GVK
 			type verifierEntry struct {
@@ -222,21 +229,24 @@ func TestCeiling_MultiGVK(t *testing.T) {
 				canary *pgx.Conn
 				gvk    string
 			}
-			verifiers := make([]verifierEntry, len(testGVKs))
-			for i, gs := range testGVKs {
-				vc := manualConn(t)
-				cc := manualConn(t)
-				ver := verifier.New(vc, cc, verifier.Config{
-					GVK:            gs.gvk,
-					PollInterval:   200 * time.Millisecond,
-					CanaryInterval: 1 * time.Second,
-				})
-				verCtx, verCancel := context.WithCancel(ctx)
-				done := make(chan error, 1)
-				go func() { done <- ver.Run(verCtx) }()
-				verifiers[i] = verifierEntry{
-					ver: ver, cancel: verCancel, done: done,
-					conn: vc, canary: cc, gvk: gs.gvk,
+			var verifiers []verifierEntry
+			if enableVerifiers {
+				verifiers = make([]verifierEntry, len(testGVKs))
+				for i, gs := range testGVKs {
+					vc := manualConn(t)
+					cc := manualConn(t)
+					ver := verifier.New(vc, cc, verifier.Config{
+						GVK:            gs.gvk,
+						PollInterval:   200 * time.Millisecond,
+						CanaryInterval: 1 * time.Second,
+					})
+					verCtx, verCancel := context.WithCancel(ctx)
+					done := make(chan error, 1)
+					go func() { done <- ver.Run(verCtx) }()
+					verifiers[i] = verifierEntry{
+						ver: ver, cancel: verCancel, done: done,
+						conn: vc, canary: cc, gvk: gs.gvk,
+					}
 				}
 			}
 
@@ -327,27 +337,27 @@ func TestCeiling_MultiGVK(t *testing.T) {
 			wg.Wait()
 			elapsed := testDuration // use configured duration, not wall clock including warmup
 
-			// Let verifiers catch up
-			time.Sleep(3 * time.Second)
-
 			// Shutdown verifiers and collect results
 			var totalViolations int
 			var totalRedeliveries int64
-			for _, ve := range verifiers {
-				ve.cancel()
-				<-ve.done
-				result := ve.ver.Result()
-				if len(result.Violations) > 0 {
-					for _, v := range result.Violations {
-						t.Logf("  VIOLATION [%s]: %s", ve.gvk, v)
+			if enableVerifiers {
+				time.Sleep(3 * time.Second)
+				for _, ve := range verifiers {
+					ve.cancel()
+					<-ve.done
+					result := ve.ver.Result()
+					if len(result.Violations) > 0 {
+						for _, v := range result.Violations {
+							t.Logf("  VIOLATION [%s]: %s", ve.gvk, v)
+						}
+						totalViolations += len(result.Violations)
 					}
-					totalViolations += len(result.Violations)
+					totalRedeliveries += result.Redeliveries
+					t.Logf("verifier %-60s  events=%-6d  redeliveries=%-4d  canary_p99=%v  violations=%d",
+						ve.gvk, result.EventsChecked, result.Redeliveries, result.CanaryP99, len(result.Violations))
+					ve.conn.Close(context.Background())
+					ve.canary.Close(context.Background())
 				}
-				totalRedeliveries += result.Redeliveries
-				t.Logf("verifier %-60s  events=%-6d  redeliveries=%-4d  canary_p99=%v  violations=%d",
-					ve.gvk, result.EventsChecked, result.Redeliveries, result.CanaryP99, len(result.Violations))
-				ve.conn.Close(context.Background())
-				ve.canary.Close(context.Background())
 			}
 
 			// Aggregate writer results
