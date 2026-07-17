@@ -27,7 +27,7 @@ seed:
 phases:
   phase1_ceiling:
     enabled: true
-    workers_per_bucket: 50              # Concurrent writers
+    workers: 50                         # Concurrent writers
     duration: 30s                       # How long to run
     target_rps: 200                     # Minimum acceptable RPS (pass/fail)
     target_p99_ms: 10                   # p99 latency target (strict mode)

@@ -27,12 +27,12 @@ These features work but behave differently from standard controller-runtime agai
 | Read consistency                  | `GetClient()` reads from cache — can be seconds stale   | `GetClient()` reads from DB — always current                                                                                   |
 | No-op writes                      | May or may not bump `ResourceVersion`                   | Content-equal writes suppressed: no version bump, no event                                                                     |
 | Delete lifecycle                  | Object removed immediately after finalizers clear       | Tombstone row persists until compaction (24h default). Invisible to callers — `Get()` returns NotFound, `List()` excludes them |
-| Horizontal scaling                | Leader election (1 active replica) or external sharding | Bucket sharding built in. Max replicas = bucket count (16 recommended)                                                         |
+| Horizontal scaling                | Leader election (1 active replica) or external sharding | Multiple replicas supported; partition objects at the application layer                                                         |
 | Event delivery                    | HTTP/2 streaming watch                                  | Poll (5s baseline) with `pg_notify` doorbell (~100ms typical delivery)                                                         |
 | `GetAPIReader()` vs `GetClient()` | Different: uncached vs cached reads                     | Identical: both go to DB                                                                                                       |
 | Periodic resync                   | Informers re-list every 10h to catch missed events      | No resync — poll-based watch can't miss events within the compaction window                                                    |
 | `IndexField()`                    | Registers cache indexes used by field selectors         | No-op — accepted but ignored. `MatchingFields` queries the database directly                                                   |
-| Cluster-scoped resources          | RESTMapper marks types as cluster-scoped; empty ns      | Works with empty namespace. Combine with `UnshardedGVKs` to skip bucket sharding                                               |
+| Cluster-scoped resources          | RESTMapper marks types as cluster-scoped; empty ns      | Works with empty namespace                                                                                                     |
 
 ## What's not supported
 

@@ -24,7 +24,7 @@ phases:
 
   phase1_ceiling:
     enabled: true
-    workers_per_bucket: 1
+    workers: 1
     duration: 120s
     warm_up: 15s
     runs: 1

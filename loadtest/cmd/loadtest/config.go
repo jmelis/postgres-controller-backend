@@ -65,7 +65,7 @@ type Phase0Config struct {
 
 type Phase1Config struct {
 	Enabled          bool          `yaml:"enabled"`
-	WorkersPerBucket int           `yaml:"workers_per_bucket"`
+	Workers          int           `yaml:"workers"`
 	Duration         time.Duration `yaml:"duration"`
 	WarmUp           time.Duration `yaml:"warm_up"`
 	Runs             int           `yaml:"runs"`

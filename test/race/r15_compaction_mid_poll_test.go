@@ -15,7 +15,7 @@ import (
 
 // R15 — Compaction mid-poll (B3: I6 direct violation).
 //
-// pollBucket checks the compaction horizon and then queries rows in two separate
+// The poll cycle checks the compaction horizon and then queries rows in two separate
 // statements with no shared snapshot. A compactor committing between them deletes
 // tombstones that the watcher's hwm says it should have seen — the watcher
 // silently skips Deleted events and never receives 410.

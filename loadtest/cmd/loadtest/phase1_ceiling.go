@@ -25,7 +25,7 @@ func RunPhase1(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	pCfg := cfg.Phases.Phase1Ceiling
 
 	if len(pCfg.WorkerSweep) == 0 {
-		return runPhase1Single(ctx, dsn, cfg, pCfg.WorkersPerBucket)
+		return runPhase1Single(ctx, dsn, cfg, pCfg.Workers)
 	}
 
 	runs := pCfg.Runs

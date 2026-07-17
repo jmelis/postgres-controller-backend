@@ -8,8 +8,8 @@ This harness tests the **Go library packages** that implement Postgres-backed Ku
 
 | Package               | What it does                                                                                                                                                                                                                                                                | How the harness uses it                                                                                                                                              |
 | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `internal/writer`     | Atomic writes via `pgctl_write()` stored procedure: no-op suppression &rarr; counter increment &rarr; UPSERT, all in one server-side call. `pg_notify` doorbell fires after commit, outside the transaction. Enforces commit ordering (I1) and optimistic concurrency (I6). | Every phase creates `writer.New(conn, nil).WithMetrics(m)` instances and calls `Write()` at varying rates, concurrency, and bucket distributions.                    |
-| `internal/reader`     | Poll-primary watcher with optional doorbell (LISTEN/NOTIFY). Delivers commit-ordered event streams per (GVK, bucket) regardless of doorbell health. Single-goroutine scheduler with debounce.                                                                               | Phase 5 creates `reader.NewWatcher(...)` instances to measure idle poll cost, doorbell delivery latency, and baseline-only fallback.                                 |
+| `internal/writer`     | Atomic writes via `pgctl_write()` stored procedure: no-op suppression &rarr; UPSERT + `pg_current_xact_id()`, all in one server-side call in autocommit mode. Debounced doorbell via `doorbell.Debouncer`. Enforces commit ordering (I1) and optimistic concurrency (I6). | Every phase creates `writer.New(conn, nil).WithMetrics(m)` instances and calls `Write()` at varying rates and concurrency levels.                                    |
+| `internal/reader`     | Poll-primary watcher with optional doorbell (LISTEN/NOTIFY). Delivers commit-ordered event streams per GVK using xid8 + snapshot-xmin watermark, regardless of doorbell health. Single-goroutine scheduler with debounce.                                                   | Phase 5 creates `reader.NewWatcher(...)` instances to measure idle poll cost, doorbell delivery latency, and baseline-only fallback.                                 |
 | `internal/verifier`   | Continuous invariant checker — subscribes to the poll stream and verifies monotonic high-water marks (I2/I4), gap-vs-compaction-horizon checks (I5), and canary write-to-delivery latency.                                                                                  | Runs alongside every write phase. Any violation fails the test. Same code used in production.                                                                        |
 | `internal/compaction` | Tombstone compaction: deletes fully-deleted tombstones (deletion_timestamp set, no active finalizers) and advances the compaction horizon atomically in a single CTE (I5). Dying objects with finalizers are preserved.                                                     | Background goroutine runs `compaction.Compact()` every 5 minutes during long tests to keep table size bounded.                                                       |
 | `internal/schema`     | DDL migration — creates all tables and indexes.                                                                                                                                                                                                                             | Runs once at startup before seeding.                                                                                                                                 |
@@ -22,7 +22,7 @@ The harness validates the correctness invariants from [DESIGN.md §2](../DESIGN.
 | Invariant                              | What it guarantees                                                                                                             | How the harness tests it                                                                                                                                 |
 | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **I1 — Commit order = sequence order** | If seq(A) < seq(B), then A committed before B became visible.                                                                  | The verifier confirms monotonic high-water marks; watchers in Phase 5 verify delivery order.                                                             |
-| **I2 — No regression**                 | `current_seq` never decreases, even across failover.                                                                           | The verifier's HWM check catches any regression. Phase 6 (manual) tests this across RDS failover.                                                        |
+| **I2 — No regression**                 | The watermark (`pg_snapshot_xmin()`) never decreases, even across failover.                                                    | The verifier's watermark check catches any regression. Phase 6 (manual) tests this across RDS failover.                                                  |
 | **I3 — Exactly-once delivery**         | Watchers receive every state change exactly once (coalescing permitted), with no duplicates or losses, regardless of doorbell. | Phase 5's notify-loss drill disables the LISTEN connection; watchers must still deliver every event via poll-only fallback within the baseline interval. |
 | **I5 — Compaction safety**             | A watcher can never silently skip a compacted event.                                                                           | The compaction goroutine runs during long phases; the verifier checks that gaps are only below the compaction horizon.                                   |
 | **I6 — Optimistic concurrency**        | An update with a stale `object_version` is rejected (409).                                                                     | The writer library handles this internally; the harness measures resulting error rates.                                                                  |
@@ -44,7 +44,7 @@ Each phase targets a specific failure mode or performance boundary from [DESIGN.
 
 ### Phase 1 — Counter ceiling
 
-Saturates buckets with N concurrent writers to find the maximum writes/s before serialization failures or latency degradation. This is the fundamental capacity number that all sizing math depends on.
+Saturates with N concurrent writers to find the maximum writes/s before latency degradation. This is the fundamental capacity number that all sizing math depends on.
 
 **Library code exercised:** `writer.Write()` under maximum concurrency, `verifier.Run()`.
 
@@ -58,17 +58,17 @@ Sustains a target RPS for an extended period (hours to a week). Validates that a
 
 **Pass criteria:** sustained RPS within 5% of target, p50 below threshold, verifier silent.
 
-### Phase 2b — Hot-bucket skew
+### Phase 2b — Hot-GVK skew
 
-Zipfian distribution: one bucket gets 80% of writes while the rest are cold. Proves cold buckets don't starve.
+Zipfian distribution: one GVK gets 80% of writes while the rest are cold. Proves cold GVKs don't starve.
 
-**Library code exercised:** same as Phase 2 but with skewed bucket selection. Exposes whether the counter table's `fillfactor=50` and HOT updates work under uneven load.
+**Library code exercised:** same as Phase 2 but with skewed GVK selection.
 
-**Pass criteria:** cold-bucket p99 below configured threshold, verifier silent.
+**Pass criteria:** cold-GVK p99 below configured threshold, verifier silent.
 
 ### Phase 3 — Avalanche / kill writers
 
-Kills a fraction of writers mid-stream. New writers start and race on the same buckets. The verifier confirms the event stream remains commit-ordered across the disruption.
+Kills a fraction of writers mid-stream. New writers start and race on the same resources. The verifier confirms the event stream remains commit-ordered across the disruption.
 
 **Library code exercised:** `writer.Write()` under crash/restart churn, `verifier.Run()` across the disruption boundary.
 
@@ -99,8 +99,7 @@ Restore from snapshot, restart controller pods, verify clients relist and conver
 Before running phases, the harness populates the database with realistic data. The YAML spec controls:
 
 - **GVK types** with configurable spec/status/metadata payload sizes (e.g., 8KB spec + 12KB status for HostedCluster objects)
-- **Objects per bucket** — determines total row count and index depth
-- **Bucket count** — determines sharding fan-out
+- **Objects per GVK** — determines total row count and index depth
 
 Large JSONB payloads matter because they exercise:
 
@@ -144,13 +143,13 @@ The harness is a standalone Go binary that imports the library packages directly
 
 ## YAML-driven test specs
 
-A single YAML file controls everything: bucket count, GVK payload sizes, which phases to run, target RPS, duration, pass/fail thresholds, checkpoint interval.
+A single YAML file controls everything: GVK payload sizes, which phases to run, target RPS, duration, pass/fail thresholds, checkpoint interval.
 
-| Spec                        | Scenario                                             | Duration |
-| --------------------------- | ---------------------------------------------------- | -------- |
-| `specs/5k-baseline.yaml`    | 5,000-cluster tier — 16 buckets, Phase 1+2+5         | ~2h      |
-| `specs/50k-stress.yaml`     | 50,000-cluster tier — 64 buckets, all phases         | ~50h     |
-| `specs/ceiling-hunt.yaml`   | Max RPS discovery across bucket counts and GVK sizes | ~30min   |
+| Spec                        | Scenario                                                     | Duration |
+| --------------------------- | ------------------------------------------------------------ | -------- |
+| `specs/5k-baseline.yaml`    | 5,000-cluster tier — Phase 1+2+5                             | ~2h      |
+| `specs/50k-stress.yaml`     | 50,000-cluster tier — all phases                             | ~50h     |
+| `specs/ceiling-hunt.yaml`   | Max RPS discovery across worker counts and GVK sizes         | ~30min   |
 | `specs/custom.yaml.example` | Fully commented template                             | varies   |
 
 ## Quick start
@@ -206,15 +205,15 @@ go build -o lt ./loadtest/cmd/loadtest/
 
 ### Write path
 
-The writer uses a PL/pgSQL stored procedure (`pgctl_write`) that performs the suppression check, counter increment, and resource upsert in a single server-side call. `pg_notify` fires outside the transaction as a fire-and-forget doorbell. The full write is 2 network round-trips: BEGIN + function call, COMMIT.
+The writer uses a PL/pgSQL stored procedure (`pgctl_write`) that performs the suppression check and resource upsert (with `pg_current_xact_id()` stamp) in a single server-side call, run in autocommit mode. The debouncer handles `pg_notify` doorbells. The full write is 1 network round-trip.
 
 COMMIT dominates write latency (~61% of total time) — this is the Multi-AZ synchronous replication wait. The WAL sync round-trip is the throughput bottleneck, not CPU.
 
 ### Throughput ceiling (sync commit, Multi-AZ)
 
-Measured with the `ceiling-hunt` spec: 1 worker per bucket, 120s duration, 15s warm-up.
+Measured with the `ceiling-hunt` spec: 120s duration, 15s warm-up.
 
-| Buckets | large (2 vCPU) | xlarge (4 vCPU) | 2xlarge (8 vCPU) | 8xlarge (32 vCPU) |
+| Workers | large (2 vCPU) | xlarge (4 vCPU) | 2xlarge (8 vCPU) | 8xlarge (32 vCPU) |
 | ------- | -------------- | --------------- | ---------------- | ----------------- |
 | 64      | 2,852 w/s      | 5,770 w/s       | 9,622 w/s        | 11,728 w/s        |
 | 32      | 2,745          | 5,224           | 6,663            | 6,815             |
@@ -223,11 +222,11 @@ Measured with the `ceiling-hunt` spec: 1 worker per bucket, 120s duration, 15s w
 | 4       | 931            | 931             | 1,068            | 974               |
 | 1       | 339            | 292             | 317              | 306               |
 
-p99 latency at 64 buckets: large 68.5ms, xlarge 23.4ms, 2xlarge 13.2ms, 8xlarge 7.7ms.
+p99 latency at 64 workers: large 68.5ms, xlarge 23.4ms, 2xlarge 13.2ms, 8xlarge 7.7ms.
 
 **db.m6g.2xlarge (8 vCPU)**
 
-| Buckets | w/s   | p50   | p99    | p999    |
+| Workers | w/s   | p50   | p99    | p999    |
 | ------- | ----- | ----- | ------ | ------- |
 | 64      | 9,622 | 6.1ms | 13.2ms | 212.9ms |
 | 32      | 6,663 | 4.4ms | 7.3ms  | 24.8ms  |
@@ -238,7 +237,7 @@ p99 latency at 64 buckets: large 68.5ms, xlarge 23.4ms, 2xlarge 13.2ms, 8xlarge 
 
 **db.m6g.8xlarge (32 vCPU)**
 
-| Buckets | w/s    | p50   | p99   | p999   |
+| Workers | w/s    | p50   | p99   | p999   |
 | ------- | ------ | ----- | ----- | ------ |
 | 64      | 11,728 | 5.0ms | 7.7ms | 58.9ms |
 | 32      | 6,815  | 4.5ms | 6.1ms | 17.4ms |
@@ -249,16 +248,16 @@ p99 latency at 64 buckets: large 68.5ms, xlarge 23.4ms, 2xlarge 13.2ms, 8xlarge 
 
 ### Scaling characteristics
 
-- **Near-linear with bucket count** up to the instance's CPU ceiling. Single-bucket baseline is ~300 w/s regardless of instance class (WAL sync limited).
+- **Near-linear with worker count** up to the instance's CPU ceiling. Single-worker baseline is ~300 w/s regardless of instance class (WAL sync limited).
 - **CPU-bound at high parallelism.** The large (2 vCPU) saturates at ~2,850 w/s with spiking latencies. The xlarge (4 vCPU) saturates at ~5,800 w/s. The 2xlarge and 8xlarge both plateau around 10-12k w/s — at that point the bottleneck shifts from CPU to WAL sync latency.
-- **Diminishing returns past 2xlarge.** The 8xlarge (4x cost vs 2xlarge) adds only 22% at 64 buckets. At 32 and below, it's identical or slightly worse.
-- **At 8 buckets and below, all instances converge.** The write path is WAL-sync-bound, not CPU-bound, at low parallelism.
+- **Diminishing returns past 2xlarge.** The 8xlarge (4x cost vs 2xlarge) adds only 22% at 64 workers. At 32 and below, it's identical or slightly worse.
+- **At 8 workers and below, all instances converge.** The write path is WAL-sync-bound, not CPU-bound, at low parallelism.
 
 ### Fleet capacity
 
 Per [DESIGN.md §4](../DESIGN.md): 0.0374 w/s per cluster steady, 0.0748 w/s per cluster at burst (2x).
 
-| Instance       | vCPU | Ceiling (64 buckets) | Max fleet at burst |
+| Instance       | vCPU | Ceiling (64 workers) | Max fleet at burst |
 | -------------- | ---- | -------------------- | ------------------ |
 | db.m6g.large   | 2    | 2,852 w/s            | ~38k clusters      |
 | db.m6g.xlarge  | 4    | 5,770 w/s            | ~77k clusters      |
