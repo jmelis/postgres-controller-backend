@@ -4,7 +4,7 @@ Runs the controller-runtime controllers against plain PostgreSQL instead of kube
 
 This works because the library re-implements the Kubernetes List/Watch contract — commit-ordered event streams with `resourceVersion` semantics — on ordinary Postgres tables. Informers, reconcile loops, and optimistic concurrency behave as they always have; underneath, writers (controllers, or an API server fronting the database) and watchers talk to Postgres directly, with no etcd protocol, no kube-apiserver, and no consensus layer in the path.
 
-The motivation is operational. At fleet scale, etcd becomes the component you engineer around, and colocating application state in the cluster's own etcd ties your data's disaster-recovery story to the cluster's. One managed Postgres instance replaces it with a database your team already knows how to run — independent backup/restore, standard failover — and gives up nothing on throughput: up to ~15,000 writes/s with small payloads, ~4,000 with realistic 15-20KB payloads (db.m6g.8xlarge), with correctness enforced by PostgreSQL's native transaction IDs.
+The motivation is operational. At fleet scale, etcd becomes the component you engineer around, and colocating application state in the cluster's own etcd ties your data's disaster-recovery story to the cluster's. One managed Postgres instance replaces it with a database your team already knows how to run — independent backup/restore, standard failover — and gives up nothing on throughput: up to ~15,000 writes/s with small payloads, ~6,000 with realistic 15-20KB payloads (Aurora I/O Optimized, db.r6g.8xlarge), with correctness enforced by PostgreSQL's native transaction IDs.
 
 **This is not a general-purpose etcd replacement.** It targets deployments where you own every writer and all writes go through this library. Check [Is this for you?](#is-this-for-you) to see if your use case matches the assumptions. If not, use [kine](https://github.com/k3s-io/kine).
 
@@ -125,9 +125,10 @@ db.m6g/r6g.8xlarge (32 vCPU), 48 concurrent workers, synchronous commit, 10 GVKs
 | RDS    | 50B      | 15,322   | 3.0ms | 4.3ms |
 | Aurora | 50B      | 11,061   | 4.3ms | 7.4ms |
 | Aurora | 15-20KB  | 3,932    | 11ms  | 26ms  |
+| Aurora I/O Optimized | 15-20KB | 6,132 | 6.3ms | 29ms |
 | RDS    | 15-20KB  | 1,728    | 8ms   | 1.4s  |
 
-Payload size is the primary throughput variable: realistic 15-20KB payloads (matching production GVK sizes) reduce throughput 3-4x compared to minimal payloads due to WAL volume. Aurora handles large payloads substantially better than RDS Multi-AZ (3,932 vs 1,728 w/s), though RDS is faster with small payloads.
+Payload size is the primary throughput variable: realistic 15-20KB payloads (matching production GVK sizes) reduce throughput 3-4x compared to minimal payloads due to WAL volume. Aurora I/O Optimized (`aurora-iopt1`) delivers 56% higher throughput than standard Aurora with large payloads (6,132 vs 3,932 w/s) and nearly halves p50 latency. Aurora handles large payloads substantially better than RDS Multi-AZ, though RDS is faster with small payloads.
 
 All correctness invariants (I1–I6) verified under load: zero serialization failures, zero verifier violations across all runs.
 

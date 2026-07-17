@@ -218,19 +218,21 @@ Measured with `TestCeiling_MultiGVK`: 10 GVKs, 48 concurrent workers, 15s test d
 | RDS    | 50B      | 15,322   | 3.0ms | 4.3ms |
 | Aurora | 50B      | 11,061   | 4.3ms | 7.4ms |
 | Aurora | 15-20KB  | 3,932    | 11ms  | 26ms  |
+| Aurora I/O Optimized | 15-20KB | 6,132 | 6.3ms | 29ms |
 | RDS    | 15-20KB  | 1,728    | 8ms   | 1.4s  |
 
 ### Scaling characteristics
 
 - **Payload size is the primary variable.** Realistic 15-20KB payloads (matching production GVK sizes) reduce throughput 3-4x compared to 50B payloads due to WAL volume per commit.
-- **Aurora handles large payloads better than RDS Multi-AZ** (3,932 vs 1,728 w/s) — Aurora's distributed storage absorbs large WAL flushes more gracefully, while RDS Multi-AZ synchronous replication amplifies the per-commit cost. RDS p99 spikes to 1.4s with large payloads.
+- **Aurora I/O Optimized is the fastest option for large payloads** (6,132 w/s) — 56% faster than standard Aurora (3,932 w/s) and nearly halves p50 latency (6.3ms vs 11ms). The `aurora-iopt1` storage type eliminates per-I/O charges and reduces WAL commit latency.
+- **Aurora handles large payloads better than RDS Multi-AZ** (3,932–6,132 vs 1,728 w/s) — Aurora's distributed storage absorbs large WAL flushes more gracefully, while RDS Multi-AZ synchronous replication amplifies the per-commit cost. RDS p99 spikes to 1.4s with large payloads.
 - **RDS is faster with small payloads** (15,322 vs 11,061 w/s) — Aurora's cross-AZ storage round-trip adds overhead that dominates when per-write WAL volume is minimal.
 
 ### Fleet capacity
 
 Per [DESIGN.md §4](../DESIGN.md): 0.0374 w/s per cluster steady, 0.0748 w/s per cluster at burst (2x).
 
-Using the realistic-payload ceiling (Aurora, 3,932 w/s): **~53k clusters at burst** on a single db.r6g.8xlarge. The 5,000-cluster tier needs 374 burst w/s — over 10x headroom. The 50,000-cluster tier needs 3,740 burst w/s, which is within the measured ceiling.
+Using the realistic-payload ceiling (Aurora I/O Optimized, 6,132 w/s): **~82k clusters at burst** on a single db.r6g.8xlarge. The 5,000-cluster tier needs 374 burst w/s — over 16x headroom. The 50,000-cluster tier needs 3,740 burst w/s — 1.6x headroom.
 
 ### Remaining optimization lever: async commit
 
