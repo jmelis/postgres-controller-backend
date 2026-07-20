@@ -95,12 +95,12 @@ remaining bottleneck is WAL volume per commit — payload size is now the primar
 
 Pre-stored-procedure (old baseline for reference):
 
-| Metric                   | Old (multi-statement) | Current (stored proc + debounced doorbell, 48 workers, 8xlarge) |
-| ------------------------ | --------------------- | --------------------------------------------------------------- |
-| Write ceiling (RDS, 50B) | ~685 w/s              | **15,322 w/s**                                                  |
-| Write ceiling (Aurora, 15-20KB) | —              | **3,932 w/s**                                                   |
-| Burst rate per cluster   | 0.0748 w/s            | 0.0748 w/s                                                      |
-| Max clusters at burst (Aurora, realistic) | ~9,200 | **~53,000**                                                    |
+| Metric                                    | Old (multi-statement) | Current (stored proc + debounced doorbell, 48 workers, 8xlarge) |
+| ----------------------------------------- | --------------------- | --------------------------------------------------------------- |
+| Write ceiling (RDS, 50B)                  | ~685 w/s              | **15,322 w/s**                                                  |
+| Write ceiling (Aurora, 15-20KB)           | —                     | **3,932 w/s**                                                   |
+| Burst rate per cluster                    | 0.0748 w/s            | 0.0748 w/s                                                      |
+| Max clusters at burst (Aurora, realistic) | ~9,200                | **~53,000**                                                     |
 
 ### Payload size is the primary variable
 
@@ -112,13 +112,13 @@ RDS Multi-AZ (3,932 vs 1,728 w/s), though RDS is faster with small payloads (15,
 
 ### What WOULD increase the write ceiling
 
-| Option                  | Expected improvement                  | Trade-off                                                                             | Status                                                                                  |
-| ----------------------- | ------------------------------------- | ------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| **Reduce round-trips**  | ~22x (685 -> 15,322 w/s, RDS small)  | —                                                                                     | **Done.** `pgctl_write()` stored procedure + debounced doorbell.                        |
-| **Reduce payload size** | ~4x (3,932 -> 15,322 w/s equivalent) | Requires application-level changes to reduce spec/status/metadata sizes               | Application-dependent                                                                    |
-| **Async commit**        | ~2x                                  | Risk of losing last ~100ms of committed data on crash                                 | Next lever if needed                                                                     |
-| **Batch writes**        | 2-5x                                 | Requires application-level changes to group multiple writes per COMMIT                | Not needed at current ceiling                                                            |
-| **Horizontal sharding** | Linear                               | Multiple RDS instances — adds operational complexity                                  | Not needed                                                                               |
+| Option                  | Expected improvement                 | Trade-off                                                               | Status                                                           |
+| ----------------------- | ------------------------------------ | ----------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| **Reduce round-trips**  | ~22x (685 -> 15,322 w/s, RDS small)  | —                                                                       | **Done.** `pgctl_write()` stored procedure + debounced doorbell. |
+| **Reduce payload size** | ~4x (3,932 -> 15,322 w/s equivalent) | Requires application-level changes to reduce spec/status/metadata sizes | Application-dependent                                            |
+| **Async commit**        | ~2x                                  | Risk of losing last ~100ms of committed data on crash                   | Next lever if needed                                             |
+| **Batch writes**        | 2-5x                                 | Requires application-level changes to group multiple writes per COMMIT  | Not needed at current ceiling                                    |
+| **Horizontal sharding** | Linear                               | Multiple RDS instances — adds operational complexity                    | Not needed                                                       |
 
 ### Recommendation (updated)
 

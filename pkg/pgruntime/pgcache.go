@@ -28,6 +28,8 @@ type pgCache struct {
 	pool       *pgxpool.Pool
 	restMapper meta.RESTMapper
 	logger     logr.Logger
+	shard      *reader.ShardSpec
+	unsharded  map[schema.GroupVersionKind]bool
 
 	mu        sync.Mutex
 	informers map[schema.GroupVersionKind]*pgInformer
@@ -201,6 +203,11 @@ func (c *pgCache) getOrCreateInformer(gvk schema.GroupVersionKind) (*pgInformer,
 		Kind:    gvk.Kind + "List",
 	}
 
+	var gvkShard *reader.ShardSpec
+	if c.shard != nil && !c.unsharded[gvk] {
+		gvkShard = c.shard
+	}
+
 	lw := &listWatchWithoutWatchListSemantics{&toolscache.ListWatch{
 		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
 			poolConn, err := c.pool.Acquire(ctx)
@@ -209,7 +216,11 @@ func (c *pgCache) getOrCreateInformer(gvk schema.GroupVersionKind) (*pgInformer,
 			}
 			defer poolConn.Release()
 
-			result, err := reader.List(ctx, poolConn.Conn(), gvkStr)
+			var filter *reader.ListFilter
+			if gvkShard != nil {
+				filter = gvkShard.ToListFilter()
+			}
+			result, err := reader.List(ctx, poolConn.Conn(), gvkStr, filter)
 			if err != nil {
 				return nil, fmt.Errorf("list: %w", err)
 			}
@@ -265,6 +276,7 @@ func (c *pgCache) getOrCreateInformer(gvk schema.GroupVersionKind) (*pgInformer,
 			w := reader.NewWatcher(pollConn, listenConn, reader.WatcherConfig{
 				GVK:     gvkStr,
 				StartRV: startRV,
+				Shard:   gvkShard,
 			}, nil)
 
 			watchCtx, watchCancel := context.WithCancel(ctx)

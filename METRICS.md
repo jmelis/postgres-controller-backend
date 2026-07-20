@@ -9,13 +9,13 @@ instrumentation with zero overhead.
 
 ## Writer Metrics (`pgctl_writer_*`)
 
-| Metric                                     | Type      | Labels                       | Description                                                       |
-| ------------------------------------------ | --------- | ---------------------------- | ----------------------------------------------------------------- |
-| `pgctl_writer_write_duration_seconds`      | Histogram | `gvk`, `result`              | Duration of write operations (stored procedure call).             |
-| `pgctl_writer_write_step_duration_seconds` | Histogram | `step`                       | Duration of individual steps within a write transaction.          |
-| `pgctl_writer_writes_total`                | Counter   | `gvk`, `result`              | Total write operations by outcome.                                |
-| `pgctl_writer_noop_suppressions_total`     | Counter   | —                            | Writes suppressed because the row already held identical content. |
-| `pgctl_writer_doorbell_errors_total`       | Counter   | —                            | Failed `pg_notify` doorbell sends (fire-and-forget, non-fatal).   |
+| Metric                                     | Type      | Labels          | Description                                                       |
+| ------------------------------------------ | --------- | --------------- | ----------------------------------------------------------------- |
+| `pgctl_writer_write_duration_seconds`      | Histogram | `gvk`, `result` | Duration of write operations (stored procedure call).             |
+| `pgctl_writer_write_step_duration_seconds` | Histogram | `step`          | Duration of individual steps within a write transaction.          |
+| `pgctl_writer_writes_total`                | Counter   | `gvk`, `result` | Total write operations by outcome.                                |
+| `pgctl_writer_noop_suppressions_total`     | Counter   | —               | Writes suppressed because the row already held identical content. |
+| `pgctl_writer_doorbell_errors_total`       | Counter   | —               | Failed `pg_notify` doorbell sends (fire-and-forget, non-fatal).   |
 
 **Result label values:** `success`, `noop`, `conflict`, `already_exists`, `ambiguous_commit`, `error`.
 
@@ -42,6 +42,11 @@ instrumentation with zero overhead.
 - `doorbell_polls_total` vs `baseline_polls_total` shows the ratio of fast-path
   vs liveness-backstop deliveries. Under healthy doorbells, baseline should be
   low relative to doorbell.
+- **Sharding:** no new metrics are introduced for sharding. When running a
+  sharded fleet, expect `poll_events_delivered` to frequently report zero events
+  for individual shards — a shard only sees changes to its owned namespaces, so
+  empty polls are normal and not a sign of doorbell failure. Use `baseline_catches_total`
+  (not zero-event polls) to diagnose doorbell health.
 
 ---
 

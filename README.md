@@ -55,6 +55,7 @@ PostgreSQL 16 is the authoritative store, with:
 - **Single-goroutine poll-primary watch** with LISTEN/NOTIFY doorbell as a latency-only optimization; all polling in one goroutine with snapshot-isolated (`REPEATABLE READ`) poll cycles; automatic LISTEN reconnection via `ListenConnFactory` with exponential backoff
 - **Tombstone compaction** via a single CTE (atomic delete + horizon advancement) with finalizer guard — only fully-deleted objects (no active finalizers) are compacted; dying objects with finalizers survive past retention
 - **Failover safety** via RDS Multi-AZ synchronous replication (no committed-write loss); on restore, pod restart forces relist
+- **Namespace-hash sharding** — partition the cache's List/Watch across replicas by `hashtext(namespace) % Mod`. Direct client reads are never sharded; `UnshardedGVKs` opt specific GVKs out of partitioning. No schema changes, no write-path changes; scale by changing `Mod` + rolling restart
 - **Prometheus instrumentation** across writer, watcher, and verifier paths ([METRICS.md](METRICS.md))
 
 ```mermaid
@@ -96,7 +97,7 @@ flowchart LR
 
 ## Correctness
 
-Every mechanism is justified by one of 6 named invariants (I1–I6, DESIGN.md §2) — commit-ordered sequences, no regression across failover, exactly-once watch delivery, resourceVersion monotonicity, compaction safety, optimistic concurrency.
+Every mechanism is justified by one of 7 named invariants (I1–I7, DESIGN.md §2) — commit-ordered sequences, no regression across failover, exactly-once watch delivery, resourceVersion monotonicity, compaction safety, optimistic concurrency.
 
 Every invariant has a corresponding race or failure scenario and a **deterministic test that forces the interleaving** — 21 tests in total (R2–R5, R7, R10, R12–R13, R15–R21, RB4a–f; full catalog in DESIGN.md §5):
 
@@ -120,13 +121,13 @@ All three write paths (`Write` for full writes, `WriteObject` for spec + metadat
 
 db.m6g/r6g.8xlarge (32 vCPU), 48 concurrent workers, synchronous commit, 10 GVKs:
 
-| Engine | Payloads | Writes/s | p50   | p99   |
-| ------ | -------- | -------- | ----- | ----- |
-| RDS    | 50B      | 15,322   | 3.0ms | 4.3ms |
-| Aurora | 50B      | 11,061   | 4.3ms | 7.4ms |
-| Aurora | 15-20KB  | 3,932    | 11ms  | 26ms  |
-| Aurora I/O Optimized | 15-20KB | 6,132 | 6.3ms | 29ms |
-| RDS    | 15-20KB  | 1,728    | 8ms   | 1.4s  |
+| Engine               | Payloads | Writes/s | p50   | p99   |
+| -------------------- | -------- | -------- | ----- | ----- |
+| RDS                  | 50B      | 15,322   | 3.0ms | 4.3ms |
+| Aurora               | 50B      | 11,061   | 4.3ms | 7.4ms |
+| Aurora               | 15-20KB  | 3,932    | 11ms  | 26ms  |
+| Aurora I/O Optimized | 15-20KB  | 6,132    | 6.3ms | 29ms  |
+| RDS                  | 15-20KB  | 1,728    | 8ms   | 1.4s  |
 
 Payload size is the primary throughput variable: realistic 15-20KB payloads (matching production GVK sizes) reduce throughput 3-4x compared to minimal payloads due to WAL volume. Aurora I/O Optimized (`aurora-iopt1`) delivers 56% higher throughput than standard Aurora with large payloads (6,132 vs 3,932 w/s) and nearly halves p50 latency. Aurora handles large payloads substantially better than RDS Multi-AZ, though RDS is faster with small payloads.
 

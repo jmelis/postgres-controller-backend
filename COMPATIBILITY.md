@@ -27,12 +27,20 @@ These features work but behave differently from standard controller-runtime agai
 | Read consistency                  | `GetClient()` reads from cache — can be seconds stale   | `GetClient()` reads from DB — always current                                                                                   |
 | No-op writes                      | May or may not bump `ResourceVersion`                   | Content-equal writes suppressed: no version bump, no event                                                                     |
 | Delete lifecycle                  | Object removed immediately after finalizers clear       | Tombstone row persists until compaction (24h default). Invisible to callers — `Get()` returns NotFound, `List()` excludes them |
-| Horizontal scaling                | Leader election (1 active replica) or external sharding | Multiple replicas supported; partition objects at the application layer                                                         |
+| Horizontal scaling                | Leader election (1 active replica) or external sharding | Multiple replicas via namespace-hash sharding (`Options.Shard`); direct client always sees full dataset                        |
 | Event delivery                    | HTTP/2 streaming watch                                  | Poll (5s baseline) with `pg_notify` doorbell (~100ms typical delivery)                                                         |
 | `GetAPIReader()` vs `GetClient()` | Different: uncached vs cached reads                     | Identical: both go to DB                                                                                                       |
 | Periodic resync                   | Informers re-list every 10h to catch missed events      | No resync — poll-based watch can't miss events within the compaction window                                                    |
 | `IndexField()`                    | Registers cache indexes used by field selectors         | No-op — accepted but ignored. `MatchingFields` queries the database directly                                                   |
 | Cluster-scoped resources          | RESTMapper marks types as cluster-scoped; empty ns      | Works with empty namespace                                                                                                     |
+
+### Sharding specifics
+
+When `Options.Shard` is set, the cache's informer List/Watch queries include a field-selector-like restriction (`hashtext(namespace) % Mod = ANY(Owned)`). This means the informer cache only contains the replica's owned namespaces. The direct client (`GetClient()`, `GetAPIReader()`) is never restricted — it always queries the full dataset.
+
+`UnshardedGVKs` exempts specific GVKs from the shard predicate so every replica watches them fully. Use this for cluster-scoped or shared configuration resources.
+
+**PostgreSQL version caveat:** `hashtext()` return values may change across PostgreSQL major versions. A major-version upgrade reshuffles all namespace-to-shard assignments. This is benign — all replicas restart during a major upgrade, and the transient period of overlapping watches resolves after the rolling restart. No data is lost; the only effect is a burst of duplicate reconciles.
 
 ## What's not supported
 

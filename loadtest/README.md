@@ -6,14 +6,14 @@ This harness tests the **Go library packages** that implement Postgres-backed Ku
 
 ### Packages under test
 
-| Package               | What it does                                                                                                                                                                                                                                                                | How the harness uses it                                                                                                                                              |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Package               | What it does                                                                                                                                                                                                                                                              | How the harness uses it                                                                                                                                              |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `internal/writer`     | Atomic writes via `pgctl_write()` stored procedure: no-op suppression &rarr; UPSERT + `pg_current_xact_id()`, all in one server-side call in autocommit mode. Debounced doorbell via `doorbell.Debouncer`. Enforces commit ordering (I1) and optimistic concurrency (I6). | Every phase creates `writer.New(conn, nil).WithMetrics(m)` instances and calls `Write()` at varying rates and concurrency levels.                                    |
-| `internal/reader`     | Poll-primary watcher with optional doorbell (LISTEN/NOTIFY). Delivers commit-ordered event streams per GVK using xid8 + snapshot-xmin watermark, regardless of doorbell health. Single-goroutine scheduler with debounce.                                                   | Phase 5 creates `reader.NewWatcher(...)` instances to measure idle poll cost, doorbell delivery latency, and baseline-only fallback.                                 |
-| `internal/verifier`   | Continuous invariant checker — subscribes to the poll stream and verifies monotonic high-water marks (I2/I4), gap-vs-compaction-horizon checks (I5), and canary write-to-delivery latency.                                                                                  | Runs alongside every write phase. Any violation fails the test. Same code used in production.                                                                        |
-| `internal/compaction` | Tombstone compaction: deletes fully-deleted tombstones (deletion_timestamp set, no active finalizers) and advances the compaction horizon atomically in a single CTE (I5). Dying objects with finalizers are preserved.                                                     | Background goroutine runs `compaction.Compact()` every 5 minutes during long tests to keep table size bounded.                                                       |
-| `internal/schema`     | DDL migration — creates all tables and indexes.                                                                                                                                                                                                                             | Runs once at startup before seeding.                                                                                                                                 |
-| `internal/metrics`    | Prometheus metrics for all of the above: write duration/count, poll duration, delivery latency, verifier violations.                                                                                                                                                        | All library instances are wired with `.WithMetrics(...)`. Metrics are scraped by CloudWatch Agent and pushed to a CloudWatch dashboard alongside native RDS metrics. |
+| `internal/reader`     | Poll-primary watcher with optional doorbell (LISTEN/NOTIFY). Delivers commit-ordered event streams per GVK using xid8 + snapshot-xmin watermark, regardless of doorbell health. Single-goroutine scheduler with debounce.                                                 | Phase 5 creates `reader.NewWatcher(...)` instances to measure idle poll cost, doorbell delivery latency, and baseline-only fallback.                                 |
+| `internal/verifier`   | Continuous invariant checker — subscribes to the poll stream and verifies monotonic high-water marks (I2/I4), gap-vs-compaction-horizon checks (I5), and canary write-to-delivery latency.                                                                                | Runs alongside every write phase. Any violation fails the test. Same code used in production.                                                                        |
+| `internal/compaction` | Tombstone compaction: deletes fully-deleted tombstones (deletion_timestamp set, no active finalizers) and advances the compaction horizon atomically in a single CTE (I5). Dying objects with finalizers are preserved.                                                   | Background goroutine runs `compaction.Compact()` every 5 minutes during long tests to keep table size bounded.                                                       |
+| `internal/schema`     | DDL migration — creates all tables and indexes.                                                                                                                                                                                                                           | Runs once at startup before seeding.                                                                                                                                 |
+| `internal/metrics`    | Prometheus metrics for all of the above: write duration/count, poll duration, delivery latency, verifier violations.                                                                                                                                                      | All library instances are wired with `.WithMetrics(...)`. Metrics are scraped by CloudWatch Agent and pushed to a CloudWatch dashboard alongside native RDS metrics. |
 
 ### Invariants validated
 
@@ -145,11 +145,11 @@ The harness is a standalone Go binary that imports the library packages directly
 
 A single YAML file controls everything: GVK payload sizes, which phases to run, target RPS, duration, pass/fail thresholds, checkpoint interval.
 
-| Spec                        | Scenario                                                     | Duration |
-| --------------------------- | ------------------------------------------------------------ | -------- |
-| `specs/5k-baseline.yaml`    | 5,000-cluster tier — Phase 1+2+5                             | ~2h      |
-| `specs/50k-stress.yaml`     | 50,000-cluster tier — all phases                             | ~50h     |
-| `specs/ceiling-hunt.yaml`   | Max RPS discovery across worker counts and GVK sizes         | ~30min   |
+| Spec                        | Scenario                                             | Duration |
+| --------------------------- | ---------------------------------------------------- | -------- |
+| `specs/5k-baseline.yaml`    | 5,000-cluster tier — Phase 1+2+5                     | ~2h      |
+| `specs/50k-stress.yaml`     | 50,000-cluster tier — all phases                     | ~50h     |
+| `specs/ceiling-hunt.yaml`   | Max RPS discovery across worker counts and GVK sizes | ~30min   |
 | `specs/custom.yaml.example` | Fully commented template                             | varies   |
 
 ## Quick start
@@ -213,13 +213,13 @@ COMMIT dominates write latency (~61% of total time) — this is the Multi-AZ syn
 
 Measured with `TestCeiling_MultiGVK`: 10 GVKs, 48 concurrent workers, 15s test duration + 2s warm-up, on db.m6g/r6g.8xlarge (32 vCPU). Both RDS (Multi-AZ sync replication) and Aurora (cross-AZ storage) tested with minimal (50B) and realistic (15-20KB) payloads.
 
-| Engine | Payloads | Writes/s | p50   | p99   |
-| ------ | -------- | -------- | ----- | ----- |
-| RDS    | 50B      | 15,322   | 3.0ms | 4.3ms |
-| Aurora | 50B      | 11,061   | 4.3ms | 7.4ms |
-| Aurora | 15-20KB  | 3,932    | 11ms  | 26ms  |
-| Aurora I/O Optimized | 15-20KB | 6,132 | 6.3ms | 29ms |
-| RDS    | 15-20KB  | 1,728    | 8ms   | 1.4s  |
+| Engine               | Payloads | Writes/s | p50   | p99   |
+| -------------------- | -------- | -------- | ----- | ----- |
+| RDS                  | 50B      | 15,322   | 3.0ms | 4.3ms |
+| Aurora               | 50B      | 11,061   | 4.3ms | 7.4ms |
+| Aurora               | 15-20KB  | 3,932    | 11ms  | 26ms  |
+| Aurora I/O Optimized | 15-20KB  | 6,132    | 6.3ms | 29ms  |
+| RDS                  | 15-20KB  | 1,728    | 8ms   | 1.4s  |
 
 ### Scaling characteristics
 

@@ -21,6 +21,7 @@ type WatcherConfig struct {
 	StartRV          resourceversion.RV
 	BaselineInterval time.Duration // default 5s
 	DebounceFloor    time.Duration // default 100ms
+	Shard            *ShardSpec    // nil = unsharded (all rows)
 
 	// ListenConnFactory, when set, lets the watcher replace a failed LISTEN
 	// connection. Called after backoff; the watcher re-LISTENs the GVK
@@ -408,14 +409,19 @@ func (w *Watcher) pollAll(ctx context.Context, tx pgx.Tx) ([]Event, error) {
 		}
 	}
 
-	rows, err := tx.Query(ctx, `
+	query := `
 		SELECT gvk, namespace, name, uid, txid_stamp::text::bigint,
 		       object_version, spec, status, metadata,
 		       deletion_timestamp, created_at, updated_at
 		FROM kubernetes_resources
-		WHERE gvk = $1 AND txid_stamp::text::bigint > $2
-		ORDER BY txid_stamp ASC`,
-		w.cfg.GVK, w.hwm)
+		WHERE gvk = $1 AND txid_stamp::text::bigint > $2`
+	args := []any{w.cfg.GVK, w.hwm}
+	if w.cfg.Shard != nil {
+		query, args = w.cfg.Shard.AppendQuery(query, args)
+	}
+	query += " ORDER BY txid_stamp ASC"
+
+	rows, err := tx.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("poll: %w", err)
 	}

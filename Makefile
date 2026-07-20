@@ -1,4 +1,4 @@
-.PHONY: test test-unit test-integration test-race test-race-stress test-toxirace test-parity lint vet build
+.PHONY: test test-unit test-integration test-race test-race-stress test-toxirace test-shard test-parity lint vet build
 
 build:
 	go build ./...
@@ -13,7 +13,7 @@ test-unit:
 	go test -race -v ./internal/resourceversion/
 
 test-integration:
-	go test -race -v -timeout=180s ./internal/schema/ ./internal/writer/ ./internal/reader/ ./pkg/compaction/ ./internal/verifier/
+	go test -race -v -timeout=180s ./internal/schema/ ./internal/writer/ ./internal/reader/ ./pkg/compaction/ ./internal/verifier/ ./pkg/pgruntime/
 
 test-race:
 	go test -race -v -count=1 -timeout=120s ./test/race/
@@ -27,9 +27,12 @@ test-toxirace:
 test-load:
 	go test -race -v -count=1 -timeout=600s ./test/loadtest/
 
+test-shard:
+	go test -race -v -count=1 -timeout=120s ./test/shard/
+
 test-parity:
 	@which setup-envtest > /dev/null 2>&1 || go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
 	KUBEBUILDER_ASSETS=$$(setup-envtest use --bin-dir $$(pwd)/.envtest -p path) \
 	go test -race -v -count=1 -timeout=180s ./test/parity/
 
-test: test-unit test-integration test-race test-parity
+test: test-unit test-integration test-race test-shard test-parity
