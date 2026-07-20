@@ -581,14 +581,14 @@ makes sense, the rest of the system is variations on it.
 
 ## 9. How it all ties back to the one sentence
 
-| Mechanism                    | Which piece of "a commit-ordered version" it defends                                                                                                |
-| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| xid8 + snapshot-xmin watermark | Commit-ordered delivery: watermark advances only past committed txids (I1)                                                                        |
-| `object_version` check       | No lost updates on one object (I6)                                                                                                                  |
-| RDS synchronous replication  | Version never goes backward across failover (I2, I4); on restore, restarting pods forces a relist                                                   |
-| Tombstones + finalizers      | Deletes are visible events; dying objects (with finalizers) stay visible for cleanup, fully-deleted tombstones (no finalizers) signal deletion (I3) |
-| Compaction horizon + 410     | A watcher that fell too far behind is told loudly, never silently skipped; compaction only removes finalizer-free tombstones (I5)                   |
-| Poll loop                    | The delivery guarantee — the doorbell is only latency (I3)                                                                                          |
+| Mechanism                      | Which piece of "a commit-ordered version" it defends                                                                                                |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| xid8 + snapshot-xmin watermark | Commit-ordered delivery: watermark advances only past committed txids (I1)                                                                          |
+| `object_version` check         | No lost updates on one object (I6)                                                                                                                  |
+| RDS synchronous replication    | Version never goes backward across failover (I2, I4); on restore, restarting pods forces a relist                                                   |
+| Tombstones + finalizers        | Deletes are visible events; dying objects (with finalizers) stay visible for cleanup, fully-deleted tombstones (no finalizers) signal deletion (I3) |
+| Compaction horizon + 410       | A watcher that fell too far behind is told loudly, never silently skipped; compaction only removes finalizer-free tombstones (I5)                   |
+| Poll loop                      | The delivery guarantee — the doorbell is only latency (I3)                                                                                          |
 
 Every mechanism is one repair to the gap between "what a Kubernetes client
 expects" and "what a plain SQL table gives you."
@@ -640,7 +640,46 @@ judge in production are the same program, so passing the tests means something.
 
 ---
 
-## 11. Where this sits versus kine
+## 11. Namespace-hash sharding
+
+When a single replica's informer cache grows too large or poll load needs
+distributing, you can shard the cache by namespace hash. Each replica declares
+which hash residues it owns, and only those namespaces appear in its
+informer-backed List/Watch queries.
+
+```go
+mgr, _ := pgruntime.NewManager(pgruntime.Options{
+    Scheme: scheme,
+    DSN:    dsn,
+    Shard: &pgruntime.ShardConfig{
+        Mod:   2,
+        Owned: []int{0},  // this replica owns even-hash namespaces
+        UnshardedGVKs: []schema.GroupVersionKind{
+            {Group: "example.com", Version: "v1", Kind: "ManagementCluster"},
+        },
+    },
+})
+```
+
+The SQL predicate appended to each poll is
+`abs(hashtext(namespace)::bigint) % 2 = ANY('{0}')` — using PostgreSQL's
+built-in `hashtext()` with a cast to `bigint` before `abs()` to avoid `INT_MIN` overflow. A second
+replica with `Owned: []int{1}` covers the other half.
+
+The direct client (`GetClient()`, `GetAPIReader()`) is **never sharded** — point
+reads and direct `List` calls always see the full dataset. Only the informer
+cache (the watch stream feeding reconcile triggers) is partitioned.
+`UnshardedGVKs` lists GVKs that every replica watches fully, regardless of shard
+config — useful for cluster-scoped configuration resources that all replicas
+need.
+
+To scale, change `Mod` and rolling-restart. The transient overlap (some
+namespaces watched by both old and new replicas) is benign — just duplicate
+reconciles, deduplicated by the informer cache.
+
+---
+
+## 12. Where this sits versus kine
 
 Worth stating plainly, since the obvious question is "isn't this just kine?"
 

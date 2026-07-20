@@ -77,7 +77,7 @@ func RunPhase5(ctx context.Context, dsn string, cfg *Config) (*PhaseResult, erro
 	var startRV resourceversion.RV
 
 	// Build initial HWM from a list query.
-	listResult, err := reader.List(ctx, probeConn, gvk)
+	listResult, err := reader.List(ctx, probeConn, gvk, nil)
 	if err != nil {
 		log.Printf("phase5: list for HWM failed (starting from zero): %v", err)
 	} else {

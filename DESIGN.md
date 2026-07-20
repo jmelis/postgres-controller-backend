@@ -27,6 +27,7 @@ These are the properties the system promises. Everything else exists to uphold t
 - **I4 — RV monotonicity.** The watermark resourceVersion observed by any client never moves backwards. Under RDS Multi-AZ synchronous replication, failover preserves all committed transactions. On database restore, restarting controller pods forces a relist from the current state.
 - **I5 — Compaction safety.** A watcher can never silently skip a compacted event: if its watermark predates the `compacted_xid` for any GVK, it receives `410 Gone` and relists; otherwise its stream is complete.
 - **I6 — Optimistic concurrency.** An update presenting a stale `object_version` is rejected (409); no lost updates on a single object.
+- **I7 — Partition completeness.** When sharding is enabled, the union of all replicas' owned residues for a given `Mod` must cover `[0, Mod)`. Every namespace hashes to exactly one residue, so every namespace is watched by at least one replica. During scale-up (changing `Mod`), a transient period exists where some namespaces are watched by both old and new replicas — this is benign (duplicate reconciles, deduplicated by the informer cache).
 
 **Not provided:** Owner-reference garbage collection is intentionally left to controllers. In Kubernetes, the API server's GC cascade-deletes dependents when their owner is removed; here, controllers handle this via standard controller-runtime patterns (`Owns()` watches + finalizer-driven cleanup). This keeps the storage layer simple — no cross-object graph traversal.
 
@@ -236,14 +237,14 @@ Default retention: 24 h. Retention must exceed the slowest legitimate watcher re
 
 ## 4. Infrastructure & Sizing
 
-| Item            | 5,000-cluster tier (default)                    | 50,000-cluster path                             |
-| --------------- | ----------------------------------------------- | ----------------------------------------------- |
-| Instance        | `db.r6g.large` or `xlarge` (Multi-AZ)           | resize in place to `db.r6g.2xlarge`             |
-| Data            | ~2.6 GB (RAM-resident many times over)          | ~26 GB (still RAM-resident)                     |
-| Load            | ~187 RPS steady / ~374 burst                    | 1,870 / 3,740 RPS                               |
-| Engine          | PostgreSQL 16/17 (avoid Extended Support cliff) | same                                            |
-| Storage         | gp3, IOPS = write path + WAL, ×3 headroom       | raise IOPS                                      |
-| Doorbell extras | single debounce window sufficient                | tune debounce window under Phase 5 load         |
+| Item            | 5,000-cluster tier (default)                    | 50,000-cluster path                     |
+| --------------- | ----------------------------------------------- | --------------------------------------- |
+| Instance        | `db.r6g.large` or `xlarge` (Multi-AZ)           | resize in place to `db.r6g.2xlarge`     |
+| Data            | ~2.6 GB (RAM-resident many times over)          | ~26 GB (still RAM-resident)             |
+| Load            | ~187 RPS steady / ~374 burst                    | 1,870 / 3,740 RPS                       |
+| Engine          | PostgreSQL 16/17 (avoid Extended Support cliff) | same                                    |
+| Storage         | gp3, IOPS = write path + WAL, ×3 headroom       | raise IOPS                              |
+| Doorbell extras | single debounce window sufficient               | tune debounce window under Phase 5 load |
 
 Correctness controls are identical at both tiers — races don't scale down.
 
@@ -293,7 +294,49 @@ Correctness that is only tested pre-GA decays. Run a **verifier** as a permanent
 - **Phase 6 — Failover drills.** Unplanned (reboot-with-failover) under load + one orchestrated planned failover, repeated ≥5×. RTO ≤120 s; zero acknowledged-write loss; tripwires silent; verifier confirms commit-ordered continuity through every drill. Include R8 assertions.
 - **Phase 7 — Backup/restore regression.** Restore a snapshot into a fresh instance (DR path). Because a restore _can_ legitimately rewind state, all controller pods must be restarted after the restore so caches relist from the current state. The drill asserts that after restart, controllers converge to the correct state with no stale data.
 
-## 8. Open Items
+## 8. Namespace-Hash Sharding
+
+Read-side controller sharding partitions the cache's List/Watch streams across replicas by namespace hash. Each replica watches only the namespaces whose hash residue it owns, reducing per-replica memory and poll load proportionally to the shard count.
+
+### 8.1 Approach
+
+Sharding uses PostgreSQL's built-in `hashtext()` function applied to the namespace column:
+
+```sql
+abs(hashtext(namespace)::bigint) % $Mod = ANY($Owned::int[])
+```
+
+The cast to `bigint` before `abs()` avoids overflow when `hashtext()` returns `INT_MIN` (`-2147483648`), since `abs(-2147483648::int)` exceeds the int4 range. The predicate is appended to both List and Watch queries as an additional `WHERE` clause. Shard membership is immutable per object — namespace is part of the primary key and is never updated in place.
+
+### 8.2 Types
+
+Two types expose sharding at different layers:
+
+- **`reader.ShardSpec`** (internal) — `Mod int`, `Owned []int`. Generates the SQL clause and validates that `Mod > 0`, `Owned` is non-empty, each residue is in `[0, Mod)`, and there are no duplicates.
+- **`pgruntime.ShardConfig`** (public API) — mirrors `ShardSpec` and adds `UnshardedGVKs []schema.GroupVersionKind` for GVKs that every replica must watch fully (e.g., cluster-scoped configuration resources like `ManagementCluster`).
+
+### 8.3 Scope
+
+- **Sharded:** the cache's informer-backed List/Watch (the `ListerWatcher` created inside `pgCache.getOrCreateInformer`). Each informer's poll query includes the shard predicate, so the informer cache contains only the replica's owned namespaces.
+- **Never sharded:** the direct client (`GetClient()`, `GetAPIReader()`). Point reads (`Get`) and direct `List` calls always query the full dataset — they bypass the informer cache entirely. This ensures cross-shard reads remain possible when needed (e.g., looking up a resource in a namespace owned by another shard).
+- **`UnshardedGVKs`:** GVKs listed here skip the shard predicate entirely. Every replica watches the full set of objects for these GVKs.
+
+### 8.4 Invariants
+
+- **I7 — Partition completeness.** The union of all replicas' `Owned` residues must cover `[0, Mod)`. This is an operational invariant — the system validates each replica's config independently but cannot enforce fleet-wide completeness.
+- **No schema changes.** Sharding is purely a query-side filter. No new tables, columns, indexes, or migrations are required.
+- **No write-path changes.** Writers are unaffected. All writes go through the same `pgctl_write()` stored procedure regardless of sharding.
+- **`Shard == nil` preserves pre-change behavior byte-for-byte.** When no `ShardConfig` is provided, no shard predicate is appended and the system behaves exactly as before.
+
+### 8.5 Scaling
+
+To change the number of shards, update `Mod` and the `Owned` residues in each replica's configuration, then perform a rolling restart. During the transition, some namespaces may be watched by both old-config and new-config replicas. This is benign — duplicate reconciles are deduplicated by the informer cache, and the write path is unaffected. Once all replicas are running the new config, each namespace is watched by exactly one replica (assuming partition completeness).
+
+### 8.6 PostgreSQL version caveat
+
+`hashtext()` output values may change across PostgreSQL major versions. A major-version upgrade causes a fleet-wide reshuffle of namespace-to-shard assignments. This is benign — all replicas restart during a major upgrade anyway, and the transient period of duplicate watches resolves once the rolling restart completes.
+
+## 9. Open Items
 
 - Baseline poll interval (5 s launch) vs. Phase 5 idle-load data.
 - Compaction retention (24 h) vs. slowest informer restart — confirm with ops; alarm at retention/2.

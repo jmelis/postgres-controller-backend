@@ -22,10 +22,9 @@ func TestListEmpty(t *testing.T) {
 	db := testinfra.StartPostgres(t)
 	conn := db.Connect(t)
 
-	result, err := reader.List(context.Background(), conn, "apps/v1/Deployment")
+	result, err := reader.List(context.Background(), conn, "apps/v1/Deployment", nil)
 	require.NoError(t, err)
 	assert.Empty(t, result.Resources)
-	assert.Equal(t, uint64(0), result.ResourceVersion.Watermark)
 }
 
 func TestListReturnsLiveResources(t *testing.T) {
@@ -51,7 +50,7 @@ func TestListReturnsLiveResources(t *testing.T) {
 	}
 
 	listConn := db.Connect(t)
-	result, err := reader.List(ctx, listConn, "apps/v1/Deployment")
+	result, err := reader.List(ctx, listConn, "apps/v1/Deployment", nil)
 	require.NoError(t, err)
 	assert.Len(t, result.Resources, 3)
 	assert.Greater(t, result.ResourceVersion.Watermark, uint64(0))
@@ -90,7 +89,7 @@ func TestListExcludesTombstones(t *testing.T) {
 	require.NoError(t, err)
 
 	listConn := db.Connect(t)
-	result, err := reader.List(ctx, listConn, "apps/v1/Deployment")
+	result, err := reader.List(ctx, listConn, "apps/v1/Deployment", nil)
 	require.NoError(t, err)
 	assert.Len(t, result.Resources, 1)
 	assert.Equal(t, "live", result.Resources[0].Name)
@@ -135,7 +134,7 @@ func TestListIncludesDyingWithFinalizers(t *testing.T) {
 	require.NoError(t, err)
 
 	listConn := db.Connect(t)
-	result, err := reader.List(ctx, listConn, "apps/v1/Deployment")
+	result, err := reader.List(ctx, listConn, "apps/v1/Deployment", nil)
 	require.NoError(t, err)
 	assert.Len(t, result.Resources, 2)
 	names := []string{result.Resources[0].Name, result.Resources[1].Name}

@@ -83,3 +83,52 @@ otherwise use kubectl.
 
 4. **Update deployment manifest** — remove RBAC (ServiceAccount, ClusterRole,
    ClusterRoleBinding). Add postgres connection env vars.
+
+## Sharded deployment
+
+To run multiple replicas where each watches a subset of namespaces, use
+`Options.Shard`. The example below shows two processes splitting the namespace
+space in half (`Mod=2`):
+
+**Replica 0** (watches even-hash namespaces):
+
+```go
+mgr, err := pgruntime.NewManager(pgruntime.Options{
+    Scheme: greeting.Scheme,
+    DSN:    dsn,
+    Shard: &pgruntime.ShardConfig{
+        Mod:   2,
+        Owned: []int{0},
+        UnshardedGVKs: []schema.GroupVersionKind{
+            // GVKs every replica must watch fully
+            greeting.GroupVersion.WithKind("GreetingPolicy"),
+        },
+    },
+})
+```
+
+**Replica 1** (watches odd-hash namespaces):
+
+```go
+mgr, err := pgruntime.NewManager(pgruntime.Options{
+    Scheme: greeting.Scheme,
+    DSN:    dsn,
+    Shard: &pgruntime.ShardConfig{
+        Mod:   2,
+        Owned: []int{1},
+        UnshardedGVKs: []schema.GroupVersionKind{
+            greeting.GroupVersion.WithKind("GreetingPolicy"),
+        },
+    },
+})
+```
+
+Everything after `NewManager` is identical to the unsharded case —
+`SetupWithManager`, reconcilers, and `mgr.Start` are unchanged. The shard
+predicate only affects the informer cache (List/Watch). Direct client calls
+(`GetClient().Get()`, `GetClient().List()`) always see the full dataset across
+all namespaces.
+
+To scale to 3 replicas, change `Mod` to 3 and assign `Owned: []int{0}`,
+`[]int{1}`, `[]int{2}` respectively, then rolling-restart. The transient
+overlap is benign — duplicate reconciles are deduplicated by the informer cache.

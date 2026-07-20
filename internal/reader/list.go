@@ -16,7 +16,7 @@ type ListResult struct {
 
 type ListFilter struct {
 	WhereClauses []string
-	WhereArgs    []interface{}
+	WhereArgs    []any
 	Limit        int64
 	Offset       int64
 }
@@ -27,7 +27,7 @@ type ListFilter struct {
 // has finalizers) are included so controllers can perform cleanup before
 // removing their finalizers. The returned RV uses the xmin watermark from the
 // same snapshot, so there is no skew between the data and the version.
-func List(ctx context.Context, conn *pgx.Conn, gvk string, filter ...*ListFilter) (*ListResult, error) {
+func List(ctx context.Context, conn *pgx.Conn, gvk string, filter *ListFilter) (*ListResult, error) {
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel:   pgx.RepeatableRead,
 		AccessMode: pgx.ReadOnly,
@@ -56,24 +56,20 @@ func List(ctx context.Context, conn *pgx.Conn, gvk string, filter ...*ListFilter
 		FROM kubernetes_resources
 		WHERE gvk = $1
 		  AND (deletion_timestamp IS NULL OR metadata->'finalizers' != '[]'::jsonb)` // tombstone filter: also in compactor.go, 001_initial.sql, writer.go
-	args := []interface{}{gvk}
+	args := []any{gvk}
 
-	var f *ListFilter
-	if len(filter) > 0 && filter[0] != nil {
-		f = filter[0]
-	}
-	if f != nil {
-		for _, clause := range f.WhereClauses {
+	if filter != nil {
+		for _, clause := range filter.WhereClauses {
 			query += " AND " + clause
 		}
-		args = append(args, f.WhereArgs...)
+		args = append(args, filter.WhereArgs...)
 	}
 	query += " ORDER BY txid_stamp"
-	if f != nil && f.Limit > 0 {
-		args = append(args, f.Limit)
+	if filter != nil && filter.Limit > 0 {
+		args = append(args, filter.Limit)
 		query += fmt.Sprintf(" LIMIT $%d", len(args))
-		if f.Offset > 0 {
-			args = append(args, f.Offset)
+		if filter.Offset > 0 {
+			args = append(args, filter.Offset)
 			query += fmt.Sprintf(" OFFSET $%d", len(args))
 		}
 	}

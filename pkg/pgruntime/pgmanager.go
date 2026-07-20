@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	pgschema "github.com/jmelis/postgres-controller-backend/internal/schema"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"github.com/jmelis/postgres-controller-backend/internal/reader"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -27,10 +28,21 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/conversion"
 )
 
+// ShardConfig partitions the cache's informer List/Watch streams across
+// replicas by hashtext(namespace) % Mod. The direct client and cache reader
+// are never sharded. This type mirrors internal reader.ShardSpec but lives
+// in the public API and adds per-GVK opt-out via UnshardedGVKs.
+type ShardConfig struct {
+	Mod           int
+	Owned         []int
+	UnshardedGVKs []schema.GroupVersionKind
+}
+
 // Options configures a postgres-backed controller-runtime Manager.
 type Options struct {
 	Scheme                 *runtime.Scheme
 	DSN                    string
+	Shard                  *ShardConfig // nil = no sharding
 	Logger                 logr.Logger
 	MaxPoolConns           int32
 	MinPoolConns           int32
@@ -50,6 +62,20 @@ func NewManager(opts Options) (manager.Manager, error) {
 	}
 	if opts.Logger.GetSink() == nil {
 		opts.Logger = logr.Discard()
+	}
+
+	var shardSpec *reader.ShardSpec
+	unsharded := map[schema.GroupVersionKind]bool{}
+	if opts.Shard != nil {
+		owned := make([]int, len(opts.Shard.Owned))
+		copy(owned, opts.Shard.Owned)
+		shardSpec = &reader.ShardSpec{Mod: opts.Shard.Mod, Owned: owned}
+		if err := shardSpec.Validate(); err != nil {
+			return nil, fmt.Errorf("pgruntime: %w", err)
+		}
+		for _, gvk := range opts.Shard.UnshardedGVKs {
+			unsharded[gvk] = true
+		}
 	}
 
 	ctx := context.Background()
@@ -85,6 +111,8 @@ func NewManager(opts Options) (manager.Manager, error) {
 		restMapper: restMapper,
 		logger:     opts.Logger.WithName("cache"),
 		informers:  make(map[schema.GroupVersionKind]*pgInformer),
+		shard:      shardSpec,
+		unsharded:  unsharded,
 	}
 
 	elected := make(chan struct{})
