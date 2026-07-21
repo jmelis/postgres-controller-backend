@@ -1,6 +1,6 @@
 module github.com/jmelis/postgres-controller-backend/examples/greeting-controller
 
-go 1.26.4
+go 1.26.3
 
 replace github.com/jmelis/postgres-controller-backend => ../..
 
